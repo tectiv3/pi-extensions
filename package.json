@@ -1,0 +1,11 @@
+{
+  "name": "pi-extensions",
+  "private": true,
+  "devDependencies": {
+    "@eslint/js": "^10.0.0",
+    "@types/node": "^22.0.0",
+    "eslint": "^10.0.0",
+    "typescript": "^5.8.0",
+    "typescript-eslint": "^8.0.0"
+  }
+}

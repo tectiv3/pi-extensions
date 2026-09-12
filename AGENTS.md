@@ -20,10 +20,21 @@ prettier) are installed here.
 
 ## Checks
 
+One-time setup per clone: `git config core.hooksPath .githooks`. The
+`.githooks/pre-commit` hook then runs on every commit and auto-formats staged TS
+files with prettier, auto-fixes them with eslint, and re-stages whatever it
+changed. It blocks only what it could not fix automatically (remaining eslint
+errors, or new TypeScript errors).
+
 - `pnpm install`
-- `npx tsc --noEmit` — type-checks against a baseline (`.tsc-baseline`). Only **new** errors
-  (not in the baseline) block the commit. If you fix a baseline error, regenerate:
-  `npx tsc --noEmit 2>&1 | grep "error TS" | sort > .tsc-baseline`
+- `npx tsc --noEmit` — type-checks against a baseline (`.tsc-baseline`). The
+  baseline is **normalized** (line/column stripped to `(*)`), so formatting-only
+  changes never invalidate it; only genuinely new error signatures block the
+  commit. If you fix a baseline error, regenerate with the exact normalized
+  command:
+  ```bash
+  npx tsc --noEmit 2>&1 | grep "error TS" | sed 's/([0-9]*,[0-9]*)/(*)/' | sort -u > .tsc-baseline
+  ```
 - `npx eslint .` — zero warnings allowed.
 
 ## Conventions

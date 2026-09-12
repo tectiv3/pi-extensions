@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Pre-commit hook for pi-extensions.
+#
+# Auto-fixes staged TypeScript instead of rejecting it outright: prettier
+# formats, eslint fixes, then a final eslint + tsc gate blocks only what could
+# not be fixed automatically. Formatting is applied per-file so the tree
+# converges as files are touched, without a big-bang reformat burying real
+# changes in noise.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+
+set -uo pipefail
+export PATH="/run/current-system/sw/bin:$PATH"
+
+# -z/-d: NUL-delimited so paths with spaces survive; ACM skips deletions and
+# renames-without-content, which have nothing to check.
+mapfile -t -d '' staged < <(git diff --cached --name-only --diff-filter=ACM -z -- '*.ts' '*.mts')
+[ ${#staged[@]} -eq 0 ] && exit 0
+
+existing=()
+for f in "${staged[@]}"; do
+    [ -f "$f" ] || continue
+    existing+=("$f")
+done
+[ ${#existing[@]} -eq 0 ] && exit 0
+staged=("${existing[@]}")
+
+# A partially staged file would have its unstaged hunks swept into the commit
+# by the re-add below, so leave it untouched and say so.
+clean=()
+skipped=()
+for f in "${staged[@]}"; do
+    if git diff --quiet -- "$f"; then
+        clean+=("$f")
+    else
+        skipped+=("$f")
+    fi
+done
+
+for f in "${skipped[@]}"; do
+    echo "pre-commit: $f has unstaged changes; left unformatted" >&2
+done
+
+# Prettier resolves its config by walking up from each file, so the user-level
+# ~/.prettierrc applies without an explicit --config.
+if [ -x node_modules/.bin/prettier ]; then
+    PRETTIER=node_modules/.bin/prettier
+elif command -v prettier >/dev/null 2>&1; then
+    PRETTIER=$(command -v prettier)
+else
+    PRETTIER=
+    echo "pre-commit: prettier not found; skipping formatting" >&2
+fi
+
+if [ -n "$PRETTIER" ] && [ ${#clean[@]} -gt 0 ]; then
+    "$PRETTIER" --write --log-level error "${clean[@]}" >/dev/null 2>&1
+    changed=()
+    for f in "${clean[@]}"; do
+        git diff --quiet -- "$f" || changed+=("$f")
+    done
+    if [ ${#changed[@]} -gt 0 ]; then
+        git add -- "${changed[@]}"
+        printf 'pre-commit: prettier formatted %d file(s)\n' "${#changed[@]}"
+    fi
+fi
+
+# ESLint auto-fix. Run from the repo root so eslint.config.mjs is discovered.
+ESLINT_BIN=node_modules/.bin/eslint
+if [ -x "$ESLINT_BIN" ] && [ ${#clean[@]} -gt 0 ]; then
+    for f in "${clean[@]}"; do
+        "$ESLINT_BIN" --fix -- "$f" >/dev/null 2>&1 || true
+    done
+    changed=()
+    for f in "${clean[@]}"; do
+        git diff --quiet -- "$f" || changed+=("$f")
+    done
+    if [ ${#changed[@]} -gt 0 ]; then
+        git add -- "${changed[@]}"
+        printf 'pre-commit: eslint auto-fixed %d file(s)\n' "${#changed[@]}"
+    fi
+elif [ ! -x "$ESLINT_BIN" ]; then
+    echo "pre-commit: eslint not found; skipping lint" >&2
+fi
+
+# Final eslint gate -- blocks on anything auto-fix could not resolve.
+if [ -x "$ESLINT_BIN" ]; then
+    lint_files=()
+    for f in "${staged[@]}"; do
+        lint_files+=("$f")
+    done
+    ESLINT_OUTPUT=$("$ESLINT_BIN" -- "${lint_files[@]}" 2>&1 || true)
+    if [ -n "$ESLINT_OUTPUT" ]; then
+        echo "$ESLINT_OUTPUT"
+        echo "pre-commit: eslint errors remain after auto-fix" >&2
+        exit 1
+    fi
+fi
+
+# tsc baseline is line/column-stripped so formatting-only changes don't
+# invalidate it; only genuinely new error signatures block the commit.
+TSC_BIN=node_modules/.bin/tsc
+if [ -x "$TSC_BIN" ] && [ -f tsconfig.json ]; then
+    TSC_RAW=$("$TSC_BIN" --noEmit 2>&1 | grep "error TS" || true)
+    TSC_NORMALIZED=$(printf '%s\n' "$TSC_RAW" | sed 's/([0-9]*,[0-9]*)/(*)/' | sort -u)
+    if [ -n "$TSC_NORMALIZED" ]; then
+        if [ -f .tsc-baseline ]; then
+            NEW_ERRORS=$(comm -23 <(printf '%s\n' "$TSC_NORMALIZED") .tsc-baseline || true)
+            if [ -n "$NEW_ERRORS" ]; then
+                echo "pre-commit: new TypeScript errors (not in baseline):" >&2
+                echo "$NEW_ERRORS"
+                exit 1
+            fi
+        else
+            echo "pre-commit: .tsc-baseline missing; reporting TypeScript errors:" >&2
+            echo "$TSC_RAW"
+            exit 1
+        fi
+    fi
+else
+    echo "pre-commit: tsc or tsconfig.json not found; skipping type check" >&2
+fi
+
+exit 0

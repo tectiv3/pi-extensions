@@ -1,4 +1,4 @@
-subagent/index.ts(2857,17): error TS2322: Type 'string' is not assignable to type 'ThinkingLevel'.
-subagent/index.ts(3076,31): error TS2339: Property 'agent' does not exist on type 'unknown'.
-subagent/index.ts(3077,31): error TS2339: Property 'task' does not exist on type 'unknown'.
-subagent/index.ts(3078,31): error TS2339: Property 'cwd' does not exist on type 'unknown'.
+subagent/index.ts(*): error TS2322: Type 'string' is not assignable to type 'ThinkingLevel'.
+subagent/index.ts(*): error TS2339: Property 'agent' does not exist on type 'unknown'.
+subagent/index.ts(*): error TS2339: Property 'cwd' does not exist on type 'unknown'.
+subagent/index.ts(*): error TS2339: Property 'task' does not exist on type 'unknown'.

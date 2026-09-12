@@ -40,7 +40,9 @@ import {
     matchesKey,
     Spacer,
     Text,
+    truncateToWidth,
     visibleWidth,
+    wrapTextWithAnsi,
 } from '@earendil-works/pi-tui'
 import { Type } from 'typebox'
 import { type AgentConfig, type AgentScope, discoverAgents } from './agents.ts'
@@ -415,6 +417,12 @@ function formatUsageStats(
 function previewText(text: string, maxChars: number): string {
     const collapsed = text.replace(/\s+/g, ' ').trim()
     return collapsed.length > maxChars ? `${collapsed.slice(0, maxChars)}...` : collapsed
+}
+
+// pi's host aborts the session when a component returns a line wider than the
+// terminal, so every custom render() funnels its result through here.
+function clampLines(lines: string[], width: number): string[] {
+    return lines.map(line => truncateToWidth(line, width))
 }
 
 function formatToolCall(
@@ -1174,14 +1182,17 @@ async function attachToSubagent(ctx: ExtensionContext, entry: ActiveSubagent): P
                     theme.fg('dim', '‹pending› ') +
                     theme.fg('dim', previewText(text, ATTACH_STEER_PREVIEW_CHARS))
             )
-            return [
-                ...header,
-                '',
-                ...lines.slice(scrollTop, scrollTop + viewportHeight),
-                ...pendingLines,
-                '',
-                steerRow,
-            ]
+            return clampLines(
+                [
+                    ...header,
+                    '',
+                    ...lines.slice(scrollTop, scrollTop + viewportHeight),
+                    ...pendingLines,
+                    '',
+                    steerRow,
+                ],
+                width
+            )
         }
 
         function handleInput(data: string): void {
@@ -2508,7 +2519,7 @@ async function openSubagentsManager(ctx: ExtensionContext): Promise<void> {
             return nav + theme.fg('dim', 'Enter/r resume · d delete · i inspect · Esc/q close')
         }
 
-        function render(_width: number): string[] {
+        function render(width: number): string[] {
             const rows = scanRows()
             if (selected >= rows.length) selected = Math.max(0, rows.length - 1)
             const selectedRow: ManagerRow | undefined = rows[selected]
@@ -2542,7 +2553,7 @@ async function openSubagentsManager(ctx: ExtensionContext): Promise<void> {
                 lines.push('', theme.fg(messageIsError ? 'error' : 'dim', message))
             }
             lines.push('', footerLegend(selectedRow))
-            return lines
+            return clampLines(lines, width)
         }
 
         function handleInput(data: string): void {
@@ -2698,16 +2709,13 @@ async function openSubagentInspectView(
                 tui.terminal.rows - ATTACH_RESERVED_TERMINAL_ROWS - INSPECT_CHROME_ROWS
             )
 
-        // The report is plain text; overlong lines hard-wrap at the width.
+        // Report lines may carry ANSI and wide glyphs; wrap on visible
+        // columns so escape sequences are never split.
         const wrapped = (width: number): string[] => {
             if (cachedLines && cachedWidth === width) return cachedLines
-            const out: string[] = []
-            for (const line of reportLines) {
-                if (line.length <= width) out.push(line)
-                else
-                    for (let i = 0; i < line.length; i += width)
-                        out.push(line.slice(i, i + width))
-            }
+            const out = reportLines.flatMap(line =>
+                visibleWidth(line) <= width ? [line] : wrapTextWithAnsi(line, width)
+            )
             cachedLines = out
             cachedWidth = width
             return out
@@ -2720,13 +2728,17 @@ async function openSubagentInspectView(
             lastViewportHeight = height
             const maxScrollTop = Math.max(0, lines.length - height)
             scrollTop = Math.min(scrollTop, maxScrollTop)
-            return [
-                theme.fg('toolTitle', theme.bold('inspect ')) + theme.fg('accent', shortId),
-                '',
-                ...lines.slice(scrollTop, scrollTop + height),
-                '',
-                theme.fg('dim', '↑↓/jk PgUp/PgDn Home/End scroll · Esc/q close'),
-            ]
+            return clampLines(
+                [
+                    theme.fg('toolTitle', theme.bold('inspect ')) +
+                        theme.fg('accent', shortId),
+                    '',
+                    ...lines.slice(scrollTop, scrollTop + height),
+                    '',
+                    theme.fg('dim', '↑↓/jk PgUp/PgDn Home/End scroll · Esc/q close'),
+                ],
+                width
+            )
         }
 
         function handleInput(data: string): void {

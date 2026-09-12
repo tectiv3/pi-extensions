@@ -186,6 +186,12 @@ declare module '@earendil-works/pi-tui' {
     export function matchesKey(data: string, key: string): boolean
     export function decodeKittyPrintable(data: string): string | undefined
     export function visibleWidth(text: string): number
+    export function truncateToWidth(
+        text: string,
+        maxWidth: number,
+        ellipsis?: string,
+        pad?: boolean
+    ): string
     export function wrapTextWithAnsi(text: string, width: number): string[]
 }
 

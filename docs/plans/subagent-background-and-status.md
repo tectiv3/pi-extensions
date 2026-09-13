@@ -43,8 +43,9 @@ cannot be settled from code are collected in §5 (verification checklist).
 - **Concurrency:** no new cap. Backgrounded runs and foreground runs coexist; the parallel
   batch cap (8 tasks / 4 concurrent) is unchanged and unrelated.
 - **Id-supersession rule (resume collision).** Resumed runs reuse the original id
-  (`runSingleAgent` uses `resume?.id`; verified: `resolveResumeTarget` returns the same id,
-  `registerActiveSubagent` re-registers it). Any spawn — background or foreground, tool or
+  (`runSingleAgent` uses `resume?.id`; verified: `resolveResumeTarget` accepts an exact or
+  unique-prefix id, resolves it to the full run id, and returns that — `registerActiveSubagent`
+  re-registers under it). Any spawn — background or foreground, tool or
   `/subagents resume` — for an id that has a `backgroundResults` entry **deletes the stale
   entry at registration time** (right at `registerActiveSubagent`, inside `runSingleAgent` —
   NOT at the top of the function: the pre-spawn early returns — unknown agent, prompt-file
@@ -232,10 +233,11 @@ New registered tool:
 subagent_collect { id: string }
 ```
 
-- Resolves `id` (exact or unique short prefix) against the **union
-  `activeSubagents` ∪ `backgroundResults`**, running branch first — a READY-only id is
-  resolvable; only ids in NEITHER map are unknown (the error result lists short ids from
-  both maps). The running branch resolves exact/unique-prefix against `activeSubagents`
+- Resolves `id` (exact or unique short prefix — the same id-resolution convention the
+  tool's `resume` param and `/subagents resume` now share, but against in-memory maps)
+  against the **union `activeSubagents` ∪ `backgroundResults`**, running branch first — a
+  READY-only id is resolvable; only ids in NEITHER map are unknown (the error result lists
+  short ids from both maps). The running branch resolves exact/unique-prefix against `activeSubagents`
   keys only (like `resolveAttachTarget`) — NEVER via the file-based `resolveInspectTarget`,
   whose "indistinguishable from a successfully completed run" error message is wrong for a
   running id. (This is also how a resumed run's id reports "still running" instead of its
@@ -365,7 +367,11 @@ Format:
 - `execute()` in the `subagent` tool: after the existing validation, branch on
   `params.background` — validate single-mode + non-print-mode, then the **spawn bridge**
   (1.2.1): `onSpawned` callback + floating run promise resolving with a pre-spawn failure +
-  5s timeout → return the spawn text (or the real failure / timeout error).
+  5s timeout → return the spawn text (or the real failure / timeout error). The background
+  dispatch must pass the tool call's `toolCallId` through to `runSingleAgent`'s trailing
+  `toolCallId` param (like the chain/parallel/single dispatches do) so the meta sidecar
+  records it — omitting it would break the rc server's attach-by-toolCallId correlation for
+  backgrounded runs.
 - New tool registration block for `subagent_collect` (params: `id`, mirroring
   `SubagentInspectParams`'s id handling and prefix resolution; running branch reuses
   `buildSubagentInspectReport`).

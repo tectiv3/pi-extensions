@@ -543,6 +543,9 @@ interface SubagentMeta {
     // scope to the current session's id; runs without the field (pre-scoping
     // metas) stay resolvable by explicit full id.
     parentSessionId?: string
+    // Tool call id of the parent session's `subagent` invocation; lets downstream
+    // tooling correlate a persisted run with the transcript step that spawned it.
+    toolCallId?: string
     resumedCount?: number
     status?: 'succeeded' | 'failed' | 'aborted'
     stopReason?: string
@@ -1630,7 +1633,8 @@ async function runSingleAgent(
     makeDetails: (results: SingleResult[]) => SubagentDetails,
     resume?: ResumeTarget,
     onSpawned?: (entry: ActiveSubagent) => void,
-    relayUiRequest?: RelayUiRequest
+    relayUiRequest?: RelayUiRequest,
+    toolCallId?: string
 ): Promise<SingleResult> {
     const subagentId = resume?.id ?? uuidv7()
     const {
@@ -1748,6 +1752,8 @@ async function runSingleAgent(
             promptHash: createHash('sha256').update(agent.systemPrompt).digest('hex'),
             // Omitted (undefined) when the session id was unavailable at spawn.
             parentSessionId: currentPiSessionId,
+            // Omitted (undefined) when the spawn was not a tool call (e.g. /subagents resume).
+            toolCallId: toolCallId || undefined,
             resumedCount: resume ? (resume.meta.resumedCount ?? 0) + 1 : undefined,
         }
         writeSubagentMetaFile(metaPath, spawnMeta)
@@ -2861,7 +2867,7 @@ export default function (pi: ExtensionAPI) {
         ].join(' '),
         parameters: SubagentParams,
 
-        async execute(_toolCallId, params, signal, onUpdate, ctx) {
+        async execute(toolCallId, params, signal, onUpdate, ctx) {
             capturePiSessionId(ctx)
             const agentScope: AgentScope = params.agentScope ?? 'user'
             const dispatchDefaults: DispatchDefaults = {
@@ -2991,7 +2997,8 @@ export default function (pi: ExtensionAPI) {
                         makeDetails('chain'),
                         undefined,
                         undefined,
-                        relayUiRequest
+                        relayUiRequest,
+                        toolCallId
                     )
                     results.push(result)
 
@@ -3100,7 +3107,8 @@ export default function (pi: ExtensionAPI) {
                             makeDetails('parallel'),
                             undefined,
                             undefined,
-                            relayUiRequest
+                            relayUiRequest,
+                            toolCallId
                         )
                         allResults[index] = result
                         emitParallelUpdate()
@@ -3160,7 +3168,8 @@ export default function (pi: ExtensionAPI) {
                     makeDetails('single'),
                     resume,
                     undefined,
-                    relayUiRequest
+                    relayUiRequest,
+                    toolCallId
                 )
                 const isError = isFailedResult(result)
                 if (isError) {

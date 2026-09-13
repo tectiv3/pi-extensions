@@ -113,7 +113,7 @@ files contain full tool output, potentially secrets):
 | File | Contents |
 |------|----------|
 | `<id>.jsonl` | pi session file, written by the child |
-| `<id>.meta` | JSON sidecar (mode `0600`): agent, task, model, thinking level, startedAt, sha256 `promptHash` of the agent system prompt; updated on close with status, stopReason, exitCode, and the session header id |
+| `<id>.meta` | JSON sidecar (mode `0600`): agent, task, model, thinking level, startedAt, sha256 `promptHash` of the agent system prompt, and the spawning `subagent` tool call id (absent for non-tool spawns such as `/subagents resume`); updated on close with status, stopReason, exitCode, and the session header id |
 | `<id>.pid` | Child pid, present while the child is running |
 
 - **Retention**: a clean success deletes all three files — the output already lives in the

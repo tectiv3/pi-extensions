@@ -345,9 +345,29 @@ function unregisterActiveSubagent(id: string): void {
 // from child callbacks (spawn/close) that have no ctx of their own.
 let latestExtensionCtx: ExtensionContext | undefined
 
-// Single 10s timer driving the footer clock while any subagent runs;
-// started/stopped inside refreshSubagentStatus so callers never manage it.
+// Set when the session is being torn down (session_shutdown): the extension is
+// about to be reloaded, so live children are killed and completion notifications
+// are suppressed (a killed run belongs to the session that is going away, and the
+// captured `pi` is stale by the time a drain would run).
+let sessionTearingDown = false
+
+// Single 10s timer driving the footer clock while any subagent runs; started and
+// stopped inside refreshSubagentStatus so callers never manage it.
 let subagentStatusTimer: ReturnType<typeof setInterval> | undefined
+
+// Settled background runs awaiting subagent_collect (slice 4). Kept OUT of
+// activeSubagents: that entry unregisters at process close and has a proc.
+const backgroundResults = new Map<string, SingleResult>()
+
+// Latest ExtensionAPI handed over by the host — the coalesced notification
+// drain fires from a timer callback that has no other pi reference.
+let latestPi: ExtensionAPI | undefined
+
+// Coalesced completion notifications (spec 1.2.3): settlements enqueue a
+// per-id block; the drain clears the queue BEFORE sending so a block
+// enqueued mid-drain arms a fresh timer instead of merging late or dropping.
+let notifyQueue: SingleResult[] = []
+let notifyDrainTimer: ReturnType<typeof setTimeout> | undefined
 
 function subagentStatusText(): string {
     const entries = [...activeSubagents.values()]
@@ -359,9 +379,10 @@ function subagentStatusText(): string {
     return `⏳ ${entries.length}: ${pairs.join(', ')}`
 }
 
-// Full idempotent recompute of the running-only footer line: leading number
-// is the total running count. A later slice will append the "✓ N ready"
-// segment here (background results are not tracked yet).
+// Idempotent recompute of the running-only footer line. The timer and the
+// line stop/clear as soon as the running count reaches 0; a ready-only state
+// no longer keeps the line or the 10s tick (settled runs live solely in
+// backgroundResults for subagent_collect).
 function refreshSubagentStatus(): void {
     const ctx = latestExtensionCtx
     if (!ctx) return
@@ -388,6 +409,90 @@ function refreshSubagentStatus(): void {
     }
 }
 
+// Background settlement sink (spec 1.2.2): defensive unregister FIRST (the
+// exit-fallback path can settle without the close handler having unregistered,
+// which would otherwise leave the id in both maps), then store, coalesced
+// notify enqueue, footer refresh. Every step is independently guarded — the
+// store-before-notify ordering IS the shutdown containment.
+function settleBackgroundRun(id: string, result: SingleResult): void {
+    try {
+        unregisterActiveSubagent(id)
+    } catch {
+        // Idempotent defensive step; must never block settlement.
+    }
+    try {
+        backgroundResults.set(id, result)
+    } catch {
+        // Store is the critical step; if it throws nothing else is meaningful.
+    }
+    try {
+        enqueueBackgroundNotification(result)
+    } catch {
+        // Notify must not lose the store.
+    }
+    try {
+        refreshSubagentStatus()
+    } catch {
+        // Refresh must not lose the notify.
+    }
+}
+
+// One self-contained per-id block for the completion notification (spec
+// 1.2.3). The full id always appears in the text: for the model it is the
+// only id source.
+function buildBackgroundNotification(result: SingleResult): string {
+    const shortId = result.subagentId.slice(0, LIST_ID_SHORT_CHARS)
+    if (isFailedResult(result)) {
+        return [
+            `Background subagent ${shortId} (${result.agent}) ${
+                result.aborted ? 'aborted' : 'failed'
+            }.`,
+            formatFailureReport(result),
+            formatResumeHint(result) ? `/subagents resume ${shortId}` : '',
+            `Call subagent_collect { id: "${result.subagentId}" } for the full result.`,
+        ]
+            .filter(Boolean)
+            .join('\n\n')
+    }
+    const finalOutput = getFinalOutput(result.messages)
+    return [
+        `Background subagent ${shortId} (${result.agent}) finished.`,
+        finalOutput.length > INSPECT_FINAL_OUTPUT_CAP
+            ? `${finalOutput.slice(0, INSPECT_FINAL_OUTPUT_CAP)}...`
+            : finalOutput,
+        formatUsageStats(result.usage, result.model),
+        `Call subagent_collect { id: "${result.subagentId}" } for the full result.`,
+    ].join('\n\n')
+}
+
+function enqueueBackgroundNotification(result: SingleResult): void {
+    if (sessionTearingDown) return
+    notifyQueue.push(result)
+    if (!notifyDrainTimer) {
+        notifyDrainTimer = setTimeout(drainBackgroundNotifications, 100)
+        notifyDrainTimer.unref()
+    }
+}
+
+// One followUp per drain covering every block enqueued since the last drain
+// (kill-sweeps settle within ms of each other → one message, one turn of N
+// parallel subagent_collect calls). The snapshot AND clear happen before the
+// send: a block enqueued mid-drain sees no pending timer and arms a fresh one
+// (never merged late, dropped, or double-counted).
+function drainBackgroundNotifications(): void {
+    notifyDrainTimer = undefined
+    const batch = notifyQueue
+    notifyQueue = []
+    const text = batch.map(buildBackgroundNotification).join('\n\n')
+    try {
+        latestPi?.sendUserMessage(text, { deliverAs: 'followUp' })
+    } catch (err) {
+        subagentDebugLog(
+            `[subagent:background] notify failed: ${err instanceof Error ? err.message : String(err)}`
+        )
+    }
+}
+
 // Ring-buffer push: cap retained events so long-running children cannot grow
 // memory unboundedly while still keeping recent history for late-attach replay.
 function pushSubagentEvent(entry: ActiveSubagent, event: SubagentStreamEvent): void {
@@ -397,10 +502,12 @@ function pushSubagentEvent(entry: ActiveSubagent, event: SubagentStreamEvent): v
     }
 }
 
-// Zombie prevention: the parent must not leave orphaned children behind when
-// it exits, so SIGTERM every live subagent. Only a best-effort signal is
-// possible here — the event loop stops once 'exit' handlers return, so no
-// SIGKILL escalation sweep can follow.
+// Crash/exit safety net: pi's uncaughtException path calls process.exit without
+// disposing the runtime, so session_shutdown is NOT emitted there — SIGTERM every
+// live subagent from the exit hook instead. Session *replacement* keeps the
+// process alive and is covered by the session_shutdown handler; on a normal quit
+// both run and the kill is idempotent. Best-effort only: the event loop stops once
+// 'exit' handlers return, so no SIGKILL escalation can follow.
 process.on('exit', () => {
     for (const entry of activeSubagents.values()) {
         try {
@@ -1425,6 +1532,64 @@ function resolveInspectTarget(requestedId: string): InspectTarget {
     }
 }
 
+// Id resolution for subagent_collect (spec 1.2.4): exact or unique prefix
+// against the in-memory union activeSubagents ∪ backgroundResults, running
+// branch first — a resumed id is re-registered under its original id, so it
+// must report "still running" instead of its superseded stale READY entry.
+// File-based resolveInspectTarget is deliberately NOT used: a running id is
+// not "indistinguishable from a successfully completed run". Persisted runs
+// from other sessions are out of scope (subagent_inspect / /subagents).
+type CollectTarget =
+    { kind: 'running'; id: string } | { kind: 'ready'; id: string } | { error: string }
+
+function resolveCollectTarget(requestedId: string): CollectTarget {
+    // Running branch first (same exact/unique-prefix convention as
+    // resolveAttachTarget, scoped to the registry keys).
+    const running = [...activeSubagents.values()]
+    const exactRunning = running.find(entry => entry.id === requestedId)
+    if (exactRunning) return { kind: 'running', id: exactRunning.id }
+    const runningMatches = running.filter(entry => entry.id.startsWith(requestedId))
+    if (runningMatches.length === 1) return { kind: 'running', id: runningMatches[0].id }
+    if (runningMatches.length > 1) {
+        return {
+            error: [
+                `Ambiguous subagent id "${requestedId}" matches ${runningMatches.length} running subagents:`,
+                ...formatRunningSubagentsList(runningMatches),
+                'Use more characters or the full id.',
+            ].join('\n'),
+        }
+    }
+
+    const readyEntries = [...backgroundResults.entries()]
+    const exactReady = readyEntries.find(([id]) => id === requestedId)
+    if (exactReady) return { kind: 'ready', id: exactReady[0] }
+    const readyMatches = readyEntries.filter(([id]) => id.startsWith(requestedId))
+    if (readyMatches.length === 1) return { kind: 'ready', id: readyMatches[0][0] }
+    if (readyMatches.length > 1) {
+        return {
+            error: [
+                `Ambiguous subagent id "${requestedId}" matches ${readyMatches.length} ready subagents:`,
+                ...readyMatches.map(
+                    ([id, stored]) =>
+                        `- ${id.slice(0, LIST_ID_SHORT_CHARS)} — agent: ${stored.agent}`
+                ),
+                'Use more characters or the full id.',
+            ].join('\n'),
+        }
+    }
+
+    const allIds = [...new Set([...activeSubagents.keys(), ...backgroundResults.keys()])]
+    const listing =
+        allIds.length > 0
+            ? `Available subagents: ${allIds.map(id => id.slice(0, LIST_ID_SHORT_CHARS)).join(', ')}`
+            : 'There are no running or ready subagents in this session.'
+    return {
+        error:
+            `Unknown subagent id "${requestedId}". ${listing} ` +
+            'Persisted runs from other sessions live in /subagents.',
+    }
+}
+
 // Id resolution for /subagents resume: exact or unique prefix against
 // persisted runs that have a readable meta sidecar (the agent name and
 // prompt hash needed to relaunch the run live there). Meta reading is
@@ -1694,7 +1859,8 @@ async function runSingleAgent(
     resume?: ResumeTarget,
     onSpawned?: (entry: ActiveSubagent) => void,
     relayUiRequest?: RelayUiRequest,
-    toolCallId?: string
+    toolCallId?: string,
+    background: boolean = false
 ): Promise<SingleResult> {
     const subagentId = resume?.id ?? uuidv7()
     const {
@@ -1900,8 +2066,15 @@ async function runSingleAgent(
                     const release = await acquireRelayMutex()
                     relayPending = true
                     const controller = new AbortController()
-                    const onRunAbort = () => controller.abort()
-                    signal?.addEventListener('abort', onRunAbort, { once: true })
+                    let relayAbortCleanup: (() => void) | undefined
+                    // Foreground only: background runs have no abort source, so the
+                    // relay stays open until the user answers or dismisses (spec §1.1).
+                    if (!background && signal) {
+                        const onRunAbort = () => controller.abort()
+                        signal.addEventListener('abort', onRunAbort, { once: true })
+                        relayAbortCleanup = () =>
+                            signal.removeEventListener('abort', onRunAbort)
+                    }
                     try {
                         const response = await relayUiRequest(
                             event,
@@ -1935,7 +2108,7 @@ async function runSingleAgent(
                     } finally {
                         relayPending = false
                         lastActivityTime = Date.now()
-                        signal?.removeEventListener('abort', onRunAbort)
+                        relayAbortCleanup?.()
                         release()
                     }
                     return
@@ -2017,6 +2190,11 @@ async function runSingleAgent(
                 steer: steerFn,
             }
             registerActiveSubagent(entry)
+            // Id supersession (spec 1.1): a re-running id reuses its id, so a stale
+            // READY entry is deleted at registration. The delete is idempotent and
+            // has no footer/manager side effect of its own; the refresh below is for
+            // the just-registered RUNNING entry.
+            backgroundResults.delete(subagentId)
             try {
                 refreshSubagentStatus()
             } catch {
@@ -2247,7 +2425,7 @@ async function runSingleAgent(
             }, STALL_CHECK_INTERVAL_MS)
             stallWatchdog.unref()
 
-            if (signal) {
+            if (!background && signal) {
                 const killProc = () => {
                     wasAborted = true
                     debug('abort signal received, killing child')
@@ -2288,6 +2466,17 @@ async function runSingleAgent(
         }
 
         debug(`returning: status=${status} stopReason=${currentResult.stopReason ?? '-'}`)
+        if (background) {
+            // Synchronous, no awaits: preserves the store-before-notify
+            // ordering the sink's invariants rely on (spec 1.2.2).
+            try {
+                settleBackgroundRun(subagentId, currentResult)
+            } catch (err) {
+                subagentDebugLog(
+                    `[subagent:background] settle failed: ${err instanceof Error ? err.message : String(err)}`
+                )
+            }
+        }
         return currentResult
     } finally {
         if (tmpPromptPath)
@@ -2910,6 +3099,13 @@ const SubagentParams = Type.Object({
                 'Id (exact or unique prefix) of a persisted subagent run to resume (single mode only)',
         })
     ),
+    background: Type.Optional(
+        Type.Boolean({
+            description:
+                'Single mode only. Return immediately; the child keeps running detached from parent Escape. ' +
+                'Completion arrives as a notification; fetch the result via subagent_collect { id }.',
+        })
+    ),
     tasks: Type.Optional(
         Type.Array(TaskItem, {
             description: 'Array of {agent, task} for parallel execution',
@@ -2948,6 +3144,41 @@ const SubagentInspectParams = Type.Object({
 
 export default function (pi: ExtensionAPI) {
     eventBus = pi.events
+    latestPi = pi
+
+    // Session teardown (quit/reload/new/resume/fork) reloads this extension and
+    // drops the module-level registries, so any live child would become an
+    // untracked orphan. Kill them and drop the in-memory state; notifications are
+    // suppressed (see sessionTearingDown).
+    pi.on('session_shutdown', () => {
+        sessionTearingDown = true
+        if (notifyDrainTimer) {
+            clearTimeout(notifyDrainTimer)
+            notifyDrainTimer = undefined
+        }
+        notifyQueue = []
+        if (subagentStatusTimer) {
+            clearInterval(subagentStatusTimer)
+            subagentStatusTimer = undefined
+        }
+        try {
+            latestExtensionCtx?.ui.setStatus?.('subagent', undefined)
+        } catch {
+            // The old ctx may already be stale; the new session clears its own slot.
+        }
+        try {
+            backgroundResults.clear()
+        } catch {
+            // In-memory only; the reload drops it regardless.
+        }
+        for (const entry of activeSubagents.values()) {
+            try {
+                entry.proc.kill('SIGTERM')
+            } catch {
+                // Already dead.
+            }
+        }
+    })
 
     pi.registerTool({
         name: 'subagent',
@@ -2959,6 +3190,7 @@ export default function (pi: ExtensionAPI) {
                 '(agent must match the original run).',
             `Default agent scope is "user" (from ${path.join(getAgentDir(), 'agents')}).`,
             `To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
+            'Background: background: true (single mode only) returns immediately; the child keeps running and completion is reported via notification; fetch results with subagent_collect.',
         ].join(' '),
         parameters: SubagentParams,
 
@@ -3012,6 +3244,32 @@ export default function (pi: ExtensionAPI) {
                         },
                     ],
                     details: makeDetails('single')([]),
+                }
+            }
+
+            const background = params.background === true
+            if (background && ctx.mode === 'print') {
+                return {
+                    content: [
+                        {
+                            type: 'text',
+                            text: 'background mode is unavailable in print mode — the parent exits before the child can settle. Use a foreground call instead.',
+                        },
+                    ],
+                    details: makeDetails('single')([]),
+                    isError: true,
+                }
+            }
+            if (background && (hasChain || hasTasks)) {
+                return {
+                    content: [
+                        {
+                            type: 'text',
+                            text: 'background mode is single-mode only ({agent, task, background: true}).',
+                        },
+                    ],
+                    details: makeDetails('single')([]),
+                    isError: true,
                 }
             }
 
@@ -3249,6 +3507,101 @@ export default function (pi: ExtensionAPI) {
                         }
                     }
                     resume = resolved
+                }
+                if (background) {
+                    // Spawn bridge (mirrors handleSubagentsResume): settle on the
+                    // first of onSpawned, a pre-spawn failure of the floating run
+                    // promise, or the timeout. Spawn + registration are synchronous,
+                    // so the timeout is pure insurance.
+                    type SpawnBridge =
+                        | { kind: 'spawned'; entry: ActiveSubagent }
+                        | { kind: 'pre-spawn'; result: SingleResult }
+                        | { kind: 'error'; message: string }
+                    let settled: SpawnBridge | undefined
+                    let settleBridge: (v: SpawnBridge) => void
+                    const bridgePromise = new Promise<SpawnBridge>(resolve => {
+                        settleBridge = v => {
+                            if (!settled) {
+                                settled = v
+                                resolve(v)
+                            }
+                        }
+                    })
+                    const timer = setTimeout(
+                        () =>
+                            settleBridge({
+                                kind: 'error',
+                                message: 'spawn did not confirm within 5s',
+                            }),
+                        5000
+                    )
+                    timer.unref()
+                    const runPromise = runSingleAgent(
+                        ctx.cwd,
+                        dispatchDefaults,
+                        agents,
+                        params.agent,
+                        params.task,
+                        params.cwd,
+                        undefined,
+                        undefined, // signal: background runs have NO abort source (spec §1.1)
+                        undefined, // onUpdate: tool returns immediately; nothing to stream to
+                        makeDetails('single'),
+                        resume,
+                        entry => {
+                            clearTimeout(timer)
+                            settleBridge({ kind: 'spawned', entry })
+                        },
+                        relayUiRequest,
+                        toolCallId, // rc-server attach-by-toolCallId correlation
+                        true
+                    )
+                    runPromise.then(
+                        result => settleBridge({ kind: 'pre-spawn', result }),
+                        err => {
+                            if (settled)
+                                subagentDebugLog(
+                                    `[subagent:background] post-spawn run failure: ${err instanceof Error ? err.message : String(err)}`
+                                )
+                            else
+                                settleBridge({
+                                    kind: 'error',
+                                    message: err instanceof Error ? err.message : String(err),
+                                })
+                        }
+                    )
+                    const spawn = await bridgePromise
+                    clearTimeout(timer)
+                    if (spawn.kind === 'spawned') {
+                        const entry = spawn.entry
+                        return {
+                            content: [
+                                {
+                                    type: 'text',
+                                    text: [
+                                        `Background subagent ${entry.id.slice(0, LIST_ID_SHORT_CHARS)} started (agent: ${params.agent}).`,
+                                        `Task: ${previewText(params.task, LIST_TASK_PREVIEW_CHARS)}`,
+                                        `You'll be notified when it completes. Call subagent_collect { id: "${entry.id}" } for the result;`,
+                                        `subagent_inspect { id: "${entry.id.slice(0, LIST_ID_SHORT_CHARS)}" } for progress.`,
+                                    ].join('\n'),
+                                },
+                            ],
+                            details: makeDetails('single')([]),
+                        }
+                    }
+                    if (spawn.kind === 'pre-spawn')
+                        return {
+                            content: [
+                                { type: 'text', text: formatFailureReport(spawn.result) },
+                            ],
+                            details: makeDetails('single')([spawn.result]),
+                            isError: true,
+                        }
+                    return {
+                        content: [{ type: 'text', text: spawn.message }],
+                        details: makeDetails('single')([]),
+                        isError: true,
+                    }
                 }
                 const result = await runSingleAgent(
                     ctx.cwd,
@@ -3732,6 +4085,108 @@ export default function (pi: ExtensionAPI) {
                 theme.fg('toolTitle', theme.bold('subagent_inspect ')) +
                 theme.fg('accent', preview)
             if (args.limit !== undefined) text += theme.fg('muted', ` (last ${args.limit})`)
+            return new Text(text, 0, 0)
+        },
+
+        renderResult(result, _options, _theme, _context) {
+            const text = result.content[0]
+            return new Text(text?.type === 'text' ? text.text : '(no output)', 0, 0)
+        },
+    })
+
+    pi.registerTool({
+        name: 'subagent_collect',
+        label: 'Subagent Collect',
+        description: [
+            'Collect the result of a background subagent run by id (exact or unique prefix). Running runs',
+            'return their current progress immediately (non-blocking); settled background runs return the',
+            'full result and are removed from the ready set. Persisted runs from other sessions use',
+            'subagent_inspect / /subagents.',
+        ].join(' '),
+        parameters: Type.Object({
+            id: Type.String({
+                description:
+                    'Subagent id (exact or unique prefix): running or settled-background',
+            }),
+        }),
+
+        async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+            capturePiSessionId(ctx)
+            const resolved = resolveCollectTarget(params.id)
+            if ('error' in resolved) {
+                return {
+                    content: [{ type: 'text', text: resolved.error }],
+                    details: undefined,
+                    isError: true,
+                }
+            }
+            if (resolved.kind === 'running') {
+                return {
+                    content: [
+                        {
+                            type: 'text',
+                            text:
+                                'Still running — this returns immediately; the completion ' +
+                                'notification will arrive on its own.\n\n' +
+                                buildSubagentInspectReport(resolved.id, INSPECT_DEFAULT_LIMIT),
+                        },
+                    ],
+                    details: undefined,
+                }
+            }
+            const result = backgroundResults.get(resolved.id)
+            if (!result) {
+                // Collected between resolution and render; report it as unknown.
+                return {
+                    content: [
+                        {
+                            type: 'text',
+                            text: `Unknown subagent id "${params.id}". There are no running or ready subagents in this session. Persisted runs from other sessions live in /subagents.`,
+                        },
+                    ],
+                    details: undefined,
+                    isError: true,
+                }
+            }
+            const status = result.aborted
+                ? 'aborted'
+                : isFailedResult(result)
+                  ? 'failed'
+                  : 'succeeded'
+            const shortId = resolved.id.slice(0, LIST_ID_SHORT_CHARS)
+            const lines: string[] = [
+                `Background subagent ${shortId} (${result.agent}) — ${status}`,
+            ]
+            if (status === 'succeeded') {
+                let finalOutput = getFinalOutput(result.messages)
+                // Same byte-cap as parallel output, but collect has no separate
+                // details payload, so the cap note can't promise one.
+                const byteLength = Buffer.byteLength(finalOutput, 'utf8')
+                if (byteLength > PER_TASK_OUTPUT_CAP) {
+                    let truncated = finalOutput.slice(0, PER_TASK_OUTPUT_CAP)
+                    while (Buffer.byteLength(truncated, 'utf8') > PER_TASK_OUTPUT_CAP) {
+                        truncated = truncated.slice(0, -1)
+                    }
+                    finalOutput = `${truncated}\n(truncated to ${PER_TASK_OUTPUT_CAP} chars)`
+                }
+                lines.push(finalOutput.length > 0 ? finalOutput : '(no final output)')
+                const usageStr = formatUsageStats(result.usage, result.model)
+                if (usageStr) lines.push(usageStr)
+            } else {
+                lines.push(formatFailureReport(result))
+            }
+            backgroundResults.delete(resolved.id)
+            return {
+                content: [{ type: 'text', text: lines.join('\n\n') }],
+                details: undefined,
+            }
+        },
+
+        renderCall(args, theme, _context) {
+            const preview = args.id.length > 40 ? `${args.id.slice(0, 40)}...` : args.id
+            const text =
+                theme.fg('toolTitle', theme.bold('subagent_collect ')) +
+                theme.fg('accent', preview)
             return new Text(text, 0, 0)
         },
 

@@ -1289,19 +1289,18 @@ function resolveResumeTarget(
     agentName: string,
     agents: AgentConfig[]
 ): ResumeTarget | string {
-    const {
-        session: sessionPath,
-        pid: pidPath,
-        meta: metaPath,
-    } = getSubagentFilePaths(resumeId)
+    // Same id semantics as subagent_inspect and /subagents resume: an exact
+    // id resolves across sessions, a unique prefix within this session.
+    const resolution = resolvePersistedResumeTarget(resumeId)
+    if ('error' in resolution) return resolution.error
+    const { id: runId, meta } = resolution
 
-    if (!fs.existsSync(sessionPath)) return formatAvailableSubagentsError(resumeId)
-
+    const { pid: pidPath } = getSubagentFilePaths(runId)
     if (fs.existsSync(pidPath)) {
-        const pid = Number.parseInt(fs.readFileSync(pidPath, 'utf-8').trim(), 10)
-        if (pid > 0 && isProcessAlive(pid)) {
+        const pid = readSubagentPid(pidPath)
+        if (pid !== undefined && isProcessAlive(pid)) {
             return (
-                `Subagent "${resumeId}" is still running (pid ${pid}). ` +
+                `Subagent "${runId}" is still running (pid ${pid}). ` +
                 'Wait for it to finish or inspect it with subagent_inspect instead of resuming.'
             )
         }
@@ -1309,16 +1308,9 @@ function resolveResumeTarget(
         removeSubagentFile(pidPath)
     }
 
-    let meta: SubagentMeta
-    try {
-        meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8')) as SubagentMeta
-    } catch {
-        return `Cannot resume "${resumeId}": its meta sidecar is missing or unreadable. Start a fresh delegation instead.`
-    }
-
     if (meta.agent !== agentName) {
         return (
-            `Cannot resume "${resumeId}" with agent "${agentName}": the original run used agent "${meta.agent}". ` +
+            `Cannot resume "${runId}" with agent "${agentName}": the original run used agent "${meta.agent}". ` +
             'Resuming under a different agent changes the system prompt and toolset; use the original agent.'
         )
     }
@@ -1328,10 +1320,10 @@ function resolveResumeTarget(
         ? createHash('sha256').update(agent.systemPrompt).digest('hex')
         : undefined
     if (!agent || currentPromptHash !== meta.promptHash) {
-        return `Cannot resume "${resumeId}": the "${agentName}" agent definition changed since the original run; start a fresh delegation instead.`
+        return `Cannot resume "${runId}": the "${agentName}" agent definition changed since the original run; start a fresh delegation instead.`
     }
 
-    return { id: resumeId, meta }
+    return { id: runId, meta }
 }
 
 type InspectTarget = { id: string } | { error: string }
@@ -2818,7 +2810,8 @@ const SubagentParams = Type.Object({
     task: Type.Optional(Type.String({ description: 'Task to delegate (for single mode)' })),
     resume: Type.Optional(
         Type.String({
-            description: 'Id of a persisted subagent run to resume (single mode only)',
+            description:
+                'Id (exact or unique prefix) of a persisted subagent run to resume (single mode only)',
         })
     ),
     tasks: Type.Optional(

@@ -10,7 +10,7 @@ Delegate tasks to specialized subagents with isolated context windows.
 - **Markdown rendering**: Final output rendered with proper formatting (expanded view)
 - **Usage tracking**: Shows turns, tokens, cost, and context usage per agent
 - **Persistence**: Interrupted or failed runs survive under `~/.pi/agent/subagents/` with a subagent id
-- **Resume**: Continue a persisted run in the same conversation (`resume: "<id>"`, single mode)
+- **Resume**: Continue a persisted run in the same conversation (`resume: "<id or unique prefix>"`, single mode)
 - **Recoverable abort**: Interrupting the parent returns an error tool result with partial output, not an exception
 
 ## Structure
@@ -143,6 +143,9 @@ subagent { agent: "scout", task: "<continuation instruction>", resume: "<id>" }
 ```
 
 - Single mode only — `resume` alongside `tasks`/`chain` is rejected.
+- The id may be exact or a unique prefix (same semantics as `subagent_inspect`): an exact
+  id resolves across sessions, a prefix is scoped to this pi session; ambiguous prefixes
+  are refused with a list of candidates.
 - The child is spawned with `--session <same path>`, which continues the existing
   conversation (not `--resume`, the interactive picker flag, which is unusable headless).
   The `task` text is the continuation instruction.
@@ -150,14 +153,14 @@ subagent { agent: "scout", task: "<continuation instruction>", resume: "<id>" }
   original run recorded no model, the current dispatch model (or the child's default) is
   used, noted in the tool result.
 - Guards, in order:
-  1. The session file must exist — otherwise the error lists the available persisted ids
+  1. The id must resolve — exact id with a readable meta sidecar, or a unique prefix among
+     this session's persisted runs; otherwise the error lists the available persisted ids
      (completed runs are cleaned up).
   2. The pidfile must not belong to a live process — a stale pidfile (parent crashed before
      cleanup) is auto-removed and the run is treated as interrupted.
-  3. The meta sidecar must be readable — missing or corrupt sidecars refuse the resume.
-  4. `agent` must match the original run — a different agent means a different system
+  3. `agent` must match the original run — a different agent means a different system
      prompt and toolset.
-  5. The agent definition's `promptHash` must match — a changed agent file is refused with
+  4. The agent definition's `promptHash` must match — a changed agent file is refused with
      a suggestion to start a fresh delegation.
 - Each resume increments `resumedCount` in the sidecar (shown by `subagent_inspect`).
 

@@ -70,6 +70,11 @@ const LIST_TASK_PREVIEW_CHARS = 60
 const RESUME_DEFAULT_INSTRUCTION = 'Continue from where you stopped.'
 const RESUME_SPAWN_TIMEOUT_MS = 15_000
 
+// Footer status line: refresh cadence (same as the stall check) and cap on
+// per-agent segments before extras collapse to "+N".
+const SUBAGENT_STATUS_INTERVAL_MS = 10_000
+const SUBAGENT_STATUS_MAX_ITEMS = 3
+
 // /subagents attach live-view sizing and preview caps. While attached, the
 // view is de-facto fullscreen: it occupies nearly all terminal rows, its own
 // header and steer chrome included (spec §7 "takes over the TUI"). The
@@ -104,12 +109,14 @@ const NON_RENDERABLE_EVENT_TYPES = new Set([
 // two extensions decoupled: rc is looked up on globalThis and checked, never imported.
 interface RcRemote {
     askAvailable(): boolean
-    ask(opts: {
-        kind: 'ask_user_question'
-        params: unknown
-        signal?: AbortSignal
-    }): Promise<
-        | { id: string; value: string; label: string; wasCustom: boolean; index?: number }[]
+    ask(opts: { kind: 'ask_user_question'; params: unknown; signal?: AbortSignal }): Promise<
+        | {
+              id: string
+              value: string
+              label: string
+              wasCustom: boolean
+              index?: number
+          }[]
         | 'dismissed'
         | null
     >
@@ -320,6 +327,10 @@ function sessionIdFromContext(ctx: ExtensionContext): string | undefined {
 
 function capturePiSessionId(ctx: ExtensionContext): void {
     currentPiSessionId = sessionIdFromContext(ctx)
+    // Footer status needs an ExtensionContext to reach ctx.ui; every entry
+    // point that can spawn or settle a subagent passes through here, so this
+    // is the single capture point for the latest one.
+    latestExtensionCtx = ctx
 }
 
 function registerActiveSubagent(entry: ActiveSubagent): void {
@@ -328,6 +339,53 @@ function registerActiveSubagent(entry: ActiveSubagent): void {
 
 function unregisterActiveSubagent(id: string): void {
     activeSubagents.delete(id)
+}
+
+// Latest ExtensionContext seen at any entry point — the footer status runs
+// from child callbacks (spawn/close) that have no ctx of their own.
+let latestExtensionCtx: ExtensionContext | undefined
+
+// Single 10s timer driving the footer clock while any subagent runs;
+// started/stopped inside refreshSubagentStatus so callers never manage it.
+let subagentStatusTimer: ReturnType<typeof setInterval> | undefined
+
+function subagentStatusText(): string {
+    const entries = [...activeSubagents.values()]
+    const pairs = entries
+        .slice(0, SUBAGENT_STATUS_MAX_ITEMS)
+        .map(entry => `${entry.agent} ${formatElapsedMs(Date.now() - entry.startedAt)}`)
+    const extras = entries.length - pairs.length
+    if (extras > 0) pairs.push(`+${extras}`)
+    return `⏳ ${entries.length}: ${pairs.join(', ')}`
+}
+
+// Full idempotent recompute of the running-only footer line: leading number
+// is the total running count. A later slice will append the "✓ N ready"
+// segment here (background results are not tracked yet).
+function refreshSubagentStatus(): void {
+    const ctx = latestExtensionCtx
+    if (!ctx) return
+    const running = activeSubagents.size
+    if (running === 0) {
+        if (subagentStatusTimer) {
+            clearInterval(subagentStatusTimer)
+            subagentStatusTimer = undefined
+        }
+    } else if (!subagentStatusTimer) {
+        subagentStatusTimer = setInterval(
+            () => refreshSubagentStatus(),
+            SUBAGENT_STATUS_INTERVAL_MS
+        )
+        subagentStatusTimer.unref()
+    }
+    // Print mode and no-UI hosts never want the footer line; do not assume
+    // the host no-ops setStatus for them.
+    if (ctx.hasUI === false || ctx.mode === 'print') return
+    try {
+        ctx.ui.setStatus?.('subagent', running === 0 ? undefined : subagentStatusText())
+    } catch {
+        // Footer status is best-effort; never propagate into spawn/close paths.
+    }
 }
 
 // Ring-buffer push: cap retained events so long-running children cannot grow
@@ -645,7 +703,11 @@ function getDisplayItems(messages: Message[]): DisplayItem[] {
             for (const part of msg.content) {
                 if (part.type === 'text') items.push({ type: 'text', text: part.text })
                 else if (part.type === 'toolCall')
-                    items.push({ type: 'toolCall', name: part.name, args: part.arguments })
+                    items.push({
+                        type: 'toolCall',
+                        name: part.name,
+                        args: part.arguments,
+                    })
             }
         }
     }
@@ -680,7 +742,10 @@ async function writePromptToTempFile(
     const safeName = agentName.replace(/[^\w.-]+/g, '_')
     const filePath = path.join(tmpDir, `prompt-${safeName}.md`)
     await withFileMutationQueue(filePath, async () => {
-        await fs.promises.writeFile(filePath, prompt, { encoding: 'utf-8', mode: 0o600 })
+        await fs.promises.writeFile(filePath, prompt, {
+            encoding: 'utf-8',
+            mode: 0o600,
+        })
     })
     return { dir: tmpDir, filePath }
 }
@@ -703,7 +768,10 @@ function getSubagentFilePaths(subagentId: string): {
 
 function ensureSubagentsDir(): void {
     try {
-        fs.mkdirSync(getSubagentsDir(), { recursive: true, mode: SUBAGENTS_DIR_MODE })
+        fs.mkdirSync(getSubagentsDir(), {
+            recursive: true,
+            mode: SUBAGENTS_DIR_MODE,
+        })
         // mkdir's mode is masked by the process umask; enforce the private mode explicitly.
         fs.chmodSync(getSubagentsDir(), SUBAGENTS_DIR_MODE)
     } catch {
@@ -1841,7 +1909,11 @@ async function runSingleAgent(
                             controller.signal
                         )
                         if (response) {
-                            writeChildStdin({ type: 'extension_ui_response', id, ...response })
+                            writeChildStdin({
+                                type: 'extension_ui_response',
+                                id,
+                                ...response,
+                            })
                             debug(`extension_ui: ${method} → relayed`)
                         } else {
                             writeChildStdin({
@@ -1852,7 +1924,11 @@ async function runSingleAgent(
                             debug(`extension_ui: ${method} → relay cancelled`)
                         }
                     } catch (err) {
-                        writeChildStdin({ type: 'extension_ui_response', id, cancelled: true })
+                        writeChildStdin({
+                            type: 'extension_ui_response',
+                            id,
+                            cancelled: true,
+                        })
                         debug(
                             `extension_ui: ${method} relay error: ${err instanceof Error ? err.message : String(err)}`
                         )
@@ -1897,7 +1973,11 @@ async function runSingleAgent(
                     }
                     case 'input':
                     case 'editor':
-                        writeChildStdin({ type: 'extension_ui_response', id, cancelled: true })
+                        writeChildStdin({
+                            type: 'extension_ui_response',
+                            id,
+                            cancelled: true,
+                        })
                         debug(`extension_ui: ${method} → cancelled`)
                         break
                     case 'notify':
@@ -1937,6 +2017,11 @@ async function runSingleAgent(
                 steer: steerFn,
             }
             registerActiveSubagent(entry)
+            try {
+                refreshSubagentStatus()
+            } catch {
+                // Best-effort footer status; never break the spawn path.
+            }
             // Fires before any child output can arrive (stdout events are
             // async; the awaiting caller resumes first), so callers can
             // attach immediately — /subagents resume relies on this.
@@ -2021,7 +2106,11 @@ async function runSingleAgent(
                 const renderable = !NON_RENDERABLE_EVENT_TYPES.has(type)
                 if (renderable) pushSubagentEvent(entry, event)
                 entry.eventEmitter.emit('event', event)
-                eventBus?.emit('subagent:event', { subagentId, agent: agentName, event })
+                eventBus?.emit('subagent:event', {
+                    subagentId,
+                    agent: agentName,
+                    event,
+                })
 
                 // Whole-list replacement: the child re-emits queue_update
                 // without a text once it is dequeued for delivery, so the
@@ -2101,6 +2190,11 @@ async function runSingleAgent(
                 // failures emit 'error' then 'close'), so this single
                 // unregister point covers every exit path.
                 unregisterActiveSubagent(subagentId)
+                try {
+                    refreshSubagentStatus()
+                } catch {
+                    // Best-effort footer status; never break the close path.
+                }
                 drainBuffer()
                 safeResolve(killSignal ? 1 : (code ?? 0), 'close')
             })
@@ -2805,7 +2899,9 @@ const AgentScopeSchema = StringEnum(['user', 'project', 'both'] as const, {
 
 const SubagentParams = Type.Object({
     agent: Type.Optional(
-        Type.String({ description: 'Name of the agent to invoke (for single mode)' })
+        Type.String({
+            description: 'Name of the agent to invoke (for single mode)',
+        })
     ),
     task: Type.Optional(Type.String({ description: 'Task to delegate (for single mode)' })),
     resume: Type.Optional(
@@ -2815,7 +2911,9 @@ const SubagentParams = Type.Object({
         })
     ),
     tasks: Type.Optional(
-        Type.Array(TaskItem, { description: 'Array of {agent, task} for parallel execution' })
+        Type.Array(TaskItem, {
+            description: 'Array of {agent, task} for parallel execution',
+        })
     ),
     chain: Type.Optional(
         Type.Array(ChainItem, {
@@ -2830,12 +2928,16 @@ const SubagentParams = Type.Object({
         })
     ),
     cwd: Type.Optional(
-        Type.String({ description: 'Working directory for the agent process (single mode)' })
+        Type.String({
+            description: 'Working directory for the agent process (single mode)',
+        })
     ),
 })
 
 const SubagentInspectParams = Type.Object({
-    id: Type.String({ description: 'Subagent id (exact filename id or unique prefix)' }),
+    id: Type.String({
+        description: 'Subagent id (exact filename id or unique prefix)',
+    }),
     limit: Type.Optional(
         Type.Number({
             description: 'Number of transcript entries to show from the end',
@@ -3615,7 +3717,10 @@ export default function (pi: ExtensionAPI) {
             }
             return {
                 content: [
-                    { type: 'text', text: buildSubagentInspectReport(resolved.id, limit) },
+                    {
+                        type: 'text',
+                        text: buildSubagentInspectReport(resolved.id, limit),
+                    },
                 ],
                 details: undefined,
             }

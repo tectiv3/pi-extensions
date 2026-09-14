@@ -12,6 +12,8 @@ Delegate tasks to specialized subagents with isolated context windows.
 - **Persistence**: Interrupted or failed runs survive under `~/.pi/agent/subagents/` with a subagent id
 - **Resume**: Continue a persisted run in the same conversation (`resume: "<id or unique prefix>"`, single mode)
 - **Recoverable abort**: Interrupting the parent returns an error tool result with partial output, not an exception
+- **Background runs**: `background: true` returns immediately, leaving the child running; completion is delivered as a notification and fetched with `subagent_collect` (single mode)
+- **Running-subagents footer**: the pi footer shows live running subagents (`⏳ <n>: <agent> <elapsed>`, refreshed every 10s)
 
 ## Structure
 
@@ -97,9 +99,10 @@ Use a chain: first have scout find the read tool, then have planner suggest impr
 | Single | `{ agent, task, resume? }` | One agent, one task; `resume` continues a persisted run |
 | Parallel | `{ tasks: [...] }` | Multiple agents run concurrently (max 8, 4 concurrent) |
 | Chain | `{ chain: [...] }` | Sequential with `{previous}` placeholder |
+| Background | `{ agent, task, background: true }` | Returns immediately; result delivered by notification, fetched via subagent_collect (single mode only) |
 
-The extension also registers the `subagent_inspect` tool and the `/subagents` command —
-see [Persistence & Resume](#persistence--resume).
+The extension also registers the `subagent_inspect` and `subagent_collect` tools and the
+`/subagents` command — see [Persistence & Resume](#persistence--resume).
 
 ## Persistence & Resume
 
@@ -177,6 +180,23 @@ subagent { agent: "scout", task: "<continuation instruction>", resume: "<id>" }
   debugging a stuck subagent.
 - Torn final lines (child killed mid-append) and unknown entry types are skipped.
 
+### Collecting results: `subagent_collect`
+
+`subagent_collect { id }` fetches the result of a background run. `id` may be exact or a
+unique prefix, resolved against running runs first, then settled-uncollected results held
+in memory for this process. See [Background Runs](#background-runs) for the notification
+that announces a settlement.
+
+- **Running** → returns immediately (non-blocking) with the same status/progress report
+  `subagent_inspect` renders.
+- **Settled** → renders the in-memory result: status and agent, the full final output
+  (capped at 50KB), and usage; a failure renders the failure report — a reported failure
+  is a normal answer, not a tool error. The entry is removed after collection.
+- **Unknown id** → error listing the available short ids; persisted runs from other
+  sessions use `subagent_inspect` / `/subagents resume`.
+
+Scope is the current process only (running runs, or settled results not yet collected).
+
 ### Listing runs: `/subagents`
 
 List-only: short id (first 8 characters), agent, status, session size, and a task preview,
@@ -210,6 +230,48 @@ tool calls formatted like the parent TUI, tool output truncated (200 chars). Str
 - Requires an interactive session (`attach` is unavailable in print mode).
 - **Single subagent only**: parallel/chain runs spawn through the same registry but
   `attach` is designed for the single mode view for now.
+
+## Background Runs
+
+`subagent { agent, task, background: true }` spawns a single run detached from the parent
+tool call and returns immediately with the spawn text (short id, task preview, and the
+full id plus `subagent_collect` / `subagent_inspect` hints). The child keeps running.
+
+- **Single mode only** — `background` alongside `tasks`/`chain` is rejected. Rejected in
+  print mode too (no notification channel); use the blocking call there.
+- **Detached from the parent's abort** — Escape does not kill a background child. Kill it
+  with `/subagents abort <id>` or the manager view's `x` key; a killed run settles as a
+  failure notification.
+- **Relayed questions** (`confirm`/`select`/`input`) still reach the parent TUI, but there
+  is no abort source: the dialog stays until the user answers or dismisses it (the stall
+  watchdog is paused while the relay is pending).
+- **Concurrency** is unchanged — there is no separate cap, and background and foreground
+  runs coexist.
+- **Backgrounded resume** — `background: true` with `resume` re-runs a persisted run
+  detached and stores a fresh result at settlement like any background run.
+- **Id supersession** — spawning a run whose id has an uncollected background result
+  deletes the stale entry at registration, so `subagent_collect` on a re-running id reports
+  "still running" rather than the stale result.
+
+### Completion notifications
+
+On settlement (success or failure) the result is stored in memory and a follow-up message
+is delivered to the model on its next turn:
+
+- **Success** — a header with the short id and agent, the final output truncated to 2000
+  chars, the usage line, and a `Call subagent_collect { id: "<full id>" }` hint.
+- **Failure** — the failure report and a resume hint instead of the output.
+
+Settlements within 100 ms of each other are coalesced into a single follow-up listing every
+id; settlements further apart arrive as separate turns. A notification queued while the
+parent is mid-turn is delivered when the parent's run ends.
+
+### Running-subagents footer
+
+While subagents run, the pi footer shows `⏳ <n>: <agent> <elapsed>, …` — up to three
+agent/elapsed pairs, with extras collapsed to `+N` — refreshed every 10 s. The line clears
+as soon as the running count reaches 0. It shows running runs only; settled-but-uncollected
+results are surfaced by the completion notification, not the footer.
 
 ## Output Display
 
@@ -302,3 +364,15 @@ resume hint:
   changed prompt and refuses the resume
 - **L3 — recovery is per-`message_end`**: partial output survives only up to the last
   completed message; a run interrupted during its first message persists no transcript
+- **L4 — background results are in-memory**: if the parent exits before `subagent_collect`,
+  the result is lost (a successful run's transcript files are deleted at settlement)
+- **L5 — no true detach**: backgrounded runs do not survive the parent process or a session
+  replacement (`/new`, `/resume`, `/fork`, `/reload`); live runs are SIGTERM'd on session
+  teardown
+- **L6 — background is single-mode only**: no backgrounded parallel batches or chains
+- **L7 — `subagent_collect` is process-scoped**: persisted runs from other sessions use
+  `subagent_inspect` / `/subagents resume`
+- **L8 — no auto-cancel for relayed questions**: a backgrounded child blocked on a relayed
+  question leaves the dialog open until answered or dismissed
+- **L9 — uncollected results have no UI**: they are visible only in the completion
+  notification

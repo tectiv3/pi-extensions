@@ -33,9 +33,18 @@ cannot be settled from code are collected in §5 (verification checklist).
   manager view's `x` key (both SIGTERM the registry entry's proc). A killed background run
   settles through the same completion path as any other (see 1.3) — the model is notified of
   the kill as a failure.
-- **Exit behavior unchanged.** `process.on('exit')` still SIGTERMs every live child. A
-  backgrounded run does not outlive the parent (a true "detach" — survive + file-persisted
-  result + orphan reaping — is a documented future feature, not in scope).
+- **Session-scoped lifetime.** Live runs (foreground and background) are killed on session
+  teardown. `pi.on('session_shutdown')` (`reason: quit | reload | new | resume | fork`)
+  SIGTERMs every `activeSubagents` child, drops the drain timer/queue and
+  `backgroundResults`, clears the footer slot, and sets a `sessionTearingDown` flag so the
+  killed runs' settlements emit no completion notification. This is required, not cosmetic:
+  pi reloads and rebinds extensions on session replacement, which drops the module-level
+  registries — a surviving child would be an untracked orphan. A `process.on('exit')` hook
+  is kept as well, because pi's `uncaughtException` path calls `process.exit` without
+  disposing the runtime, so `session_shutdown` is not emitted on a crash (and the on-quit
+  kill is idempotent across both hooks). A backgrounded run does not outlive the session or
+  the parent (a true "detach" — survive + file-persisted result + orphan reaping — is a
+  documented future feature, not in scope).
 - **Stall watchdog unchanged** (300s silence default): a stalled backgrounded child is
   killed and settles as a failure like any other.
 - **Relay UI unchanged:** `confirm`/`select`/`input` requests from a backgrounded child are
@@ -53,15 +62,15 @@ cannot be settled from code are collected in §5 (verification checklist).
   while no RUNNING entry exists; a spawn *error* — `proc.on('error')`, e.g. ENOENT — fires
   asynchronously AFTER registration, so the run did register and did fail, and consuming the
   stale entry there is correct — do not "fix" supersession to skip it on spawn errors).
-  Supersession ALSO triggers a footer-status refresh and the manager re-render event, but
-  ONLY when `backgroundResults.delete(id)` returned true (it removes a READY row; see the
-  refresh invariant in 2.2) — not unconditionally at registration. A **backgrounded resume stores a fresh entry** at settlement like any backgrounded
+  The delete is unconditional and idempotent at registration (no
+  footer/manager side effect of its own; the footer shows running runs only — see 2). A
+  **backgrounded resume stores a fresh entry** at settlement like any backgrounded
   run (the model must be notified of its completion); only the *non-background* resume paths
   (tool resume without `background`, `/subagents resume`) skip the sink — their completions
   already have their own handling (tool result; "finished"/"keeps running" notices). No
   completion notification is emitted for the superseded stale entry itself.
   Without this rule, `subagent_collect <id>` would return the stale failure report while the
-  resumed run is actively running, and the manager would show the id in both RUNNING and READY.
+  resumed run is actively running.
   A `subagent_collect` on a re-running (resumed) id hits the running branch (lookup checks
   `activeSubagents` first — see 1.2.4) and returns "still running".
 - **Relay questions on detached runs.** A backgrounded child's `confirm`/`select`/`input`
@@ -143,11 +152,8 @@ call has already returned, so the caller stores the result instead:
   1. stores `result` in `backgroundResults` (success **and** failure — the failure carries
      the existing failure report: partial output, stopReason, exitCode),
   2. pushes the completion notification (1.2.3),
-  3. refreshes the footer status (2) **and** emits a manager re-render event on `eventBus`
-     (an open manager view must pick up the new READY row without a keypress: both close
-     listeners — the spawn-side handler and the manager's `once('close')` — run synchronously
-     during the close emit, and the sink's store is a microtask after the whole emit, so the
-     manager's own close-hook re-scan happens BEFORE the store and would miss the row).
+  3. refreshes the footer status (2) — running runs only; the uncollected result itself has no
+     UI (see 2.3).
   Removal from `backgroundResults` happens only in `subagent_collect` or at registration-time
   supersession (1.1), never in the sink.
 - **Store order / invariant.** Verified code sequence: the close handler runs
@@ -162,7 +168,7 @@ call has already returned, so the caller stores the result instead:
   exit-fallback path (close lags exit by >3s — grandchild holding a stdio pipe; the code's
   documented scenario) resolves the promise WITHOUT the close handler having unregistered,
   which would otherwise leave the id in both maps (collect would report a settled run as
-  "still running"; the manager would show it in RUNNING and READY).
+  "still running").
 - **Error containment.** The sink runs from process callbacks (including during parent
   shutdown, when the exit handler's SIGTERM can fire close events) with no awaiting tool
   call: every step is independently try/catch-guarded (a notify failure must not lose the
@@ -183,7 +189,7 @@ call has already returned, so the caller stores the result instead:
   Map** (plus the 2000-char notification truncation). Do not "fix" the cleanup to keep files
   — that would break the success-cleanup contract the rest of the extension relies on.
 - `subagent_collect` removes the entry from `backgroundResults` when it delivers a settled
-  result (the "ready" indicator and manager row then disappear).
+  result (the entry leaves the in-memory ready set; there is no manager/footer UI for it).
 
 #### 1.2.3 Completion notification
 
@@ -256,8 +262,8 @@ subagent_collect { id: string }
   "tool details" wording adjusted — collect has no separate tool-details payload), status,
   usage; failures return the failure report (`formatFailureReport` — not `isError`; a
   reported failure is a normal answer, matching how inspect treats failures). Removes the
-  entry from `backgroundResults` and refreshes status/manager (the refresh clears the slot
-  if this was the last ready entry).
+  entry from `backgroundResults` (no footer/manager refresh — the footer shows running runs
+  only).
 - **Unknown id →** error result listing the short ids of the **union** of both maps
   (`activeSubagents` ∪ `backgroundResults`, deduped by id) + hint that persisted runs live
   in `/subagents`.
@@ -272,6 +278,7 @@ subagent_collect { id: string }
 | Parent Escape | **no effect** (detached) | — |
 | `/subagents abort <id>` / manager `x` | close → sink, failure | failure (killed) |
 | Parent process exit | exit handler SIGTERM (unchanged) | lost with the process (documented) |
+| Session switch/fork/reload (`session_shutdown`) | SIGTERM live children + drop state | none (suppressed; the run belonged to the old session) |
 | Resume of this id (tool or `/subagents resume`) | registration-time supersession | none for the stale entry; the resume path's own handling applies |
 
 ---
@@ -286,61 +293,51 @@ subagent_collect { id: string }
 Format:
 
 ```
-⏳ 5: scout 1:23, worker 0:41, +3 · ✓ 1 ready
+⏳ 5: scout 1:23, worker 0:41, +3
 ```
 
 - `⏳ <total>: <agent> <elapsed>, …` — the leading number is the TOTAL running count; the
   agent/elapsed pairs are a sample (from `activeSubagents`, excluding settled) capped at 3,
   elapsed via the existing `formatElapsedMs`.
 - Up to **3** agent/elapsed pairs; extras collapse to `+N`.
-- `· ✓ <n> ready` only when `backgroundResults` is non-empty (uncollected settled runs).
-- Running-only line: `⏳ 1: scout 0:42`. Ready-only line: `✓ 1 ready`.
+- Example line: `⏳ 1: scout 0:42`.
 - Print mode: `refreshSubagentStatus` gates on `ctx.hasUI`/mode (2.2) and skips the
   `setStatus` call entirely — no host-level no-op is assumed or required. (Background is
   rejected in print mode anyway, so this path mainly serves foreground spawns.)
 
 ### 2.2 Updates
 
-- **Event-driven:** spawn, settlement (→ ready), collect, abort/kill, and the timer tick.
-  Invariant: **every path that mutates `activeSubagents` or `backgroundResults` ends in a
-  `refreshSubagentStatus` call + the manager re-render event** (spawn → running+1;
-  settlement → running−1/ready+1; collect → ready−1; supersession → ready−1; abort → via
-  the close handler). The 10s tick is the safety net, not the primary refresh.
+- **Event-driven:** spawn, settlement (→ running−1), abort/kill, and the timer tick.
+  Invariant: **every path that mutates `activeSubagents` ends in a `refreshSubagentStatus`
+  call** (spawn → running+1; settlement → running−1; abort → via the close handler).
+  `backgroundResults` (the collect buffer) is invisible to the footer, so its mutations do not
+  refresh it. The 10s tick is the safety net, not the primary refresh.
 - **Timer:** a single module-level interval (10s — same cadence as `STALL_CHECK_INTERVAL_MS`)
   that re-renders elapsed times. Started when the running count goes 0 → >0, stopped (and the
-  status cleared) when running + ready both reach 0. The timer is `unref()`ed.
-- **Every refresh is a full idempotent recompute** from current state (counts from
-  `activeSubagents` + `backgroundResults`) — no incremental deltas; that is how stale clears
-  happen when two refreshes for the same id interleave (e.g. settlement after collect).
-- In the ready-only state (nothing running) the 10s tick is a no-op render — keep it (one
-  code path) and state it so nobody "optimizes" the tick away, which would leak the slot
-  (`setStatus` persists until explicitly cleared). The stop/clear (timer stop +
-  `setStatus(undefined)`) is evaluated inside every refresh, so the collect path (READY→0
-  with no running) clears the slot even though the timer never managed its own lifecycle.
+  status cleared) as soon as the running count reaches 0. The timer is `unref()`ed.
+- **Every refresh is a full idempotent recompute** of the running set from `activeSubagents` —
+  no incremental deltas; that is how stale clears happen when refreshes interleave.
+- The stop/clear (timer stop + `setStatus(undefined)`) is evaluated inside every refresh; a
+  ready-only state keeps neither the line nor the tick.
 - `refreshSubagentStatus` gates on `ctx.hasUI`/mode itself (existing code gates UI calls this
   way), so callers need no per-mode branching.
 - The owner chose live elapsed over event-only updates, accepting the standing timer.
 
-### 2.3 Manager view (`/subagents`)
+### 2.3 Manager view (`/subagents`) — READY UI dropped
 
-- New **READY** section between RUNNING and PERSISTED: one row per `backgroundResults` entry
-  (`✓ <shortId> <agent> <status> <task preview>`), sorted by `settledAt`. No resume. For
-  failed/aborted uncollected runs the PERSISTED section also shows the id (files survive
-  failure) — different affordance, expected duplication.
-  - `i` on a READY row renders from the **stored `SingleResult`** (status, agent, task,
-    usage, final output capped at `INSPECT_FINAL_OUTPUT_CAP`, collect hint) — NOT
-    `buildSubagentInspectReport`, which is file-based: for a successful background run the
-    files are deleted at settlement and the file-based report would render "Meta: missing /
-    No transcript persisted yet" even though the output is available. (For a running row the
-    existing file-based inspect applies, unchanged.)
-- **Re-render wiring:** the view subscribes to the sink's `eventBus` re-render event (and
-  clears `cachedRows` on it), so READY rows appear without a keypress. See 1.2.2 step 3.
-- A PERSISTED row whose id also has a READY entry (failed/aborted run) gets a
-  "result available via subagent_collect" hint in its inspect/render — otherwise the
-  file-based report ("No transcript persisted yet"-adjacent) misleads for a run whose
-  output is in memory.
-- Existing behavior unchanged: RUNNING rows already cover backgrounded runs (shared registry),
-  and `x`/`/subagents abort` already kills them.
+The planned READY section was dropped (owner decision): `backgroundResults` is an internal
+collection buffer for `subagent_collect`, not a user-facing list, so no stored-result renderer,
+no `inspectReady` action, and no PERSISTED-duplicate hint are needed. Consequences:
+
+- The manager keeps RUNNING + PERSISTED exactly as before. RUNNING rows already cover
+  backgrounded runs and drop out when the child closes via the existing proc-close re-scan.
+- A failed/aborted background run still appears in PERSISTED (its files survive failure) and
+  is inspectable/resumable from disk like any other persisted run.
+- A successful settled-uncollected run has no manager row; it is surfaced only by its
+  completion notification.
+- The `subagent:status` `eventBus` channel (settled/collected/superseded) that existed only to
+  drive this view's re-render is removed as dead code. The separate high-frequency
+  `subagent:event` channel (consumed by rc) is untouched.
 
 ---
 
@@ -362,8 +359,7 @@ Format:
 - Supersession (1.1): inside `runSingleAgent`, at the `registerActiveSubagent` point —
   if the subagentId (which for resumes is the resumed id) is in `backgroundResults`, delete
   it there (NOT at the top of the function: pre-spawn early returns must not consume the
-  stale report), and trigger the status refresh + manager re-render event ONLY when the
-  delete removed an entry (ready count changed).
+  stale report). The delete is idempotent and has no footer/manager side effect.
 - `execute()` in the `subagent` tool: after the existing validation, branch on
   `params.background` — validate single-mode + non-print-mode, then the **spawn bridge**
   (1.2.1): `onSpawned` callback + floating run promise resolving with a pre-spawn failure +
@@ -376,10 +372,10 @@ Format:
   `SubagentInspectParams`'s id handling and prefix resolution; running branch reuses
   `buildSubagentInspectReport`).
 - `backgroundResults` map + `settleBackgroundRun(result, ...)` (the sink: defensive
-  `unregisterActiveSubagent` → store → coalesced notify enqueue → status refresh → manager
-  re-render event; every step independently guarded) + `refreshSubagentStatus(ctx)` (full
+  `unregisterActiveSubagent` → store → coalesced notify enqueue → status refresh; every step
+  independently guarded) + `refreshSubagentStatus(ctx)` (full
   idempotent recompute; the stop/clear — timer stop + `setStatus(undefined)` when
-  running+ready both reach 0 — is part of EVERY refresh, not a lifecycle callers manage).
+  running reaches 0 — is part of EVERY refresh, not a lifecycle callers manage).
   `pi`/`ctx` capture follows the existing module-scope pattern (`eventBus`,
   `currentPiSessionId`): a module-level **latest-ctx slot**, updated at the same entry
   points that already call `capturePiSessionId` (tool `execute` + the command handlers —
@@ -388,26 +384,19 @@ Format:
   slot, falling back to the run's own spawn ctx (held by the sink) if the slot is empty.
   Do NOT hold only the spawn ctx: a background run that settles while no foreground tool
   is running must still be able to refresh the footer via the newest available ctx.
-- Manager re-render event: `eventBus.emit('subagent:status', ...)` — a dedicated
-  namespaced name (`eventBus` is cross-extension and already carries the high-frequency
-  `subagent:event` stream). The manager view subscribes on open and MUST remove the
-  listener in `finish()` (the view's existing `hookedProcs` cleanup does not cover it).
 - Coalescing: a 100ms `setTimeout` (unref) drain queue that batches nearby settlements
   into one `sendUserMessage` (1.2.3).
-- Manager: add READY rows to `scanRows`/rendering/footer legend; subscribe to the
-  re-render event. **New `ManagerAction` variant is REQUIRED** — `inspect: { id }` is
-  file-based (`buildSubagentInspectReport` reads disk), and a successful background run's
-  files are deleted at settlement, so routing a READY row's `i` through it would render
-  "Meta: missing / No transcript persisted yet". Add `{ type: 'inspectReady'; id: string;
-  result: SingleResult }` (or overload `inspect` with an optional `result`) and branch the
-  `i` handler on row kind: READY → stored-result renderer; RUNNING/PERSISTED → existing
-  file-based path.
 
 ## 4. Limitations (documented in README)
 
 - Uncollected background results are lost when the parent process exits (in-memory retention;
   a successful run's full output exists only in the `backgroundResults` Map after settlement).
-- Backgrounded runs do not survive the parent (no detach; exit-kill unchanged).
+- Uncollected background results have no UI: after settlement the footer shows running runs
+  only and the manager lists RUNNING/PERSISTED, so an uncollected result is visible only in
+  the completion notification and retrievable only via `subagent_collect`.
+- Backgrounded runs do not survive the parent process or a session replacement (`/new`,
+  `/resume`, `/fork`, `/reload`): live runs are SIGTERM'd on `session_shutdown` (no true
+  detach).
 - Background is single-mode only; no backgrounded parallel batches or chains.
 - `subagent_collect` covers runs of the current process (running or settled-uncollected);
   persisted runs from other sessions are out of its scope.
@@ -430,6 +419,8 @@ on the target box before the feature is declared done:
    `subagent` slot coexists with the rc extension's slot without clobbering.
 4. **RPC-mode parent** (background allowed — only print is rejected): followUp + setStatus
    behave (or are documented no-ops); if broken, tighten the mode guard.
+    (Not applicable to this deployment: the owner drives sessions via the rc phone client,
+    not `pi --mode rpc`; revisit only if RPC mode is adopted.)
 5. **Coalescing:** two backgrounded runs killed in one sweep (closes <100ms apart) →
    exactly one followUp message listing both ids; one turn collects both. Two completions
    seconds apart → two messages (the documented fallback). Also: a single completion's
@@ -437,34 +428,68 @@ on the target box before the feature is declared done:
 6. **Spawn bridge:** (a) `background: true` with an unknown agent → the tool returns the
    unknown-agent failure immediately (not the spawn text, not a hang); (b) normal spawn →
    spawn text returns within ms, child keeps running.
-7. **Store-invariant:** (a) kill a backgrounded run and immediately `subagent_inspect` / open
-   the manager — the id is in exactly one of RUNNING/READY, never neither; (b) exit-fallback
+7. **Store-invariant:** (a) kill a backgrounded run and immediately `subagent_collect` — it must
+   return the settled failure, never "still running"; (b) exit-fallback
    path — a child whose grandchild holds a stdio pipe (close lags exit >3s): while settled,
-   the id must not appear in BOTH RUNNING and READY and collect must not say "still running"
+   the id must not appear in both `activeSubagents` and `backgroundResults` and collect must not say "still running"
    (the defensive unregister at store is the fix; verify it). On this path the store and the
    completion notification may land up to ~3s after exit (the fallback timer is what resolves
    the promise) — assert the bound and that the notify FIRES, not zero latency.
 8. **Supersession:** (a) fail a backgrounded run, leave the entry uncollected, resume the
    same id via the tool (non-background) → the stale entry is gone at registration, collect
-   on the running id says "still running" (not the stale failure), manager shows no duplicate
-   READY row; (b) a **backgrounded resume** (`background: true` + `resume`) settles into a
-   fresh READY entry and its notification fires.
+   on the running id says "still running" (not the stale failure); (b) a **backgrounded resume** (`background: true` + `resume`) settles into a
+   fresh `backgroundResults` entry and its notification fires.
 9. **Stale-ctx status path:** `ctx.ui.setStatus` through the module-level ctx captured on an
    EARLIER (already-returned) tool call — i.e. the sink's own refresh, not just the
    relay-ctx dialog of item 2 — updates the footer for as long as the parent session lives;
    if the host rejects a completed tool call's ctx, fall back to the rc relay path or drop
    the live-elapsed tick (degrade to event-driven only) — decide then, not during.
-10. **Manager eventBus subscription lifetime:** open the manager, let a background run settle
-   (row appears without keypress), close the manager, settle another — no leak/crash from
-   the closed view's listener (the `finish()` unsubscribe works).
-11. **Session switch with an in-flight background run** (`switchSession`/`newSession`):
-    the footer slot's behavior (persists/clears/no crash), and the run itself keeps running
-    and settles normally (notification may target the switched-away session — document what
-    happens).
-12. **Cross-child relay mutex hold:** with a backgrounded dialog open, a second child's
+10. **Session switch with an in-flight background run** (`switchSession`/`newSession`/
+    `fork`/`reload`): the run is SIGTERM'd on `session_shutdown`, the footer slot is
+    cleared, and no completion notification fires for it. Verify: `/new` with a run in
+    flight → the child process is gone (`ps`), the footer is empty, no follow-up arrives.
+11. **Cross-child relay mutex hold:** with a backgrounded dialog open, a second child's
     relay queues behind it; the queued child's stall watchdog keeps running (its
     `relayPending` is set only after the mutex) — observe the queued behavior and that
     answering/Esc on the first dialog releases the queue.
+
+### Verification status (observed 2026-09-14)
+
+Results from the manual verification pass on the target box:
+
+- **1 — follow-up delivery:** PASS. Delivered as its own turn when the parent was idle;
+  queued and drained at run end when the parent was mid-turn (no drop, no double turn).
+- **2 — relay via a completed tool ctx:** PASS. A `ctx.ui.confirm` from a background child
+  surfaced while the parent was idle and while mid-turn; the answer reached the child
+  (`confirm result: true`) and Esc cancelled cleanly (`confirm result: false`). Exercised
+  with a temporary probe tool (the relay forwards only `select`/`confirm`/`input`);
+  `ask_user_question` reaches the same path via its RPC-mode `select`/`input` fallback.
+- **3 — `setStatus` slot:** PASS. `⏳ <n>: <agent> …` while running, cleared on settle;
+  `subagent_collect` does not touch the slot (the footer is running-only).
+- **5 — coalescing:** PASS. Two closes within ms (direct SIGTERM sweep) produced one
+  follow-up listing both ids; completions seconds apart arrived as separate turns.
+- **6 — spawn bridge:** PASS. Normal spawn returns the spawn text in ms; `background: true`
+  with an unknown agent returns the real failure immediately, not the spawn text.
+- **7a — kill store-invariant:** PASS. After a kill, `subagent_collect` returns the settled
+  failure, never "still running".
+- **8 — supersession:** PASS. A backgrounded resume deleted the stale entry at registration
+  (collect on the running id said "still running"); the resumed run settled into a fresh
+  entry and notified.
+- **9 — stale-ctx status path:** PASS. Sink-driven refreshes updated the footer through the
+  captured completed-tool ctx.
+- **10 — session switch:** PASS. `/clone` with a live background run: the child was
+  SIGTERM'd (`exitCode: 143`), its `.pid` removed and failure artifacts persisted, the
+  footer cleared, and no completion notification fired.
+- **11 — cross-child relay mutex:** PASS for serialization: with two background children
+  prompting, exactly one dialog showed at a time (A, then B after A was resolved).
+- **4 — RPC-mode parent:** not applicable to this deployment (the owner drives sessions via
+  the rc phone client, not `pi --mode rpc`).
+- **7b — exit-fallback store:** code-verified only. The fallback is unreachable in practice
+  (pi reaps the child's process tree, so a `sleep`-style grandchild cannot hold the pipe
+  past exit); the defensive `unregisterActiveSubagent` is the sink's first step, so the
+  both-maps state the item guards against cannot occur.
+- **11 (stall-watchdog nuance)** — unobserved: verifying that a child queued behind a held
+  relay keeps its stall watchdog running requires an unanswered dialog held >300 s.
 
 ## 6. Out of scope / future
 

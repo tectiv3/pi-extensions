@@ -4,7 +4,7 @@ pi coding-agent extensions, TypeScript, loaded directly by pi (no build step).
 
 - **`subagent/`** — subagent tool: delegates tasks to specialized agents with isolated context
   windows. Single, parallel, and chain modes; persistence and resume of interrupted runs;
-  live attach and steering of running subagents.
+  background runs with follow-up notifications; live attach and steering of running subagents.
 - **`ask-user-question/`** — structured question tool: single- and multi-question prompts with
   typed option pages, tabbed navigation for multiple questions, `allowOther` free-text option,
   and remote answer relay (answers can arrive from the mobile companion via the `rc` extension).
@@ -33,6 +33,12 @@ Ctrl+C abort propagation. Added here:
 - **Per-subagent abort** — from the manager view.
 - **Question relay** — a subagent's own `ask_user_question` call is relayed to the parent,
   so a child can ask the user questions through the parent's tool.
+- **Background runs** — `background: true` returns immediately and leaves the child running
+  detached from parent Escape; completion is delivered as a coalesced follow-up notification
+  (settlements within 100 ms arrive as a single turn) and the full result is fetched with
+  `subagent_collect`.
+- **Running-subagents footer** — the pi footer shows live running subagents
+  (`⏳ <n>: <agent> <elapsed>`) while any run is in flight.
 
 **`ask-user-question/`** is a fork of the
 [questionnaire example](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/examples/extensions/questionnaire.ts)

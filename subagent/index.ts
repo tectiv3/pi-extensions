@@ -302,6 +302,13 @@ interface ActiveSubagent {
     // Steer handle for a new LLM turn; wired at spawn so the attach view can
     // reach it later.
     steer: (message: string) => void
+    // Runtime backgrounding (docs/plans/subagent-runtime-background.md): the
+    // manager view's `b` key converts a foreground single-mode tool-call run
+    // mid-flight. Wired only for backgroundable runs.
+    backgroundize?: () => boolean
+    // Set once backgroundize succeeds; the manager's bg badge and the tool's
+    // "sent to background" result read it.
+    runtimeBackgrounded?: boolean
 }
 
 const activeSubagents = new Map<string, ActiveSubagent>()
@@ -688,6 +695,9 @@ interface SingleResult {
     resumeNote?: string
     errorMessage?: string
     step?: number
+    // Set when a foreground run was runtime-backgrounded: the awaiting tool
+    // call returned early with the backgrounded notice instead of the result.
+    runtimeBackgrounded?: boolean
 }
 
 interface SubagentDetails {
@@ -1860,7 +1870,8 @@ async function runSingleAgent(
     onSpawned?: (entry: ActiveSubagent) => void,
     relayUiRequest?: RelayUiRequest,
     toolCallId?: string,
-    background: boolean = false
+    background: boolean = false,
+    runtimeBackgroundable: boolean = false
 ): Promise<SingleResult> {
     const subagentId = resume?.id ?? uuidv7()
     const {
@@ -1920,6 +1931,30 @@ async function runSingleAgent(
 
     let tmpPromptDir: string | null = null
     let tmpPromptPath: string | null = null
+    // Spawn-time background is immutable; runtime backgrounding (manager `b`)
+    // flips this mid-flight. Everything that must re-evaluate after the flip
+    // (relay abort wiring, onUpdate streaming, the settlement sink) reads this
+    // mutable copy, not the `background` param.
+    let backgrounded = background
+    // The --append-system-prompt tmp file is deleted when this invocation is
+    // done with it — except on the runtime-backgrounded early return, where
+    // the child may still be booting and has not read the file yet (pi reads
+    // it exactly once, at startup). That path defers to the exit continuation.
+    const cleanupTmpPrompt = () => {
+        if (tmpPromptPath)
+            try {
+                fs.unlinkSync(tmpPromptPath)
+            } catch {
+                /* ignore */
+            }
+        if (tmpPromptDir)
+            try {
+                fs.rmdirSync(tmpPromptDir)
+            } catch {
+                /* ignore */
+            }
+    }
+    let tmpCleanupDeferred = false
 
     const currentResult: SingleResult = {
         agent: agentName,
@@ -1945,6 +1980,8 @@ async function runSingleAgent(
     }
 
     const emitUpdate = () => {
+        // Runtime-backgrounded: the tool call has returned; nothing streams.
+        if (backgrounded) return
         if (onUpdate) {
             onUpdate({
                 content: [
@@ -1987,7 +2024,17 @@ async function runSingleAgent(
         const tag = subagentId.slice(0, 8)
         const debug = (msg: string) => subagentDebugLog(`[subagent:${tag}] ${msg}`)
 
-        const exitCode = await new Promise<number>(resolve => {
+        // Runtime backgrounding: resolved by entry.backgroundize (manager `b`)
+        // while the child keeps running. Races the exit promise below, exit
+        // term first, so a simultaneous settle counts as an exit.
+        let backgroundizeResolve!: () => void
+        const backgroundizePromise = runtimeBackgroundable
+            ? new Promise<void>(resolve => {
+                  backgroundizeResolve = resolve
+              })
+            : undefined
+
+        const exitCodePromise = new Promise<number>(resolve => {
             const invocation = getPiInvocation(args)
             debug(`spawn: ${invocation.command} ${invocation.args.join(' ')}`)
             const proc = spawn(invocation.command, invocation.args, {
@@ -2010,6 +2057,10 @@ async function runSingleAgent(
             let resolved = false
             let lastActivityTime = Date.now()
             let relayPending = false
+            // Abort-detach handle for a pending relayed question; runtime
+            // backgrounding drops it, leaving relays without an abort source
+            // exactly like spawn-time background.
+            let pendingRelayAbortCleanup: (() => void) | undefined
             let eventCount = 0
             let lastEventType = ''
             let stdinClosed = false
@@ -2069,11 +2120,14 @@ async function runSingleAgent(
                     let relayAbortCleanup: (() => void) | undefined
                     // Foreground only: background runs have no abort source, so the
                     // relay stays open until the user answers or dismisses (spec §1.1).
-                    if (!background && signal) {
+                    // `backgrounded` (mutable), not `background`: a
+                    // runtime-backgrounded run stops wiring new relays mid-flight.
+                    if (!backgrounded && signal) {
                         const onRunAbort = () => controller.abort()
                         signal.addEventListener('abort', onRunAbort, { once: true })
                         relayAbortCleanup = () =>
                             signal.removeEventListener('abort', onRunAbort)
+                        pendingRelayAbortCleanup = relayAbortCleanup
                     }
                     try {
                         const response = await relayUiRequest(
@@ -2108,6 +2162,7 @@ async function runSingleAgent(
                     } finally {
                         relayPending = false
                         lastActivityTime = Date.now()
+                        pendingRelayAbortCleanup = undefined
                         relayAbortCleanup?.()
                         release()
                     }
@@ -2204,6 +2259,25 @@ async function runSingleAgent(
             // async; the awaiting caller resumes first), so callers can
             // attach immediately — /subagents resume relies on this.
             onSpawned?.(entry)
+
+            if (runtimeBackgroundable) {
+                // Manager `b` converts this run mid-flight: the awaiting tool
+                // call returns early while the child keeps running detached.
+                // Refusals: already converted (idempotent), or the child
+                // already exited/settled — the exit term wins the race below.
+                entry.backgroundize = () => {
+                    if (entry.runtimeBackgrounded) return true
+                    if (resolved || entry.settled) return false
+                    entry.runtimeBackgrounded = true
+                    backgrounded = true
+                    // Detach the parent's abort wiring: Escape must no longer
+                    // kill the child, and a pending relay loses its abort source.
+                    abortCleanup?.()
+                    pendingRelayAbortCleanup?.()
+                    backgroundizeResolve()
+                    return true
+                }
+            }
 
             const processLine = (line: string) => {
                 if (!line.trim()) return
@@ -2425,6 +2499,11 @@ async function runSingleAgent(
             }, STALL_CHECK_INTERVAL_MS)
             stallWatchdog.unref()
 
+            // Spawn-time decision only (the `background` param): foreground
+            // runs wire the parent's abort signal to kill. abortCleanup lets
+            // runtime backgrounding drop the listener afterwards; an already-
+            // aborted signal needs no listener and no cleanup.
+            let abortCleanup: (() => void) | undefined
             if (!background && signal) {
                 const killProc = () => {
                     wasAborted = true
@@ -2435,62 +2514,92 @@ async function runSingleAgent(
                     }, 5000)
                 }
                 if (signal.aborted) killProc()
-                else signal.addEventListener('abort', killProc, { once: true })
+                else {
+                    signal.addEventListener('abort', killProc, { once: true })
+                    abortCleanup = () => signal.removeEventListener('abort', killProc)
+                }
             }
         })
-        debug(`promise resolved: exitCode=${exitCode}`)
+        const outcome = await (backgroundizePromise
+            ? // Exit term first: when both are settled, Promise.race resolves
+              // the first array element — an exit tie must not read backgrounded.
+              Promise.race([
+                  exitCodePromise.then((code): { kind: 'exit'; code: number } => ({
+                      kind: 'exit',
+                      code,
+                  })),
+                  backgroundizePromise.then((): { kind: 'backgrounded' } => ({
+                      kind: 'backgrounded',
+                  })),
+              ])
+            : exitCodePromise.then(code => ({ kind: 'exit' as const, code })))
 
-        currentResult.exitCode = exitCode
-        if (wasAborted) {
-            currentResult.aborted = true
-            currentResult.stopReason = 'aborted'
+        // Exit bookkeeping shared by the direct-exit path and the
+        // runtime-backgrounded exit continuation — runs exactly once, and for
+        // the latter only from the continuation, never inline (the tool call
+        // has already returned).
+        const finalizeExit = (exitCode: number): SingleResult => {
+            debug(`promise resolved: exitCode=${exitCode}`)
+
+            currentResult.exitCode = exitCode
+            if (wasAborted) {
+                currentResult.aborted = true
+                currentResult.stopReason = 'aborted'
+            }
+
+            const status = wasAborted
+                ? 'aborted'
+                : isFailedResult(currentResult)
+                  ? 'failed'
+                  : 'succeeded'
+            removeSubagentFile(pidPath)
+            if (status === 'succeeded') {
+                removeSubagentFile(sessionPath)
+                removeSubagentFile(metaPath)
+            } else {
+                writeSubagentMetaFile(metaPath, {
+                    ...spawnMeta,
+                    status,
+                    stopReason: currentResult.stopReason,
+                    exitCode,
+                    sessionHeaderId: readSessionHeaderId(sessionPath),
+                })
+            }
+
+            debug(`returning: status=${status} stopReason=${currentResult.stopReason ?? '-'}`)
+            if (backgrounded) {
+                // Synchronous, no awaits: preserves the store-before-notify
+                // ordering the sink's invariants rely on (spec 1.2.2).
+                try {
+                    settleBackgroundRun(subagentId, currentResult)
+                } catch (err) {
+                    subagentDebugLog(
+                        `[subagent:background] settle failed: ${err instanceof Error ? err.message : String(err)}`
+                    )
+                }
+            }
+            return currentResult
         }
 
-        const status = wasAborted
-            ? 'aborted'
-            : isFailedResult(currentResult)
-              ? 'failed'
-              : 'succeeded'
-        removeSubagentFile(pidPath)
-        if (status === 'succeeded') {
-            removeSubagentFile(sessionPath)
-            removeSubagentFile(metaPath)
-        } else {
-            writeSubagentMetaFile(metaPath, {
-                ...spawnMeta,
-                status,
-                stopReason: currentResult.stopReason,
-                exitCode,
-                sessionHeaderId: readSessionHeaderId(sessionPath),
-            })
-        }
-
-        debug(`returning: status=${status} stopReason=${currentResult.stopReason ?? '-'}`)
-        if (background) {
-            // Synchronous, no awaits: preserves the store-before-notify
-            // ordering the sink's invariants rely on (spec 1.2.2).
-            try {
-                settleBackgroundRun(subagentId, currentResult)
-            } catch (err) {
-                subagentDebugLog(
-                    `[subagent:background] settle failed: ${err instanceof Error ? err.message : String(err)}`
+        if (outcome.kind === 'backgrounded') {
+            // The finally must not delete the tmp prompt file while the child
+            // may still be booting; the exit continuation cleans up instead.
+            tmpCleanupDeferred = true
+            void exitCodePromise
+                .then(code => finalizeExit(code))
+                .catch(err =>
+                    subagentDebugLog(
+                        `[subagent:${tag}] exit continuation failed: ${
+                            err instanceof Error ? err.message : String(err)
+                        }`
+                    )
                 )
-            }
+                .finally(cleanupTmpPrompt)
+            return { ...currentResult, runtimeBackgrounded: true }
         }
-        return currentResult
+        return finalizeExit(outcome.code)
     } finally {
-        if (tmpPromptPath)
-            try {
-                fs.unlinkSync(tmpPromptPath)
-            } catch {
-                /* ignore */
-            }
-        if (tmpPromptDir)
-            try {
-                fs.rmdirSync(tmpPromptDir)
-            } catch {
-                /* ignore */
-            }
+        if (!tmpCleanupDeferred) cleanupTmpPrompt()
     }
 }
 
@@ -2768,6 +2877,7 @@ async function openSubagentsManager(ctx: ExtensionContext): Promise<void> {
                     theme.fg('toolTitle', row.agent) +
                     ' ' +
                     theme.fg('muted', formatElapsedMs(Date.now() - row.startedAt)) +
+                    (row.entry.runtimeBackgrounded ? theme.fg('accent', ' bg') : '') +
                     ' ' +
                     theme.fg('dim', preview)
                 )
@@ -2795,7 +2905,11 @@ async function openSubagentsManager(ctx: ExtensionContext): Promise<void> {
             const nav = theme.fg('dim', '↑↓/jk select · ')
             if (row.kind === 'running')
                 return (
-                    nav + theme.fg('dim', 'Enter/a attach · x abort · i inspect · Esc/q close')
+                    nav +
+                    theme.fg(
+                        'dim',
+                        'Enter/a attach · b background · x abort · i inspect · Esc/q close'
+                    )
                 )
             return nav + theme.fg('dim', 'Enter/r resume · d delete · i inspect · Esc/q close')
         }
@@ -2904,6 +3018,29 @@ async function openSubagentsManager(ctx: ExtensionContext): Promise<void> {
                         true
                     )
                 }
+                return
+            }
+            if (ch === 'b') {
+                if (row.kind !== 'running') {
+                    showNotice('background applies to running rows only', true)
+                    return
+                }
+                const short = row.id.slice(0, LIST_ID_SHORT_CHARS)
+                if (!row.entry.backgroundize) {
+                    showNotice('background applies to foreground single-mode runs only', true)
+                    return
+                }
+                if (row.entry.runtimeBackgrounded) {
+                    showNotice(`${short} already backgrounded`, true)
+                    return
+                }
+                // Does not close the view: the row stays RUNNING with a bg badge
+                // until the child exits and the settlement sink takes over.
+                if (row.entry.backgroundize())
+                    showNotice(
+                        `Backgrounded ${short} — the tool call returned; completion will be announced.`
+                    )
+                else showNotice(`${short} already finished — nothing to background`, true)
                 return
             }
             if (ch === 'r') {
@@ -3617,8 +3754,28 @@ export default function (pi: ExtensionAPI) {
                     resume,
                     undefined,
                     relayUiRequest,
-                    toolCallId
+                    toolCallId,
+                    false,
+                    // Manager `b` may convert this awaiting call mid-flight
+                    // (foreground single tool-call runs, incl. resume, only).
+                    true
                 )
+                if (result.runtimeBackgrounded) {
+                    return {
+                        content: [
+                            {
+                                type: 'text',
+                                text: [
+                                    `Subagent ${result.subagentId.slice(0, LIST_ID_SHORT_CHARS)} (agent: ${params.agent}) was sent to the background by the user; it keeps running.`,
+                                    `Task: ${previewText(params.task, LIST_TASK_PREVIEW_CHARS)}`,
+                                    `You'll be notified when it completes. Call subagent_collect { id: "${result.subagentId}" } for the result;`,
+                                    `subagent_inspect { id: "${result.subagentId.slice(0, LIST_ID_SHORT_CHARS)}" } for progress.`,
+                                ].join('\n'),
+                            },
+                        ],
+                        details: makeDetails('single')([]),
+                    }
+                }
                 const isError = isFailedResult(result)
                 if (isError) {
                     return {

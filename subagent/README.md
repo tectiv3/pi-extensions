@@ -12,7 +12,7 @@ Delegate tasks to specialized subagents with isolated context windows.
 - **Persistence**: Interrupted or failed runs survive under `~/.pi/agent/subagents/` with a subagent id
 - **Resume**: Continue a persisted run in the same conversation (`resume: "<id or unique prefix>"`, single mode)
 - **Recoverable abort**: Interrupting the parent returns an error tool result with partial output, not an exception
-- **Background runs**: `background: true` returns immediately, leaving the child running; completion is delivered as a notification and fetched with `subagent_collect` (single mode)
+- **Background runs**: `background: true` returns immediately, leaving the child running; completion is delivered as a notification and fetched with `subagent_collect` (single mode); a running foreground single run can also be converted mid-flight from `/subagents` (`b`)
 - **Running-subagents footer**: the pi footer shows live running subagents (`⏳ <n>: <agent> <elapsed>`, refreshed every 10s)
 
 ## Structure
@@ -199,9 +199,12 @@ Scope is the current process only (running runs, or settled results not yet coll
 
 ### Listing runs: `/subagents`
 
-List-only: short id (first 8 characters), agent, status, session size, and a task preview,
-with a footer showing the inspect/resume/delete hints. There is no interactive delete — by
-design, `subagent_inspect` covers the model and `rm` covers the user.
+Opens the interactive manager view (TUI): RUNNING rows — short id (first 8 characters),
+agent, elapsed time, a `bg` badge on runtime-backgrounded runs — above PERSISTED rows
+(status). Keys on a running row: `Enter/a` attach, `b` background (foreground
+single-mode runs only — see [Runtime backgrounding](#runtime-backgrounding)), `x` abort,
+`i` inspect; on a persisted row: `Enter/r` resume, `d` delete, `i` inspect; `Esc/q`
+closes. Print mode keeps the plain text report.
 
 ### Live view: `/subagents attach [id]`
 
@@ -252,6 +255,18 @@ full id plus `subagent_collect` / `subagent_inspect` hints). The child keeps run
 - **Id supersession** — spawning a run whose id has an uncollected background result
   deletes the stale entry at registration, so `subagent_collect` on a re-running id reports
   "still running" rather than the stale result.
+
+### Runtime backgrounding
+
+The `/subagents` manager view's `b` key converts a **running foreground single-mode**
+run (including a foreground `resume`) to a background run mid-flight: the awaiting
+`subagent` tool call returns immediately with a "sent to the background" result (same
+collect/inspect hints as above), the child keeps running detached from the parent's
+abort (Escape no longer kills it), streaming stops, and settlement is delivered exactly
+like a spawn-time background run — completion notification plus `subagent_collect`.
+The manager row stays in RUNNING with a `bg` badge. Parallel tasks, chain steps,
+`/subagents resume` spawns, and spawn-time background runs are not convertible (`b`
+refuses with a notice).
 
 ### Completion notifications
 
@@ -369,7 +384,8 @@ resume hint:
 - **L5 — no true detach**: backgrounded runs do not survive the parent process or a session
   replacement (`/new`, `/resume`, `/fork`, `/reload`); live runs are SIGTERM'd on session
   teardown
-- **L6 — background is single-mode only**: no backgrounded parallel batches or chains
+- **L6 — background is single-mode only**: no backgrounded parallel batches or chains;
+  runtime conversion via the manager's `b` is single-mode too (foreground single tool-call runs)
 - **L7 — `subagent_collect` is process-scoped**: persisted runs from other sessions use
   `subagent_inspect` / `/subagents resume`
 - **L8 — no auto-cancel for relayed questions**: a backgrounded child blocked on a relayed

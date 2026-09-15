@@ -8,6 +8,12 @@ pi coding-agent extensions, TypeScript, loaded directly by pi (no build step).
 - **`ask-user-question/`** — structured question tool: single- and multi-question prompts with
   typed option pages, tabbed navigation for multiple questions, `allowOther` free-text option,
   and remote answer relay (answers can arrive from the mobile companion via the `rc` extension).
+- **`index/`** — index tool: shells out to the shared `idx` binary (maki-style) to return a compact
+  source-file skeleton (imports, types, signatures with `[start-end]` line ranges) or directory
+  listing, so the model can `read` with offset/limit only the sections it needs. Resolves the
+  binary via `IDX_BIN` → PATH → `~/.local/bin/idx`; when absent, the tool fails
+  with an install hint, and appends a use-`index`-first system-prompt nudge only when the binary
+  is found and the tool is active.
 
 ## Diffs from the pi examples
 
@@ -61,6 +67,7 @@ Symlink each extension directory into your agent dir:
 ```sh
 ln -s "$PWD/subagent" ~/.pi/agent/extensions/subagent
 ln -s "$PWD/ask-user-question" ~/.pi/agent/extensions/ask-user-question
+ln -s "$PWD/index" ~/.pi/agent/extensions/index
 ```
 
 Type-checks against host pi package stubs in `types.d.ts`; see `AGENTS.md` for the check

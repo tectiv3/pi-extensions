@@ -46,6 +46,11 @@ import {
 } from '@earendil-works/pi-tui'
 import { Type } from 'typebox'
 import { type AgentConfig, type AgentScope, discoverAgents } from './agents.ts'
+import {
+    advanceSessionEpoch,
+    currentSessionEpoch,
+    isCurrentSessionRun,
+} from './session-epoch.ts'
 
 const MAX_PARALLEL_TASKS = 8
 const MAX_CONCURRENCY = 4
@@ -352,11 +357,11 @@ function unregisterActiveSubagent(id: string): void {
 // from child callbacks (spawn/close) that have no ctx of their own.
 let latestExtensionCtx: ExtensionContext | undefined
 
-// Set when the session is being torn down (session_shutdown): the extension is
-// about to be reloaded, so live children are killed and completion notifications
-// are suppressed (a killed run belongs to the session that is going away, and the
-// captured `pi` is stale by the time a drain would run).
-let sessionTearingDown = false
+// pi caches the extension factory per cwd, so this module is evaluated once per
+// process and survives session replacement. Session-scoped state is therefore
+// advanced explicitly via sessionEpoch: a run captures the epoch at spawn and is
+// suppressed when it no longer matches the current session (see
+// settleBackgroundRun/isCurrentSessionRun).
 
 // Single 10s timer driving the footer clock while any subagent runs; started and
 // stopped inside refreshSubagentStatus so callers never manage it.
@@ -421,7 +426,9 @@ function refreshSubagentStatus(): void {
 // which would otherwise leave the id in both maps), then store, coalesced
 // notify enqueue, footer refresh. Every step is independently guarded — the
 // store-before-notify ordering IS the shutdown containment.
-function settleBackgroundRun(id: string, result: SingleResult): void {
+function settleBackgroundRun(id: string, result: SingleResult, runEpoch: number): void {
+    // A run from a torn-down session must not store or notify into the new one.
+    if (!isCurrentSessionRun(runEpoch)) return
     try {
         unregisterActiveSubagent(id)
     } catch {
@@ -473,7 +480,6 @@ function buildBackgroundNotification(result: SingleResult): string {
 }
 
 function enqueueBackgroundNotification(result: SingleResult): void {
-    if (sessionTearingDown) return
     notifyQueue.push(result)
     if (!notifyDrainTimer) {
         notifyDrainTimer = setTimeout(drainBackgroundNotifications, 100)
@@ -1874,6 +1880,7 @@ async function runSingleAgent(
     runtimeBackgroundable: boolean = false
 ): Promise<SingleResult> {
     const subagentId = resume?.id ?? uuidv7()
+    const runEpoch = currentSessionEpoch()
     const {
         session: sessionPath,
         pid: pidPath,
@@ -2571,7 +2578,7 @@ async function runSingleAgent(
                 // Synchronous, no awaits: preserves the store-before-notify
                 // ordering the sink's invariants rely on (spec 1.2.2).
                 try {
-                    settleBackgroundRun(subagentId, currentResult)
+                    settleBackgroundRun(subagentId, currentResult, runEpoch)
                 } catch (err) {
                     subagentDebugLog(
                         `[subagent:background] settle failed: ${err instanceof Error ? err.message : String(err)}`
@@ -3283,12 +3290,12 @@ export default function (pi: ExtensionAPI) {
     eventBus = pi.events
     latestPi = pi
 
-    // Session teardown (quit/reload/new/resume/fork) reloads this extension and
-    // drops the module-level registries, so any live child would become an
-    // untracked orphan. Kill them and drop the in-memory state; notifications are
-    // suppressed (see sessionTearingDown).
+    // pi caches the extension factory and does NOT re-evaluate this module on
+    // session replacement, so this handler explicitly advances the epoch and
+    // resets session state: killed children belong to the session going away,
+    // and their epoch-stale settlements must not notify into the new one.
     pi.on('session_shutdown', () => {
-        sessionTearingDown = true
+        advanceSessionEpoch()
         if (notifyDrainTimer) {
             clearTimeout(notifyDrainTimer)
             notifyDrainTimer = undefined
@@ -3315,6 +3322,7 @@ export default function (pi: ExtensionAPI) {
                 // Already dead.
             }
         }
+        activeSubagents.clear()
     })
 
     pi.registerTool({

@@ -462,6 +462,7 @@ function buildBackgroundNotification(result: SingleResult): string {
                 result.aborted ? 'aborted' : 'failed'
             }.`,
             formatFailureReport(result),
+            result.resumeNote ?? '',
             formatResumeHint(result) ? `/subagents resume ${shortId}` : '',
             `Call subagent_collect { id: "${result.subagentId}" } for the full result.`,
         ]
@@ -469,7 +470,7 @@ function buildBackgroundNotification(result: SingleResult): string {
             .join('\n\n')
     }
     const finalOutput = getFinalOutput(result.messages)
-    return [
+    const notification = [
         `Background subagent ${shortId} (${result.agent}) finished.`,
         finalOutput.length > INSPECT_FINAL_OUTPUT_CAP
             ? `${finalOutput.slice(0, INSPECT_FINAL_OUTPUT_CAP)}...`
@@ -477,6 +478,7 @@ function buildBackgroundNotification(result: SingleResult): string {
         formatUsageStats(result.usage, result.model),
         `Call subagent_collect { id: "${result.subagentId}" } for the full result.`,
     ].join('\n\n')
+    return result.resumeNote ? `${notification}\n\n${result.resumeNote}` : notification
 }
 
 function enqueueBackgroundNotification(result: SingleResult): void {
@@ -1920,23 +1922,29 @@ async function runSingleAgent(
     let model: string | undefined
     let thinkingLevel: ThinkingLevel | undefined
     let resumeNote: string | undefined
+    // Per-item tasks/chain models bypass the top-level guard, so normalize here to
+    // keep an empty string from winning the ?? chain or reaching spawnMeta/resumeNote.
+    const override = overrideModel && overrideModel.trim() !== '' ? overrideModel : undefined
     if (resume) {
-        model = overrideModel ?? resume.meta.model ?? dispatchDefaults.model
-        if (overrideModel === undefined) {
+        model = override ?? resume.meta.model ?? dispatchDefaults.model
+        if (override === undefined) {
             // Continuity: the recorded level belongs to the recorded model.
             thinkingLevel = resume.meta.thinkingLevel
         } else if (model === dispatchDefaults.model) {
             thinkingLevel = dispatchDefaults.thinkingLevel
         }
-        if (overrideModel !== undefined) {
-            resumeNote = `Resumed with the requested model override (${overrideModel}); the original run's model and thinking level were not reused.`
+        if (override !== undefined) {
+            resumeNote =
+                override === resume.meta.model
+                    ? `Resumed with the requested model override (${override}); the thinking level was re-derived from the current dispatch.`
+                    : `Resumed with the requested model override (${override}); the original run's model and thinking level were not reused.`
         } else if (!resume.meta.model) {
             resumeNote = model
                 ? `Resumed with the current dispatch model (${model}); the original run recorded none.`
                 : 'Resumed without a recorded model; the child used its own default model.'
         }
     } else {
-        model = overrideModel ?? agent.model ?? dispatchDefaults.model
+        model = override ?? agent.model ?? dispatchDefaults.model
         // A differing model is an explicit choice, so it gets the child's own default level.
         if (model === dispatchDefaults.model) thinkingLevel = dispatchDefaults.thinkingLevel
     }
@@ -3441,6 +3449,18 @@ export default function (pi: ExtensionAPI) {
                     isError: true,
                 }
             }
+            if (params.model !== undefined && params.model.trim() === '') {
+                return {
+                    content: [
+                        {
+                            type: 'text',
+                            text: 'model must be a non-empty "provider/model-id" string.',
+                        },
+                    ],
+                    details: makeDetails('single')([]),
+                    isError: true,
+                }
+            }
             if (params.model !== undefined && (hasChain || hasTasks)) {
                 return {
                     content: [
@@ -3832,7 +3852,14 @@ export default function (pi: ExtensionAPI) {
                 const isError = isFailedResult(result)
                 if (isError) {
                     return {
-                        content: [{ type: 'text', text: formatFailureReport(result) }],
+                        content: [
+                            {
+                                type: 'text',
+                                text: result.resumeNote
+                                    ? `${formatFailureReport(result)}\n\n${result.resumeNote}`
+                                    : formatFailureReport(result),
+                            },
+                        ],
                         details: makeDetails('single')([result]),
                         isError: true,
                     }
@@ -3881,7 +3908,8 @@ export default function (pi: ExtensionAPI) {
                         theme.fg('muted', `${i + 1}.`) +
                         ' ' +
                         theme.fg('accent', step.agent) +
-                        theme.fg('dim', ` ${preview}`)
+                        theme.fg('dim', ` ${preview}`) +
+                        (step.model ? theme.fg('muted', ` model=${step.model}`) : '')
                 }
                 if (args.chain.length > 3)
                     text += `\n  ${theme.fg('muted', `... +${args.chain.length - 3} more`)}`
@@ -3894,7 +3922,7 @@ export default function (pi: ExtensionAPI) {
                     theme.fg('muted', ` [${scope}]`)
                 for (const t of args.tasks.slice(0, 3)) {
                     const preview = t.task.length > 40 ? `${t.task.slice(0, 40)}...` : t.task
-                    text += `\n  ${theme.fg('accent', t.agent)}${theme.fg('dim', ` ${preview}`)}`
+                    text += `\n  ${theme.fg('accent', t.agent)}${theme.fg('dim', ` ${preview}`)}${t.model ? theme.fg('muted', ` model=${t.model}`) : ''}`
                 }
                 if (args.tasks.length > 3)
                     text += `\n  ${theme.fg('muted', `... +${args.tasks.length - 3} more`)}`
@@ -3909,7 +3937,8 @@ export default function (pi: ExtensionAPI) {
             let text =
                 theme.fg('toolTitle', theme.bold('subagent ')) +
                 theme.fg('accent', agentName) +
-                theme.fg('muted', ` [${scope}]`)
+                theme.fg('muted', ` [${scope}]`) +
+                (args.model ? theme.fg('muted', ` model=${args.model}`) : '')
             text += `\n  ${theme.fg('dim', preview)}`
             return new Text(text, 0, 0)
         },
@@ -4385,6 +4414,7 @@ export default function (pi: ExtensionAPI) {
             } else {
                 lines.push(formatFailureReport(result))
             }
+            if (result.resumeNote) lines.push(result.resumeNote)
             backgroundResults.delete(resolved.id)
             return {
                 content: [{ type: 'text', text: lines.join('\n\n') }],

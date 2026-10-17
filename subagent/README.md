@@ -134,7 +134,8 @@ A frontmatter pin is a **per-agent default**, not the agent's identity — an ex
 dispatch model overrides it.
 
 **Single mode only at the top level.** `model` next to `tasks`/`chain` is rejected with an
-error rather than silently ignored; set it per item instead.
+error rather than silently ignored; set it per item instead. An empty or whitespace-only
+`model` is rejected too — it is not treated as "no override".
 
 **Thinking level.** The child inherits the parent's thinking level only when the resolved
 model equals the parent session model. A model chosen by dispatch override or by an agent
@@ -142,8 +143,10 @@ pin that differs from the parent means an explicit model choice, so the child us
 default thinking level. (`thinking` is not a tool parameter; this rule is derived.)
 
 **Resume.** A resume without `model` re-passes the recorded model and thinking level from
-the meta sidecar, exactly as before. A resume **with** `model` overrides the recorded model,
-re-derives the thinking level by the rule above, and says so in the tool result. The
+the meta sidecar, exactly as before. A resume **with** `model` overrides the recorded model and
+re-derives the thinking level by the rule above; the note about this appears in the foreground
+result, the background completion notification, and `subagent_collect`. When the override
+equals the recorded model, the note says only that the thinking level was re-derived. The
 sidecar's `model` is rewritten to the resolved model on every spawn, so it always records
 the run's **last** model: resuming twice, the second time without `model`, continues on the
 model the override-resume used.
@@ -204,7 +207,8 @@ subagent { agent: "scout", task: "<continuation instruction>", resume: "<id>" }
   The `task` text is the continuation instruction.
 - The original run's model and thinking level are re-passed from the meta sidecar; if the
   original run recorded no model, the current dispatch model (or the child's default) is
-  used, noted in the tool result. Passing `model` at resume overrides the recorded model —
+  used, noted in the foreground result, the background completion notification, and
+  `subagent_collect`. Passing `model` at resume overrides the recorded model —
   see [Per-dispatch model](#per-dispatch-model).
 - Guards, in order:
   1. The id must resolve — exact id with a readable meta sidecar, or a unique prefix among

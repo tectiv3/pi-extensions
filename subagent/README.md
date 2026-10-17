@@ -104,6 +104,56 @@ Use a chain: first have scout find the read tool, then have planner suggest impr
 The extension also registers the `subagent_inspect` and `subagent_collect` tools and the
 `/subagents` command — see [Persistence & Resume](#persistence--resume).
 
+## Per-dispatch model
+
+A dispatch can name the child's model explicitly, so agent files stay model-agnostic
+instead of one file per `(agent, model)` pair:
+
+```
+subagent { agent: "scout", task: "find the auth code", model: "anthropic/claude-haiku-4-5" }
+subagent { tasks: [
+  { agent: "scout", task: "find models",  model: "anthropic/claude-haiku-4-5" },
+  { agent: "scout", task: "find routes" }
+] }
+subagent { chain: [
+  { agent: "scout",   task: "find the read tool" },
+  { agent: "planner", task: "review {previous}", model: "anthropic/claude-sonnet-4-5" }
+] }
+```
+
+`model` takes a `provider/model-id` string, the same form pi uses on the command line.
+Precedence, highest first:
+
+| Source | Scope | Applies when |
+|--------|-------|--------------|
+| dispatch `model` | this call (single) or this item (tasks/chain) | always wins |
+| agent frontmatter `model:` | every run of that agent file | no dispatch model |
+| parent session model | the default for all dispatches | neither of the above |
+
+A frontmatter pin is a **per-agent default**, not the agent's identity — an explicit
+dispatch model overrides it.
+
+**Single mode only at the top level.** `model` next to `tasks`/`chain` is rejected with an
+error rather than silently ignored; set it per item instead.
+
+**Thinking level.** The child inherits the parent's thinking level only when the resolved
+model equals the parent session model. A model chosen by dispatch override or by an agent
+pin that differs from the parent means an explicit model choice, so the child uses its own
+default thinking level. (`thinking` is not a tool parameter; this rule is derived.)
+
+**Resume.** A resume without `model` re-passes the recorded model and thinking level from
+the meta sidecar, exactly as before. A resume **with** `model` overrides the recorded model,
+re-derives the thinking level by the rule above, and says so in the tool result. The
+sidecar's `model` is rewritten to the resolved model on every spawn, so it always records
+the run's **last** model: resuming twice, the second time without `model`, continues on the
+model the override-resume used.
+
+**Unknown models are not validated client-side** — the child pi process is the source of
+truth. An unknown provider (`nope/nope`) makes the child exit immediately, and the run is
+reported failed. A known provider with an unknown model id (`anthropic/does-not-exist`)
+only makes pi fabricate a fallback model with a warning: the child starts and may fail
+later, when a request is made.
+
 ## Persistence & Resume
 
 Every invocation (single task, chain step, or parallel task) gets a UUIDv7 subagent id and
@@ -154,7 +204,8 @@ subagent { agent: "scout", task: "<continuation instruction>", resume: "<id>" }
   The `task` text is the continuation instruction.
 - The original run's model and thinking level are re-passed from the meta sidecar; if the
   original run recorded no model, the current dispatch model (or the child's default) is
-  used, noted in the tool result.
+  used, noted in the tool result. Passing `model` at resume overrides the recorded model —
+  see [Per-dispatch model](#per-dispatch-model).
 - Guards, in order:
   1. The id must resolve — exact id with a readable meta sidecar, or a unique prefix among
      this session's persisted runs; otherwise the error lists the available persisted ids

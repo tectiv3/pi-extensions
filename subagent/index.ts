@@ -1877,7 +1877,8 @@ async function runSingleAgent(
     relayUiRequest?: RelayUiRequest,
     toolCallId?: string,
     background: boolean = false,
-    runtimeBackgroundable: boolean = false
+    runtimeBackgroundable: boolean = false,
+    overrideModel?: string
 ): Promise<SingleResult> {
     const subagentId = resume?.id ?? uuidv7()
     const runEpoch = currentSessionEpoch()
@@ -1914,23 +1915,30 @@ async function runSingleAgent(
 
     const args: string[] = ['--mode', 'rpc', '--session', sessionPath]
     // Resumes re-pass the recorded model/thinking because they reflect the original run;
-    // continuity matters more than the current dispatch defaults.
+    // continuity matters more than the current dispatch defaults. An explicit override
+    // still wins: the user's choice at dispatch/resume time is the newer intent.
     let model: string | undefined
     let thinkingLevel: ThinkingLevel | undefined
     let resumeNote: string | undefined
     if (resume) {
-        model = resume.meta.model
-        thinkingLevel = resume.meta.thinkingLevel
-        if (!model) {
-            model = dispatchDefaults.model
+        model = overrideModel ?? resume.meta.model ?? dispatchDefaults.model
+        if (overrideModel === undefined) {
+            // Continuity: the recorded level belongs to the recorded model.
+            thinkingLevel = resume.meta.thinkingLevel
+        } else if (model === dispatchDefaults.model) {
+            thinkingLevel = dispatchDefaults.thinkingLevel
+        }
+        if (overrideModel !== undefined) {
+            resumeNote = `Resumed with the requested model override (${overrideModel}); the original run's model and thinking level were not reused.`
+        } else if (!resume.meta.model) {
             resumeNote = model
                 ? `Resumed with the current dispatch model (${model}); the original run recorded none.`
                 : 'Resumed without a recorded model; the child used its own default model.'
         }
     } else {
-        model = agent.model ?? dispatchDefaults.model
-        // Only agents without a pinned model inherit the dispatch thinking level.
-        if (!agent.model) thinkingLevel = dispatchDefaults.thinkingLevel
+        model = overrideModel ?? agent.model ?? dispatchDefaults.model
+        // A differing model is an explicit choice, so it gets the child's own default level.
+        if (model === dispatchDefaults.model) thinkingLevel = dispatchDefaults.thinkingLevel
     }
     if (model) args.push('--model', model)
     if (thinkingLevel) args.push('--thinking', thinkingLevel)
@@ -3206,12 +3214,25 @@ async function openSubagentInspectView(
     })
 }
 
+// The typebox stub exposes no Static<typeof Schema>, so the parallel dispatch loop
+// declares the item shape it receives from params.tasks.
+type DispatchItem = {
+    agent: string
+    task: string
+    cwd?: string
+    model?: string
+}
+
+const MODEL_OVERRIDE_DESCRIPTION =
+    "Model override for this dispatch, 'provider/model-id'. Precedence: explicit > agent file pin > parent session default."
+
 const TaskItem = Type.Object({
     agent: Type.String({ description: 'Name of the agent to invoke' }),
     task: Type.String({ description: 'Task to delegate to the agent' }),
     cwd: Type.Optional(
         Type.String({ description: 'Working directory for the agent process' })
     ),
+    model: Type.Optional(Type.String({ description: MODEL_OVERRIDE_DESCRIPTION })),
 })
 
 const ChainItem = Type.Object({
@@ -3222,6 +3243,7 @@ const ChainItem = Type.Object({
     cwd: Type.Optional(
         Type.String({ description: 'Working directory for the agent process' })
     ),
+    model: Type.Optional(Type.String({ description: MODEL_OVERRIDE_DESCRIPTION })),
 })
 
 const AgentScopeSchema = StringEnum(['user', 'project', 'both'] as const, {
@@ -3237,6 +3259,7 @@ const SubagentParams = Type.Object({
         })
     ),
     task: Type.Optional(Type.String({ description: 'Task to delegate (for single mode)' })),
+    model: Type.Optional(Type.String({ description: MODEL_OVERRIDE_DESCRIPTION })),
     resume: Type.Optional(
         Type.String({
             description:
@@ -3336,6 +3359,7 @@ export default function (pi: ExtensionAPI) {
             `Default agent scope is "user" (from ${path.join(getAgentDir(), 'agents')}).`,
             `To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
             'Background: background: true (single mode only) returns immediately; the child keeps running and completion is reported via notification; fetch results with subagent_collect.',
+            'Model: model: "provider/model-id" overrides the agent file pin and the parent session default for that dispatch (single mode; per item in tasks/chain).',
         ].join(' '),
         parameters: SubagentParams,
 
@@ -3411,6 +3435,18 @@ export default function (pi: ExtensionAPI) {
                         {
                             type: 'text',
                             text: 'background mode is single-mode only ({agent, task, background: true}).',
+                        },
+                    ],
+                    details: makeDetails('single')([]),
+                    isError: true,
+                }
+            }
+            if (params.model !== undefined && (hasChain || hasTasks)) {
+                return {
+                    content: [
+                        {
+                            type: 'text',
+                            text: 'model is single-mode only ({agent, task, model}); set model per item in tasks/chain.',
                         },
                     ],
                     details: makeDetails('single')([]),
@@ -3496,7 +3532,10 @@ export default function (pi: ExtensionAPI) {
                         undefined,
                         undefined,
                         relayUiRequest,
-                        toolCallId
+                        toolCallId,
+                        false,
+                        false,
+                        step.model
                     )
                     results.push(result)
 
@@ -3585,7 +3624,7 @@ export default function (pi: ExtensionAPI) {
                 const results = await mapWithConcurrencyLimit(
                     params.tasks,
                     MAX_CONCURRENCY,
-                    async (t, index) => {
+                    async (t: DispatchItem, index) => {
                         const result = await runSingleAgent(
                             ctx.cwd,
                             dispatchDefaults,
@@ -3606,7 +3645,10 @@ export default function (pi: ExtensionAPI) {
                             undefined,
                             undefined,
                             relayUiRequest,
-                            toolCallId
+                            toolCallId,
+                            false,
+                            false,
+                            t.model
                         )
                         allResults[index] = result
                         emitParallelUpdate()
@@ -3699,7 +3741,9 @@ export default function (pi: ExtensionAPI) {
                         },
                         relayUiRequest,
                         toolCallId, // rc-server attach-by-toolCallId correlation
-                        true
+                        true,
+                        false,
+                        params.model
                     )
                     runPromise.then(
                         result => settleBridge({ kind: 'pre-spawn', result }),
@@ -3766,7 +3810,8 @@ export default function (pi: ExtensionAPI) {
                     false,
                     // Manager `b` may convert this awaiting call mid-flight
                     // (foreground single tool-call runs, incl. resume, only).
-                    true
+                    true,
+                    params.model
                 )
                 if (result.runtimeBackgrounded) {
                     return {

@@ -39,7 +39,7 @@ declare module '@earendil-works/pi-coding-agent' {
         cwd: string
         mode: string
         model?: Record<string, unknown>
-        thinkingLevel?: string
+        thinkingLevel?: import('@earendil-works/pi-agent-core').ThinkingLevel
         hasUI?: boolean
         isIdle(): boolean
         hasPendingMessages(): boolean
@@ -196,7 +196,7 @@ declare module '@earendil-works/pi-tui' {
 }
 
 declare module '@earendil-works/pi-agent-core' {
-    export type ThinkingLevel = 'none' | 'low' | 'medium' | 'high'
+    export type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
     export interface AgentToolResult<T = unknown> {
         content: Array<{ type: string; text: string }>
         details?: T

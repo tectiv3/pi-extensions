@@ -325,16 +325,18 @@ refuses with a notice).
 
 ### Completion notifications
 
-On settlement (success or failure) the result is stored in memory and a follow-up message
-is delivered to the model on its next turn:
+On settlement (success or failure) the result is stored in memory and a notification
+message is delivered to the model at the parent's next turn (after its current
+assistant turn and its tool calls):
 
 - **Success** — a header with the short id and agent, the final output truncated to 2000
   chars, the usage line, and a `Call subagent_collect { id: "<full id>" }` hint.
 - **Failure** — the failure report and a resume hint instead of the output.
 
-Settlements within 100 ms of each other are coalesced into a single follow-up listing every
-id; settlements further apart arrive as separate turns. A notification queued while the
-parent is mid-turn is delivered when the parent's run ends.
+Settlements within 100 ms of each other are coalesced into a single notification listing
+every id; settlements further apart arrive as separate turns. No notice is sent once the
+result is collected or superseded; a late notice for an already-collected result says no
+action is needed.
 
 ### Running-subagents footer
 

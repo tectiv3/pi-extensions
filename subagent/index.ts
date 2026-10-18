@@ -465,6 +465,7 @@ function buildBackgroundNotification(result: SingleResult): string {
             result.resumeNote ?? '',
             formatResumeHint(result) ? `/subagents resume ${shortId}` : '',
             `Call subagent_collect { id: "${result.subagentId}" } for the full result.`,
+            'If you already collected this id, no action is needed.',
         ]
             .filter(Boolean)
             .join('\n\n')
@@ -477,6 +478,7 @@ function buildBackgroundNotification(result: SingleResult): string {
             : finalOutput,
         formatUsageStats(result.usage, result.model),
         `Call subagent_collect { id: "${result.subagentId}" } for the full result.`,
+        'If you already collected this id, no action is needed.',
     ].join('\n\n')
     return result.resumeNote ? `${notification}\n\n${result.resumeNote}` : notification
 }
@@ -489,7 +491,7 @@ function enqueueBackgroundNotification(result: SingleResult): void {
     }
 }
 
-// One followUp per drain covering every block enqueued since the last drain
+// One notification per drain covering every block enqueued since the last drain
 // (kill-sweeps settle within ms of each other → one message, one turn of N
 // parallel subagent_collect calls). The snapshot AND clear happen before the
 // send: a block enqueued mid-drain sees no pending timer and arms a fresh one
@@ -498,9 +500,11 @@ function drainBackgroundNotifications(): void {
     notifyDrainTimer = undefined
     const batch = notifyQueue
     notifyQueue = []
-    const text = batch.map(buildBackgroundNotification).join('\n\n')
+    const liveBatch = batch.filter(r => backgroundResults.get(r.subagentId) === r)
+    if (liveBatch.length === 0) return
+    const text = liveBatch.map(buildBackgroundNotification).join('\n\n')
     try {
-        latestPi?.sendUserMessage(text, { deliverAs: 'followUp' })
+        latestPi?.sendUserMessage(text, { deliverAs: 'steer' })
     } catch (err) {
         subagentDebugLog(
             `[subagent:background] notify failed: ${err instanceof Error ? err.message : String(err)}`

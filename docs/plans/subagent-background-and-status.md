@@ -197,6 +197,10 @@ call has already returned, so the caller stores the result instead:
 module scope alongside `eventBus`; `deliverAs: 'steer'` was rejected — mid-turn injection
 disrupts in-flight reasoning and followUp is visible next turn anyway).
 
+> **Superseded:** the `deliverAs` rejection above no longer applies — completion
+> notifications now use `steer` and suppress notices for collected/superseded results. The
+> rest of this section is historical.
+
 - Success:
   ```
   Background subagent <shortId> (<agent>) finished.

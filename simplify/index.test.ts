@@ -50,6 +50,32 @@ function upstreamBase(args: string[]): ExecResult | undefined {
     return undefined
 }
 
+function noUpstreamBase(args: string[]): ExecResult | undefined {
+    const key = args.join(' ')
+    if (key === 'rev-parse --is-inside-work-tree') return ok('true\n')
+    if (key === 'rev-parse --abbrev-ref --symbolic-full-name @{upstream}') return fail()
+    if (key === 'rev-parse HEAD') return ok(`${HEAD_SHA}\n`)
+    return undefined
+}
+
+function makeCommandHarness(handler: (args: string[]) => ExecResult | undefined) {
+    const { pi, calls } = makeExec(handler)
+    const notices: Array<[string, string]> = []
+    const sent: Array<{ text: string; opts?: { deliverAs?: string } }> = []
+    const ctx = {
+        cwd: '/repo',
+        ui: {
+            notify: (message: string, severity: string) => notices.push([message, severity]),
+        },
+    } as unknown as ExtensionCommandContext
+    const api = {
+        ...pi,
+        sendUserMessage: (text: string, opts?: { deliverAs?: string }) =>
+            sent.push({ text, opts }),
+    } as unknown as ExtensionAPI
+    return { api, ctx, notices, sent, calls }
+}
+
 const baseMeta: SimplifyMeta = {
     baseLabel: `origin/main (${BASE_SHA.slice(0, 7)})`,
     source: 'upstream',
@@ -222,6 +248,7 @@ test('resolveBase resolves upstream, explicit refs, HEAD, and invalid refs', asy
     const upstream = makeExec(upstreamBase)
     assert.deepEqual(await resolveBase(upstream.pi, '/repo'), {
         base: BASE_SHA,
+        name: 'origin/main',
         label: `origin/main (${BASE_SHA.slice(0, 7)})`,
         source: 'upstream',
     })
@@ -235,19 +262,15 @@ test('resolveBase resolves upstream, explicit refs, HEAD, and invalid refs', asy
     })
     assert.deepEqual(await resolveBase(ref.pi, '/repo', 'main'), {
         base: MERGE_SHA,
+        name: 'main',
         label: `main (${MERGE_SHA.slice(0, 7)})`,
         source: 'ref',
     })
 
-    const head = makeExec(args => {
-        const key = args.join(' ')
-        if (key === 'rev-parse --is-inside-work-tree') return ok('true\n')
-        if (key === 'rev-parse --abbrev-ref --symbolic-full-name @{upstream}') return fail()
-        if (key === 'rev-parse HEAD') return ok(`${HEAD_SHA}\n`)
-        return undefined
-    })
+    const head = makeExec(noUpstreamBase)
     assert.deepEqual(await resolveBase(head.pi, '/repo'), {
         base: HEAD_SHA,
+        name: 'HEAD',
         label: 'HEAD',
         source: 'head',
     })
@@ -332,10 +355,9 @@ test('getChangedFiles --staged excludes untracked files and uses --cached', asyn
 
 test('getChangedFiles keeps an explicit file with no diff as whole-file scope', async () => {
     const { pi, calls } = makeExec(args => {
+        const base = noUpstreamBase(args)
+        if (base) return base
         const key = args.join(' ')
-        if (key === 'rev-parse --is-inside-work-tree') return ok('true\n')
-        if (key === 'rev-parse --abbrev-ref --symbolic-full-name @{upstream}') return fail()
-        if (key === 'rev-parse HEAD') return ok(`${HEAD_SHA}\n`)
         if (key.startsWith('diff --name-status')) return ok('')
         if (key.startsWith('ls-files --others')) return ok('')
         return undefined
@@ -357,10 +379,9 @@ test('getChangedFiles keeps an explicit file with no diff as whole-file scope', 
 
 test('getChangedFiles ignores auto-discovered lockfiles but not explicit paths', async () => {
     const { pi } = makeExec(args => {
+        const base = noUpstreamBase(args)
+        if (base) return base
         const key = args.join(' ')
-        if (key === 'rev-parse --is-inside-work-tree') return ok('true\n')
-        if (key === 'rev-parse --abbrev-ref --symbolic-full-name @{upstream}') return fail()
-        if (key === 'rev-parse HEAD') return ok(`${HEAD_SHA}\n`)
         if (key.startsWith('diff --name-status')) {
             return args.includes('--')
                 ? ok('M\0package-lock.json\0')
@@ -404,16 +425,7 @@ test('getArgumentCompletions completes flags and cached files', () => {
 })
 
 test('handleSimplifyCommand reports ignored-only and empty staged scopes', async () => {
-    const notices: Array<[string, string]> = []
-    const ctx = {
-        cwd: '/repo',
-        ui: {
-            notify: (message: string, severity: string) => notices.push([message, severity]),
-        },
-    } as unknown as ExtensionCommandContext
-    const sent: string[] = []
-
-    const ignored = makeExec(args => {
+    const ignored = makeCommandHarness(args => {
         const base = upstreamBase(args)
         if (base) return base
         if (args.join(' ') === `diff --name-status -z ${BASE_SHA}`) {
@@ -422,36 +434,31 @@ test('handleSimplifyCommand reports ignored-only and empty staged scopes', async
         if (args[0] === 'ls-files') return ok('')
         return undefined
     })
-    const ignoredApi = {
-        ...ignored.pi,
-        sendUserMessage: (text: string) => sent.push(text),
-    } as unknown as ExtensionAPI
 
-    await handleSimplifyCommand('', ctx, ignoredApi)
+    await handleSimplifyCommand('', ignored.ctx, ignored.api)
     assert.match(
-        notices.at(-1)?.[0] ?? '',
+        ignored.notices.at(-1)?.[0] ?? '',
         /No reviewable files: 1 changed file\(s\) were excluded/
     )
-    assert.equal(sent.length, 0)
+    assert.equal(ignored.sent.length, 0)
 
-    const staged = makeExec(args => {
+    const staged = makeCommandHarness(args => {
         const base = upstreamBase(args)
         if (base) return base
         if (args.join(' ').startsWith('diff --name-status -z --cached')) return ok('')
         return undefined
     })
-    const stagedApi = {
-        ...staged.pi,
-        sendUserMessage: (text: string) => sent.push(text),
-    } as unknown as ExtensionAPI
 
-    await handleSimplifyCommand('--staged', ctx, stagedApi)
-    assert.match(notices.at(-1)?.[0] ?? '', /No staged changes relative to origin\/main/)
-    assert.equal(sent.length, 0)
+    await handleSimplifyCommand('--staged', staged.ctx, staged.api)
+    assert.match(
+        staged.notices.at(-1)?.[0] ?? '',
+        /No staged changes relative to origin\/main/
+    )
+    assert.equal(staged.sent.length, 0)
 })
 
 test('handleSimplifyCommand notifies errors, sends a follow-up, and caches completions', async () => {
-    const { pi } = makeExec(args => {
+    const { api, ctx, notices, sent } = makeCommandHarness(args => {
         const base = upstreamBase(args)
         if (base) return base
         const key = args.join(' ')
@@ -460,18 +467,6 @@ test('handleSimplifyCommand notifies errors, sends a follow-up, and caches compl
         if (key.startsWith('diff --unified=0')) return ok('@@ -4 +4,2 @@\n')
         return undefined
     })
-    const notices: Array<[string, string]> = []
-    const sent: Array<{ text: string; opts: unknown }> = []
-    const ctx = {
-        cwd: '/repo',
-        ui: {
-            notify: (message: string, severity: string) => notices.push([message, severity]),
-        },
-    } as unknown as ExtensionCommandContext
-    const api = {
-        ...pi,
-        sendUserMessage: (text: string, opts: unknown) => sent.push({ text, opts }),
-    } as unknown as ExtensionAPI
 
     await handleSimplifyCommand('', ctx, api)
 
@@ -479,18 +474,18 @@ test('handleSimplifyCommand notifies errors, sends a follow-up, and caches compl
     assert.equal(notices[0]?.[1], 'info')
     assert.match(notices[0]?.[0] ?? '', /reviewing 1 file\(s\) relative to origin\/main/)
     assert.equal(sent.length, 1)
-    assert.equal((sent[0]?.opts as { deliverAs?: string }).deliverAs, 'followUp')
+    assert.equal(sent[0]?.opts?.deliverAs, 'followUp')
     assert.match(sent[0]?.text ?? '', /src\/command\.ts/)
     assert.deepEqual(
         getArgumentCompletions('src/').map(item => item.value),
         ['src/command.ts']
     )
 
-    const invalid = makeExec(args =>
+    const invalid = makeCommandHarness(args =>
         args.join(' ') === 'rev-parse --is-inside-work-tree' ? ok('true\n') : undefined
     )
-    await handleSimplifyCommand('--ref=nope', ctx, invalid.pi as unknown as ExtensionAPI)
-    assert.equal(notices.at(-1)?.[1], 'error')
-    assert.match(notices.at(-1)?.[0] ?? '', /Unknown git ref: nope/)
-    assert.equal(sent.length, 1)
+    await handleSimplifyCommand('--ref=nope', invalid.ctx, invalid.api)
+    assert.equal(invalid.notices.at(-1)?.[1], 'error')
+    assert.match(invalid.notices.at(-1)?.[0] ?? '', /Unknown git ref: nope/)
+    assert.equal(invalid.sent.length, 0)
 })

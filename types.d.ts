@@ -23,14 +23,7 @@ declare module '@earendil-works/pi-coding-agent' {
                 description: string
                 getArgumentCompletions?: (
                     argumentPrefix: string
-                ) =>
-                    | Array<{ value: string; label: string; description: string }>
-                    | null
-                    | Promise<Array<{
-                          value: string
-                          label: string
-                          description: string
-                      }> | null>
+                ) => Array<{ value: string; label: string; description: string }>
                 handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>
             }
         ): void

@@ -33,6 +33,7 @@ export interface SimplifyOptions {
 
 export interface BaseInfo {
     readonly base?: string
+    readonly name: string
     readonly label: string
     readonly source: Exclude<BaseSource, 'none'>
 }
@@ -163,8 +164,21 @@ export function parseArgs(args: string): SimplifyOptions {
     return ref === undefined ? { files, staged } : { files, ref, staged }
 }
 
-function shortSha(sha: string | undefined): string | undefined {
-    return sha ? sha.slice(0, SHORT_SHA_LENGTH) : undefined
+async function mergeBaseOrRef(
+    pi: ExecApi,
+    cwd: string,
+    ref: string
+): Promise<string | undefined> {
+    const mergeBase = await pi.exec('git', ['merge-base', 'HEAD', ref], { cwd })
+    if (mergeBase.code === 0 && mergeBase.stdout.trim()) return mergeBase.stdout.trim()
+
+    // Unrelated histories share no merge base; diff directly against the ref.
+    const commit = await pi.exec('git', ['rev-parse', `${ref}^{commit}`], { cwd })
+    return commit.code === 0 ? commit.stdout.trim() || undefined : undefined
+}
+
+function labelFor(name: string, base: string | undefined): string {
+    return base ? `${name} (${base.slice(0, SHORT_SHA_LENGTH)})` : name
 }
 
 /** Resolve the diff base and a human-readable label for notifications and prompts. */
@@ -180,13 +194,11 @@ export async function resolveBase(pi: ExecApi, cwd: string, ref?: string): Promi
             ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`],
             { cwd }
         )
-        const refSha = verify.stdout.trim()
-        if (verify.code !== 0 || !refSha) throw new Error(`Unknown git ref: ${ref}`)
+        if (verify.code !== 0 || !verify.stdout.trim())
+            throw new Error(`Unknown git ref: ${ref}`)
 
-        const mergeBase = await pi.exec('git', ['merge-base', 'HEAD', ref], { cwd })
-        const base =
-            mergeBase.code === 0 && mergeBase.stdout.trim() ? mergeBase.stdout.trim() : refSha
-        return { base, label: `${ref} (${shortSha(base)})`, source: 'ref' }
+        const base = await mergeBaseOrRef(pi, cwd, ref)
+        return { base, name: ref, label: labelFor(ref, base), source: 'ref' }
     }
 
     const upstream = await pi.exec(
@@ -196,27 +208,18 @@ export async function resolveBase(pi: ExecApi, cwd: string, ref?: string): Promi
     )
     const upstreamName = upstream.code === 0 ? upstream.stdout.trim() : ''
     if (upstreamName) {
-        const mergeBase = await pi.exec('git', ['merge-base', 'HEAD', upstreamName], { cwd })
-        let base =
-            mergeBase.code === 0 && mergeBase.stdout.trim()
-                ? mergeBase.stdout.trim()
-                : undefined
-        if (!base) {
-            const fallback = await pi.exec('git', ['rev-parse', `${upstreamName}^{commit}`], {
-                cwd,
-            })
-            if (fallback.code === 0) base = fallback.stdout.trim() || undefined
-        }
+        const base = await mergeBaseOrRef(pi, cwd, upstreamName)
         return {
             base,
-            label: `${upstreamName} (${shortSha(base) ?? 'unknown'})`,
+            name: upstreamName,
+            label: labelFor(upstreamName, base),
             source: 'upstream',
         }
     }
 
     const head = await pi.exec('git', ['rev-parse', 'HEAD'], { cwd })
     const base = head.code === 0 ? head.stdout.trim() || undefined : undefined
-    return { base, label: 'HEAD', source: 'head' }
+    return { base, name: 'HEAD', label: 'HEAD', source: 'head' }
 }
 
 /**
@@ -292,7 +295,7 @@ export function shouldIgnore(path: string): boolean {
     const segments = path.split('/')
     if (segments.some(segment => IGNORED_SEGMENTS.has(segment))) return true
 
-    const basename = segments[segments.length - 1] ?? path
+    const basename = segments[segments.length - 1]
     if (IGNORED_BASENAMES.has(basename)) return true
     return GENERATED_FILE.test(basename) || BINARY_FILE.test(basename)
 }
@@ -305,17 +308,13 @@ function formatRanges(ranges: readonly LineRange[]): string {
 
 function formatFile(file: ChangedFile): string {
     if (file.status === 'added') return `- ${file.path} (added; entire file in scope)`
-    if (file.explicit && file.changedLines === undefined) {
-        return `- ${file.path} (explicitly requested; entire file in scope)`
-    }
+    if (file.explicit) return `- ${file.path} (explicitly requested; entire file in scope)`
 
     const unavailable = 'changed lines unavailable — inspect git diff before editing'
     const relation =
-        file.status === 'renamed'
-            ? `renamed from ${file.oldPath}`
-            : file.status === 'copied'
-              ? `copied from ${file.oldPath}`
-              : undefined
+        file.status === 'renamed' || file.status === 'copied'
+            ? `${file.status} from ${file.oldPath}`
+            : undefined
 
     if (file.changedLines === undefined) {
         return `- ${file.path} (${relation ?? file.status}; ${unavailable})`
@@ -333,19 +332,25 @@ function formatFile(file: ChangedFile): string {
     return `- ${file.path} (${file.status}; changed lines: ${formatRanges(file.changedLines)})`
 }
 
+function promptOpening(meta: SimplifyMeta): string {
+    switch (meta.source) {
+        case 'upstream':
+            return `Review the code changed relative to ${meta.baseLabel}: all unpushed commits plus uncommitted and untracked changes.`
+        case 'ref':
+            return `Review the code changed relative to ${meta.baseLabel}.`
+        case 'head':
+            return `Review the code changed relative to ${meta.baseLabel} (uncommitted changes only; no upstream branch is configured).`
+        case 'none':
+            return 'Review the code in this new repository.'
+    }
+}
+
 /** Build the follow-up prompt that scopes simplification to the collected files. */
 export function buildSimplifyPrompt(
     files: readonly ChangedFile[],
     meta: SimplifyMeta
 ): string {
-    const opening =
-        meta.source === 'upstream'
-            ? `Review the code changed relative to ${meta.baseLabel}: all unpushed commits plus uncommitted and untracked changes.`
-            : meta.source === 'ref'
-              ? `Review the code changed relative to ${meta.baseLabel}.`
-              : meta.source === 'head'
-                ? `Review the code changed relative to ${meta.baseLabel} (uncommitted changes only; no upstream branch is configured).`
-                : 'Review the code in this new repository.'
+    const opening = promptOpening(meta)
 
     const stagedNote = meta.staged ? '\n\nOnly staged changes are included.' : ''
     const fileList = files.map(formatFile).join('\n')
@@ -393,21 +398,9 @@ ${fileList}${note}
 5. Summarize what you changed per file, and list worthwhile out-of-scope opportunities you deliberately skipped.`
 }
 
-function trackedDiffArgs(
-    options: SimplifyOptions,
-    sha: string | undefined,
-    extra: readonly string[]
-): string[] {
-    const args = ['diff', ...extra]
-    if (options.staged) args.push('--cached')
-    if (sha) args.push(sha)
-    if (options.files.length > 0) args.push('--', ...options.files)
-    return args
-}
-
-function fileDiffArgs(options: SimplifyOptions, sha: string, file: ChangedFile): string[] {
+function fileDiffArgs(staged: boolean, sha: string, file: ChangedFile): string[] {
     const args = ['diff', '--unified=0', '--no-ext-diff']
-    if (options.staged) args.push('--cached')
+    if (staged) args.push('--cached')
     args.push(sha, '--', file.path)
     if (file.oldPath && file.oldPath !== file.path) args.push(file.oldPath)
     return args
@@ -416,7 +409,7 @@ function fileDiffArgs(options: SimplifyOptions, sha: string, file: ChangedFile):
 async function addChangedLines(
     pi: ExecApi,
     cwd: string,
-    options: SimplifyOptions,
+    staged: boolean,
     sha: string | undefined,
     files: readonly ChangedFile[]
 ): Promise<ChangedFile[]> {
@@ -425,7 +418,7 @@ async function addChangedLines(
             if (file.status === 'added' || file.explicit) return file
             if (!sha) return file
 
-            const result = await pi.exec('git', fileDiffArgs(options, sha, file), { cwd })
+            const result = await pi.exec('git', fileDiffArgs(staged, sha, file), { cwd })
             return result.code === 0
                 ? { ...file, changedLines: parseChangedLines(result.stdout) }
                 : file
@@ -437,25 +430,28 @@ async function addChangedLines(
 export async function getChangedFiles(
     pi: ExecApi,
     cwd: string,
-    options: SimplifyOptions,
-    resolvedBase?: BaseInfo
+    options: SimplifyOptions
 ): Promise<ChangedFilesResult> {
-    const base = resolvedBase ?? (await resolveBase(pi, cwd, options.ref))
+    const base = await resolveBase(pi, cwd, options.ref)
     const explicitPaths = new Set(options.files)
     let skippedCount = 0
 
-    const diff = await pi.exec(
-        'git',
-        trackedDiffArgs(options, base.base, ['--name-status', '-z']),
-        { cwd }
-    )
+    const diffArgs = ['diff', '--name-status', '-z']
+    if (options.staged) diffArgs.push('--cached')
+    if (base.base) diffArgs.push(base.base)
+    if (options.files.length > 0) diffArgs.push('--', ...options.files)
+
+    const diff = await pi.exec('git', diffArgs, { cwd })
     if (diff.code !== 0) {
         throw new Error(diff.stderr.trim() || `git diff failed with exit code ${diff.code}.`)
     }
 
+    const shouldSkip = (path: string): boolean =>
+        !explicitPaths.has(path) && shouldIgnore(path)
+
     const tracked: ChangedFile[] = []
     for (const file of parseNameStatus(diff.stdout)) {
-        if (!explicitPaths.has(file.path) && shouldIgnore(file.path)) {
+        if (shouldSkip(file.path)) {
             skippedCount += 1
             continue
         }
@@ -470,7 +466,7 @@ export async function getChangedFiles(
         if (result.code === 0) {
             for (const path of result.stdout.split('\0')) {
                 if (!path) continue
-                if (!explicitPaths.has(path) && shouldIgnore(path)) {
+                if (shouldSkip(path)) {
                     skippedCount += 1
                     continue
                 }
@@ -499,24 +495,20 @@ export async function getChangedFiles(
     )
     const omittedCount = Math.max(0, sorted.length - MAX_FILES)
     const capped = sorted.slice(0, MAX_FILES)
-    const files = await addChangedLines(pi, cwd, options, base.base, capped)
+    const files = await addChangedLines(pi, cwd, options.staged, base.base, capped)
 
     return { files, base, skippedCount, omittedCount }
 }
 
-function labelName(label: string): string {
-    return label.replace(/\s+\([0-9a-f]{7}\)$/, '')
-}
-
-function emptyMessage(source: BaseSource, label: string, staged: boolean): string {
-    if (staged) return `No staged changes relative to ${labelName(label)}.`
+function emptyMessage(source: BaseSource, base: BaseInfo, staged: boolean): string {
+    if (staged) return `No staged changes relative to ${base.name}.`
     if (source === 'upstream') {
-        return `Nothing unpushed or uncommitted relative to ${labelName(label)}. Pass file paths or --ref=<branch> to review something else.`
+        return `Nothing unpushed or uncommitted relative to ${base.name}. Pass file paths or --ref=<branch> to review something else.`
     }
     if (source === 'head') {
         return 'No uncommitted changes. Configure an upstream branch or pass --ref=<branch> to review committed work.'
     }
-    if (source === 'ref') return `No changes relative to ${labelName(label)}.`
+    if (source === 'ref') return `No changes relative to ${base.name}.`
     return 'No changed files found.'
 }
 
@@ -530,15 +522,9 @@ export async function handleSimplifyCommand(
     pi: ExtensionAPI
 ): Promise<void> {
     let options: SimplifyOptions
-    try {
-        options = parseArgs(args)
-    } catch (error) {
-        ctx.ui.notify(error instanceof Error ? error.message : String(error), 'error')
-        return
-    }
-
     let result: ChangedFilesResult
     try {
+        options = parseArgs(args)
         result = await getChangedFiles(pi, ctx.cwd, options)
     } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), 'error')
@@ -554,7 +540,7 @@ export async function handleSimplifyCommand(
             )
             return
         }
-        ctx.ui.notify(emptyMessage(source, result.base.label, options.staged), 'info')
+        ctx.ui.notify(emptyMessage(source, result.base, options.staged), 'info')
         return
     }
 

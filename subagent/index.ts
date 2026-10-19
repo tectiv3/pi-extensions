@@ -69,6 +69,10 @@ const INSPECT_ENTRY_PREVIEW_CHARS = 100
 const INSPECT_FINAL_OUTPUT_CAP = 2000
 const LIST_ID_SHORT_CHARS = 8
 const LIST_TASK_PREVIEW_CHARS = 60
+// Children inherit the parent's extensions, so this tool set is present in every
+// child regardless of its `tools:` frontmatter. Denying it unconditionally keeps
+// nesting hard-blocked at one level; `--exclude-tools` applies after `--tools`.
+const SUBAGENT_TOOL_NAMES = ['subagent', 'subagent_inspect', 'subagent_collect'] as const
 // /subagents resume: instruction sent when the user provides none, and how
 // long the command waits for the spawned child to appear in the registry
 // before reporting failure (covers pre-spawn exits inside runSingleAgent).
@@ -1955,6 +1959,9 @@ async function runSingleAgent(
     if (model) args.push('--model', model)
     if (thinkingLevel) args.push('--thinking', thinkingLevel)
     if (agent.tools && agent.tools.length > 0) args.push('--tools', agent.tools.join(','))
+    // Unconditional: agents without `tools:` would otherwise inherit the full default
+    // toolset and could delegate again, defeating the single-level guarantee.
+    args.push('--exclude-tools', SUBAGENT_TOOL_NAMES.join(','))
 
     let tmpPromptDir: string | null = null
     let tmpPromptPath: string | null = null

@@ -5,6 +5,7 @@ Delegate tasks to specialized subagents with isolated context windows.
 ## Features
 
 - **Isolated context**: Each subagent runs in a separate `pi` process
+- **One delegation level**: Children are spawned with `--exclude-tools` for the subagent tools, so a subagent cannot delegate further
 - **Streaming output**: See tool calls and progress as they happen
 - **Parallel streaming**: All parallel tasks stream updates simultaneously
 - **Markdown rendering**: Final output rendered with proper formatting (expanded view)
@@ -103,6 +104,12 @@ Use a chain: first have scout find the read tool, then have planner suggest impr
 
 The extension also registers the `subagent_inspect` and `subagent_collect` tools and the
 `/subagents` command — see [Persistence & Resume](#persistence--resume).
+
+**Delegation is one level deep.** Every child is spawned with `--exclude-tools`
+listing `subagent`, `subagent_inspect`, and `subagent_collect`, so subagents cannot
+themselves delegate. The denylist is applied after `--tools`, so it holds for agents
+without `tools:` frontmatter too — those would otherwise inherit the full default
+toolset. Nesting is hard-blocked, not merely discouraged by a prompt.
 
 ## Per-dispatch model
 

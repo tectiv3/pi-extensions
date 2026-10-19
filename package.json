@@ -10,6 +10,6 @@
     "typescript-eslint": "^8.0.0"
   },
   "scripts": {
-    "test": "node --test --experimental-strip-types --no-warnings subagent/session-epoch.test.ts"
+    "test": "node --test --experimental-strip-types --no-warnings subagent/*.test.ts simplify/*.test.ts"
   }
 }

@@ -23,12 +23,24 @@ declare module '@earendil-works/pi-coding-agent' {
                 description: string
                 getArgumentCompletions?: (
                     argumentPrefix: string
-                ) => Array<{ value: string; label: string; description: string }>
+                ) =>
+                    | Array<{ value: string; label: string; description: string }>
+                    | null
+                    | Promise<Array<{
+                          value: string
+                          label: string
+                          description: string
+                      }> | null>
                 handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>
             }
         ): void
         on(event: string, handler: (event: any, ctx: any) => void): void
         sendUserMessage(text: string, opts?: { deliverAs?: string }): void
+        exec(
+            command: string,
+            args: string[],
+            options?: { signal?: AbortSignal; timeout?: number; cwd?: string }
+        ): Promise<{ stdout: string; stderr: string; code: number; killed: boolean }>
         setModel(model: unknown): Promise<boolean>
         setSessionName(name: string): void
         getSessionName(): string | undefined

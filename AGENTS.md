@@ -7,6 +7,7 @@ pi coding-agent extensions (TypeScript, run inside the pi process):
 | `subagent/` | Subagent tool — delegates tasks to specialized agents with isolated context (single, parallel, chain modes). See `subagent/README.md`. |
 | `ask-user-question/` | Structured question tool — single- and multi-question prompts with typed answers (tabbed per-question pages, `allowOther` "Type something" option). |
 | `index/` | Index tool — spawns the shared `idx` binary for maki-style file skeletons and directory listings. |
+| `simplify/` | `/simplify` command — reviews changed code (unpushed + uncommitted by default) within changed line ranges. |
 
 All are symlinked into the consuming pi setup (`~/.pi/agent/extensions/<name>`); there is no
 build step — pi loads the `.ts` files directly.

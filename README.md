@@ -14,6 +14,12 @@ pi coding-agent extensions, TypeScript, loaded directly by pi (no build step).
   binary via `IDX_BIN` → PATH → `~/.local/bin/idx`; when absent, the tool fails
   with an install hint, and appends a use-`index`-first system-prompt nudge only when the binary
   is found and the tool is active.
+- **`simplify/`** — `/simplify` command: reviews changed code for clarity, consistency, and
+  maintainability, scoped to changed line ranges. Default scope is everything unpushed plus
+  uncommitted and untracked changes; `--ref=<git-ref>` diffs against another base, `--staged`
+  limits to the index, and file paths narrow the scope. Filters vendored, generated, lock, and
+  binary files. Adapted from
+  [pi-simplify](https://github.com/MattDevy/pi-extensions/tree/main/packages/pi-simplify) (MIT).
 
 ## Diffs from the pi examples
 
@@ -68,6 +74,7 @@ Symlink each extension directory into your agent dir:
 ln -s "$PWD/subagent" ~/.pi/agent/extensions/subagent
 ln -s "$PWD/ask-user-question" ~/.pi/agent/extensions/ask-user-question
 ln -s "$PWD/index" ~/.pi/agent/extensions/index
+ln -s "$PWD/simplify" ~/.pi/agent/extensions/simplify
 ```
 
 Type-checks against host pi package stubs in `types.d.ts`; see `AGENTS.md` for the check

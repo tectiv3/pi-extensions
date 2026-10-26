@@ -34,12 +34,15 @@
  *      - Durations are measured per thinking run and persisted in the
  *        session, so restored sessions keep showing them.
  *   2. Tool output is collapsed on every session start (`session_start`
- *      covers startup, /reload, /new, /resume and /fork).
+ *      covers startup, /reload, /new, /resume and /fork). Collapsed `bash`
+ *      results are hidden entirely (the call line remains; errors stay
+ *      visible).
  *   3. The `write` tool gets git-style stats in its header line —
  *      `write path +12 -3` (green additions, red deletions) — computed by
  *      diffing the file content before the write executes. Collapsed write
- *      rows show only that header line (the content preview appears when
- *      expanded).
+ *      and edit rows keep pi's content preview by default; the
+ *      `writecollapsed header` setting reduces them to the header line and
+ *      hides the preview.
  *
  * Thinking text is never modified on disk or in the LLM context: folding is
  * display-only, applied through pi's markdown-transformer hook. The write
@@ -840,8 +843,11 @@ export default function smartFold(pi: ExtensionAPI): void {
                       ` ${this.theme.fg('error', `-${stat.removed}`)}`
                     : ''
 
-            if (this.expanded) {
-                // Expanded: everything, with the stat injected into the header line.
+            // Pass pi's lines through untouched apart from the stat: expanded rows
+            // render in full, and collapsed write/edit rows keep pi's native
+            // preview — replacing it with one line would throw away content pi
+            // already decided to show.
+            if (this.expanded || (this.headerOnly && config.writeCollapsed === 'preview')) {
                 const out = lines.slice()
                 if (suffix) {
                     out[headerIndex] =
@@ -875,8 +881,9 @@ export default function smartFold(pi: ExtensionAPI): void {
                 return out
             }
 
-            // Collapsed: single first content line, truncated to the terminal width
-            // with an ellipsis (an extra `…` marks hidden continuation lines).
+            // Collapsed shell/file rows without their own preview: single first
+            // content line, truncated to the terminal width with an ellipsis (an
+            // extra `…` marks hidden continuation lines).
             let line = trimLineFiller(lines[headerIndex])
             if (suffix) line += suffix
             if (lines.length > headerIndex + 1) line += ' …'
@@ -935,12 +942,13 @@ export default function smartFold(pi: ExtensionAPI): void {
     }
 
     /**
-     * Build a renderResult wrapper for tools whose result area shows code
-     * details (edit renders its full diff). Collapsed + header mode shows
-     * nothing (errors stay visible); expanded delegates to pi's renderer.
+     * Build a renderResult wrapper that can hide the result area while the row
+     * is collapsed. `hideWhenCollapsed` is evaluated per render, so settings
+     * changes take effect immediately; errors always delegate to pi.
      */
     const wrapToolRenderResult = (
-        base: { renderResult?: unknown } & Record<string, unknown>
+        base: { renderResult?: unknown } & Record<string, unknown>,
+        hideWhenCollapsed: () => boolean
     ) => {
         const baseRenderResult = base.renderResult as (
             result: unknown,
@@ -955,8 +963,7 @@ export default function smartFold(pi: ExtensionAPI): void {
             theme: ThemeLike,
             context: ToolRenderContextLike & { isError?: boolean }
         ): Component => {
-            if (!options.expanded && config.writeCollapsed === 'header' && !context.isError) {
-                // Fully collapsed: no code/diff details at all in the result area.
+            if (!options.expanded && hideWhenCollapsed() && !context.isError) {
                 return new Container()
             }
             return baseRenderResult(result, options, theme, context)
@@ -964,35 +971,51 @@ export default function smartFold(pi: ExtensionAPI): void {
     }
 
     // Register the overrides: shell/file tools get collapsed-line truncation;
-    // write/edit additionally get `+N -M` stats, header-only collapse and a
-    // detail-free collapsed result area.
+    // write/edit additionally get `+N -M` stats and header-only collapse.
+    // `hideResultWhenCollapsed` decides per tool whether the result area
+    // disappears while collapsed.
+    const hideWriteDetailsWhenCollapsed = (): boolean => config.writeCollapsed === 'header'
     const toolOverrides: Array<
         [
             Record<string, unknown>,
-            Parameters<typeof wrapToolRenderCall>[1] & { hideCollapsedResult?: boolean },
+            Parameters<typeof wrapToolRenderCall>[1] & {
+                hideResultWhenCollapsed?: () => boolean
+            },
         ]
     > = [
-        [createBashToolDefinition(process.cwd()) as unknown as Record<string, unknown>, {}],
+        [
+            createBashToolDefinition(process.cwd()) as unknown as Record<string, unknown>,
+            { hideResultWhenCollapsed: () => true },
+        ],
         [createReadToolDefinition(process.cwd()) as unknown as Record<string, unknown>, {}],
         [createGrepToolDefinition(process.cwd()) as unknown as Record<string, unknown>, {}],
         [createFindToolDefinition(process.cwd()) as unknown as Record<string, unknown>, {}],
         [createLsToolDefinition(process.cwd()) as unknown as Record<string, unknown>, {}],
         [
             createEditToolDefinition(process.cwd()) as unknown as Record<string, unknown>,
-            { headerOnly: true, statFromArgs: countEditsLineDiff, hideCollapsedResult: true },
+            {
+                headerOnly: true,
+                statFromArgs: countEditsLineDiff,
+                hideResultWhenCollapsed: hideWriteDetailsWhenCollapsed,
+            },
         ],
         [
             createWriteToolDefinition(process.cwd()) as unknown as Record<string, unknown>,
-            { headerOnly: true, statFromMap: true, hideCollapsedResult: true },
+            {
+                headerOnly: true,
+                statFromMap: true,
+                hideResultWhenCollapsed: hideWriteDetailsWhenCollapsed,
+            },
         ],
     ]
     for (const [baseTool, opts] of toolOverrides) {
+        const renderResult = opts.hideResultWhenCollapsed
+            ? wrapToolRenderResult(baseTool, opts.hideResultWhenCollapsed)
+            : undefined
         pi.registerTool({
             ...(baseTool as object),
             renderCall: wrapToolRenderCall(baseTool, opts),
-            ...(opts.hideCollapsedResult
-                ? { renderResult: wrapToolRenderResult(baseTool) }
-                : {}),
+            ...(renderResult ? { renderResult } : {}),
         } as never)
     }
 
@@ -1150,7 +1173,7 @@ export default function smartFold(pi: ExtensionAPI): void {
                     currentValue: config.writeCollapsed,
                     values: ['header', 'preview'],
                     description:
-                        'header: collapsed rows show only the first line; preview: keep the content/diff preview (pi default).',
+                        "header: collapsed rows show only the header line (content/diff preview hidden); preview: keep pi's content/diff preview (default).",
                 },
             ]
 

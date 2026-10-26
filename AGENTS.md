@@ -8,7 +8,7 @@ pi coding-agent extensions (TypeScript, run inside the pi process):
 | `ask-user-question/` | Structured question tool — single- and multi-question prompts with typed answers (tabbed per-question pages, `allowOther` "Type something" option). |
 | `index/` | Index tool — spawns the shared `idx` binary for maki-style file skeletons and directory listings. |
 | `simplify/` | `/simplify` command — reviews changed code (unpushed + uncommitted by default) within changed line ranges. |
-| `smart-fold/` | Transcript compaction — folds thinking and tool output, adds `+N -M` stats to write/edit rows. Vendored from `@clapecho233/pi-smart-fold` (MIT), config persistence stripped. |
+| `smart-fold/` | Transcript compaction — folds thinking, hides collapsed `bash` output, keeps `read`/`write` previews, adds `+N -M` stats to write/edit rows. Vendored from `@clapecho233/pi-smart-fold` (MIT), config persistence stripped, collapsed-row behaviour retuned. |
 
 All are symlinked into the consuming pi setup (`~/.pi/agent/extensions/<name>`); there is no
 build step — pi loads the `.ts` files directly.

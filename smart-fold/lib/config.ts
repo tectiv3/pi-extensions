@@ -29,7 +29,7 @@ export interface SmartFoldConfig {
      * Collapsed write tool rows:
      * - "header": only the `write <path> +N -M` line (fully collapsed).
      * - "preview": keep pi's default content preview (10 lines).
-     * Default: "header"
+     * Default: "preview"
      */
     writeCollapsed: WriteCollapsedStyle
 }
@@ -38,5 +38,5 @@ export const defaultConfig: SmartFoldConfig = {
     toolsFold: true,
     thinking: 'smart',
     writeStat: true,
-    writeCollapsed: 'header',
+    writeCollapsed: 'preview',
 }

@@ -21,11 +21,13 @@ pi coding-agent extensions, TypeScript, loaded directly by pi (no build step).
   [pi-multi-opencode-go](https://github.com/huaxel/pi-multi-opencode-go) (MIT).
 - **`smart-fold/`** — transcript compaction: finished thinking collapses to one
   `Thought for 12.4s` line (click to expand; live thinking shows a scrolling tail plus elapsed
-  time), tool output folds at session start, and `write`/`edit` rows get `+N -M` stat headers.
-  Folding is display-only — nothing changes in the conversation sent to the model. `/fold` opens
-  a settings picker; settings are session-only. Vendored from
+  time), `bash` rows hide their output while collapsed (errors stay visible), `read`/`grep`/
+  `find`/`ls` keep pi's 10-line preview, and `write`/`edit` keep pi's content preview with a
+  `+N -M` stat appended to the header (`/fold writecollapsed header` reduces them to the header
+  line). Folding is display-only — nothing changes in the conversation sent to the model. `/fold`
+  opens a settings picker; settings are session-only. Vendored from
   [`@clapecho233/pi-smart-fold`](https://www.npmjs.com/package/@clapecho233/pi-smart-fold) (MIT)
-  with its on-disk config file removed.
+  with its on-disk config file removed and collapsed-row behaviour retuned.
 - **`simplify/`** — `/simplify` command: reviews changed code for clarity, consistency, and
   maintainability, scoped to changed line ranges. Default scope is everything unpushed plus
   uncommitted and untracked changes; `--ref=<git-ref>` diffs against another base, `--staged`

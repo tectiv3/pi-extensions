@@ -11,7 +11,7 @@ Delegate tasks to specialized subagents with isolated context windows.
 - **Markdown rendering**: Final output rendered with proper formatting (expanded view)
 - **Usage tracking**: Shows turns, tokens, cost, and context usage per agent
 - **Persistence**: Interrupted or failed runs survive under `~/.pi/agent/subagents/` with a subagent id
-- **Resume**: Continue a persisted run in the same conversation (`resume: "<id or unique prefix>"`, single mode)
+- **Resume**: Continue a persisted run in the same conversation (`resume: "<id or unique suffix>"`, single mode)
 - **Recoverable abort**: Interrupting the parent returns an error tool result with partial output, not an exception
 - **Background runs**: `background: true` returns immediately, leaving the child running; completion is delivered as a notification and fetched with `subagent_collect` (single mode); a running foreground single run can also be converted mid-flight from `/subagents` (`b`)
 - **Running-subagents footer**: the pi footer shows live running subagents (`⏳ <n>: <agent> <elapsed>`, refreshed every 10s)
@@ -206,8 +206,8 @@ subagent { agent: "scout", task: "<continuation instruction>", resume: "<id>" }
 ```
 
 - Single mode only — `resume` alongside `tasks`/`chain` is rejected.
-- The id may be exact or a unique prefix (same semantics as `subagent_inspect`): an exact
-  id resolves across sessions, a prefix is scoped to this pi session; ambiguous prefixes
+- The id may be exact or a unique suffix (same semantics as `subagent_inspect`): an exact
+  id resolves across sessions, a suffix is scoped to this pi session; ambiguous suffixes
   are refused with a list of candidates.
 - The child is spawned with `--session <same path>`, which continues the existing
   conversation (not `--resume`, the interactive picker flag, which is unusable headless).
@@ -218,7 +218,7 @@ subagent { agent: "scout", task: "<continuation instruction>", resume: "<id>" }
   `subagent_collect`. Passing `model` at resume overrides the recorded model —
   see [Per-dispatch model](#per-dispatch-model).
 - Guards, in order:
-  1. The id must resolve — exact id with a readable meta sidecar, or a unique prefix among
+  1. The id must resolve — exact id with a readable meta sidecar, or a unique suffix among
      this session's persisted runs; otherwise the error lists the available persisted ids
      (completed runs are cleaned up).
   2. The pidfile must not belong to a live process — a stale pidfile (parent crashed before
@@ -234,7 +234,7 @@ subagent { agent: "scout", task: "<continuation instruction>", resume: "<id>" }
 `subagent_inspect { id, limit? }` reports status, agent, task, model, usage, and the last
 `limit` transcript entries (default 20; entries render like the collapsed view).
 
-- `id` may be the exact filename id or a unique prefix (ambiguous prefixes list the matches).
+- `id` may be the exact filename id or a unique suffix (ambiguous suffixes list the matches).
 - Status is `running` (via the pidfile), `aborted`, `failed`, or `unknown` (no meta sidecar).
   Successful runs are deleted on completion, so a bare id with no artifacts is
   indistinguishable from a completed run — its output is in the parent's tool result.
@@ -245,7 +245,7 @@ subagent { agent: "scout", task: "<continuation instruction>", resume: "<id>" }
 ### Collecting results: `subagent_collect`
 
 `subagent_collect { id }` fetches the result of a background run. `id` may be exact or a
-unique prefix, resolved against running runs first, then settled-uncollected results held
+unique suffix, resolved against running runs first, then settled-uncollected results held
 in memory for this process. See [Background Runs](#background-runs) for the notification
 that announces a settlement.
 
@@ -261,7 +261,7 @@ Scope is the current process only (running runs, or settled results not yet coll
 
 ### Listing runs: `/subagents`
 
-Opens the interactive manager view (TUI): RUNNING rows — short id (first 8 characters),
+Opens the interactive manager view (TUI): RUNNING rows — short id (last 8 characters),
 agent, elapsed time, a `bg` badge on runtime-backgrounded runs — above PERSISTED rows
 (status). Keys on a running row: `Enter/a` attach, `b` background (foreground
 single-mode runs only — see [Runtime backgrounding](#runtime-backgrounding)), `x` abort,
@@ -274,8 +274,8 @@ Attaches to a **running** subagent and takes over the editor region with a live 
 replayed from the subagent's in-memory ring buffer (last 500 renderable events), so
 late-attaching shows recent history.
 
-- **Resolution**: with an id, exact or unique-prefix match against running subagents
-  (ambiguous prefixes list the matches). Without an id, attaches when exactly one
+- **Resolution**: with an id, exact or unique-suffix match against running subagents
+  (ambiguous suffixes list the matches). Without an id, attaches when exactly one
   subagent is running; otherwise lists the running short ids.
 - **View**: assistant text as Markdown, thinking blocks dimmed and truncated (200 chars),
 tool calls formatted like the parent TUI, tool output truncated (200 chars). Streaming

@@ -67,8 +67,15 @@ const INSPECT_DEFAULT_LIMIT = 20
 const INSPECT_TASK_PREVIEW_CHARS = 200
 const INSPECT_ENTRY_PREVIEW_CHARS = 100
 const INSPECT_FINAL_OUTPUT_CAP = 2000
-const LIST_ID_SHORT_CHARS = 8
+const SHORT_ID_CHARS = 8
 const LIST_TASK_PREVIEW_CHARS = 60
+// UUIDv7 ids lead with a millisecond timestamp; the distinguishing random part is at the tail.
+function shortSubagentId(id: string): string {
+    return id.slice(-SHORT_ID_CHARS)
+}
+function idMatches(requested: string, candidate: string): boolean {
+    return candidate.endsWith(requested)
+}
 // Children inherit the parent's extensions, so this tool set is present in every
 // child regardless of its `tools:` frontmatter. Denying it unconditionally keeps
 // nesting hard-blocked at one level; `--exclude-tools` applies after `--tools`.
@@ -459,7 +466,7 @@ function settleBackgroundRun(id: string, result: SingleResult, runEpoch: number)
 // 1.2.3). The full id always appears in the text: for the model it is the
 // only id source.
 function buildBackgroundNotification(result: SingleResult): string {
-    const shortId = result.subagentId.slice(0, LIST_ID_SHORT_CHARS)
+    const shortId = shortSubagentId(result.subagentId)
     if (isFailedResult(result)) {
         return [
             `Background subagent ${shortId} (${result.agent}) ${
@@ -1063,7 +1070,7 @@ function buildSubagentsListReport(): string {
             ? previewText(entry.meta.task, LIST_TASK_PREVIEW_CHARS)
             : '(meta sidecar unreadable)'
         const size = formatSessionFileSize(getSubagentFilePaths(entry.id).session)
-        return `- ${entry.id.slice(0, LIST_ID_SHORT_CHARS)} — agent: ${agent}, status: ${status}, size: ${size}, task: ${task}`
+        return `- ${shortSubagentId(entry.id)} — agent: ${agent}, status: ${status}, size: ${size}, task: ${task}`
     })
     return [
         ...lines,
@@ -1077,7 +1084,7 @@ function buildSubagentsListReport(): string {
 function formatRunningSubagentsList(entries: ActiveSubagent[]): string[] {
     return entries.map(
         entry =>
-            `- ${entry.id.slice(0, LIST_ID_SHORT_CHARS)} — agent: ${entry.agent}, task: ${previewText(
+            `- ${shortSubagentId(entry.id)} — agent: ${entry.agent}, task: ${previewText(
                 entry.task,
                 LIST_TASK_PREVIEW_CHARS
             )}`
@@ -1093,7 +1100,7 @@ function resolveAttachTarget(id?: string): ActiveSubagent | string {
     if (id) {
         const exact = running.find(entry => entry.id === id)
         if (exact) return exact
-        const matches = running.filter(entry => entry.id.startsWith(id))
+        const matches = running.filter(entry => idMatches(id, entry.id))
         if (matches.length === 1) return matches[0]
         if (matches.length > 1) {
             return [
@@ -1247,7 +1254,7 @@ function buildAttachItems(
 }
 
 async function attachToSubagent(ctx: ExtensionContext, entry: ActiveSubagent): Promise<void> {
-    const shortId = entry.id.slice(0, LIST_ID_SHORT_CHARS)
+    const shortId = shortSubagentId(entry.id)
 
     await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
         let finished = false
@@ -1491,7 +1498,7 @@ function resolveResumeTarget(
     agents: AgentConfig[]
 ): ResumeTarget | string {
     // Same id semantics as subagent_inspect and /subagents resume: an exact
-    // id resolves across sessions, a unique prefix within this session.
+    // id resolves across sessions, a unique suffix within this session.
     const resolution = resolvePersistedResumeTarget(resumeId)
     if ('error' in resolution) return resolution.error
     const { id: runId, meta } = resolution
@@ -1532,13 +1539,13 @@ type InspectTarget = { id: string } | { error: string }
 function resolveInspectTarget(requestedId: string): InspectTarget {
     // An exact id is honored even when its meta sidecar is missing (jsonl-only runs)
     // and even when the run belongs to another session — explicit id is
-    // explicit intent. Prefix candidates are scoped to this session.
+    // explicit intent. Suffix candidates are scoped to this session.
     const { session, pid, meta } = getSubagentFilePaths(requestedId)
     if (fs.existsSync(session) || fs.existsSync(pid) || fs.existsSync(meta))
         return { id: requestedId }
 
     const matches = listSessionPersistedSubagents().filter(entry =>
-        entry.id.startsWith(requestedId)
+        idMatches(requestedId, entry.id)
     )
     if (matches.length === 1) return { id: matches[0].id }
     if (matches.length > 1) {
@@ -1558,7 +1565,7 @@ function resolveInspectTarget(requestedId: string): InspectTarget {
     }
 }
 
-// Id resolution for subagent_collect (spec 1.2.4): exact or unique prefix
+// Id resolution for subagent_collect (spec 1.2.4): exact or unique suffix
 // against the in-memory union activeSubagents ∪ backgroundResults, running
 // branch first — a resumed id is re-registered under its original id, so it
 // must report "still running" instead of its superseded stale READY entry.
@@ -1569,12 +1576,12 @@ type CollectTarget =
     { kind: 'running'; id: string } | { kind: 'ready'; id: string } | { error: string }
 
 function resolveCollectTarget(requestedId: string): CollectTarget {
-    // Running branch first (same exact/unique-prefix convention as
+    // Running branch first (same exact/unique-suffix convention as
     // resolveAttachTarget, scoped to the registry keys).
     const running = [...activeSubagents.values()]
     const exactRunning = running.find(entry => entry.id === requestedId)
     if (exactRunning) return { kind: 'running', id: exactRunning.id }
-    const runningMatches = running.filter(entry => entry.id.startsWith(requestedId))
+    const runningMatches = running.filter(entry => idMatches(requestedId, entry.id))
     if (runningMatches.length === 1) return { kind: 'running', id: runningMatches[0].id }
     if (runningMatches.length > 1) {
         return {
@@ -1589,15 +1596,14 @@ function resolveCollectTarget(requestedId: string): CollectTarget {
     const readyEntries = [...backgroundResults.entries()]
     const exactReady = readyEntries.find(([id]) => id === requestedId)
     if (exactReady) return { kind: 'ready', id: exactReady[0] }
-    const readyMatches = readyEntries.filter(([id]) => id.startsWith(requestedId))
+    const readyMatches = readyEntries.filter(([id]) => idMatches(requestedId, id))
     if (readyMatches.length === 1) return { kind: 'ready', id: readyMatches[0][0] }
     if (readyMatches.length > 1) {
         return {
             error: [
                 `Ambiguous subagent id "${requestedId}" matches ${readyMatches.length} ready subagents:`,
                 ...readyMatches.map(
-                    ([id, stored]) =>
-                        `- ${id.slice(0, LIST_ID_SHORT_CHARS)} — agent: ${stored.agent}`
+                    ([id, stored]) => `- ${shortSubagentId(id)} — agent: ${stored.agent}`
                 ),
                 'Use more characters or the full id.',
             ].join('\n'),
@@ -1607,7 +1613,7 @@ function resolveCollectTarget(requestedId: string): CollectTarget {
     const allIds = [...new Set([...activeSubagents.keys(), ...backgroundResults.keys()])]
     const listing =
         allIds.length > 0
-            ? `Available subagents: ${allIds.map(id => id.slice(0, LIST_ID_SHORT_CHARS)).join(', ')}`
+            ? `Available subagents: ${allIds.map(shortSubagentId).join(', ')}`
             : 'There are no running or ready subagents in this session.'
     return {
         error:
@@ -1616,11 +1622,11 @@ function resolveCollectTarget(requestedId: string): CollectTarget {
     }
 }
 
-// Id resolution for /subagents resume: exact or unique prefix against
+// Id resolution for /subagents resume: exact or unique suffix against
 // persisted runs that have a readable meta sidecar (the agent name and
 // prompt hash needed to relaunch the run live there). Meta reading is
 // shared with the other resolution helpers via listPersistedSubagents.
-// Exact ids resolve across sessions; prefix candidates are scoped to this
+// Exact ids resolve across sessions; suffix candidates are scoped to this
 // session (§11).
 type PersistedResumeResolution = { id: string; meta: SubagentMeta } | { error: string }
 
@@ -1639,7 +1645,7 @@ function resolvePersistedResumeTarget(requestedId: string): PersistedResumeResol
         (entry): entry is PersistedSubagentEntry & { meta: SubagentMeta } =>
             entry.meta !== undefined
     )
-    const matches = resumable.filter(entry => entry.id.startsWith(requestedId))
+    const matches = resumable.filter(entry => idMatches(requestedId, entry.id))
     if (matches.length === 1) return { id: matches[0].id, meta: matches[0].meta }
     if (matches.length > 1) {
         return {
@@ -1673,7 +1679,7 @@ function readSubagentPid(pidPath: string): number | undefined {
 // so in-process races are impossible.
 function deletePersistedRunArtifacts(subagentId: string): string | undefined {
     if (activeSubagents.has(subagentId)) {
-        return `Refused: ${subagentId.slice(0, LIST_ID_SHORT_CHARS)} is running in this session — abort it first.`
+        return `Refused: ${shortSubagentId(subagentId)} is running in this session — abort it first.`
     }
     const { session, pid, meta } = getSubagentFilePaths(subagentId)
     const livePid = readSubagentPid(pid)
@@ -2055,7 +2061,7 @@ async function runSingleAgent(
         }
         writeSubagentMetaFile(metaPath, spawnMeta)
 
-        const tag = subagentId.slice(0, 8)
+        const tag = shortSubagentId(subagentId)
         const debug = (msg: string) => subagentDebugLog(`[subagent:${tag}] ${msg}`)
 
         // Runtime backgrounding: resolved by entry.backgroundize (manager `b`)
@@ -2699,7 +2705,7 @@ async function handleSubagentsResume(ctx: ExtensionContext, rest: string[]): Pro
         emitCommandNotice(ctx, resolved.error, 'warning')
         return
     }
-    const shortId = resolved.id.slice(0, LIST_ID_SHORT_CHARS)
+    const shortId = shortSubagentId(resolved.id)
 
     // Resume needs the interactive attach view; checked after id handling so
     // the omission/resolution notices stay observable in print/rpc modes.
@@ -2906,7 +2912,7 @@ async function openSubagentsManager(ctx: ExtensionContext): Promise<void> {
             if (row.kind === 'running') {
                 return (
                     marker +
-                    theme.fg('accent', row.id.slice(0, LIST_ID_SHORT_CHARS)) +
+                    theme.fg('accent', shortSubagentId(row.id)) +
                     ' ' +
                     theme.fg('toolTitle', row.agent) +
                     ' ' +
@@ -2928,7 +2934,7 @@ async function openSubagentsManager(ctx: ExtensionContext): Promise<void> {
                 ' ' +
                 theme.fg('toolTitle', row.agent) +
                 ' ' +
-                theme.fg('accent', row.id.slice(0, LIST_ID_SHORT_CHARS)) +
+                theme.fg('accent', shortSubagentId(row.id)) +
                 ' ' +
                 theme.fg('dim', preview)
             )
@@ -2957,7 +2963,9 @@ async function openSubagentsManager(ctx: ExtensionContext): Promise<void> {
                 theme.fg('toolTitle', theme.bold('subagents ')) +
                     theme.fg(
                         'muted',
-                        `session ${currentPiSessionId?.slice(0, LIST_ID_SHORT_CHARS) ?? '?'}`
+                        `session ${
+                            currentPiSessionId ? shortSubagentId(currentPiSessionId) : '?'
+                        }`
                     ),
                 '',
                 theme.fg('toolTitle', 'RUNNING'),
@@ -3044,11 +3052,11 @@ async function openSubagentsManager(ctx: ExtensionContext): Promise<void> {
                     // tool-call result settle through the existing handlers.
                     row.entry.proc.kill('SIGTERM')
                     showNotice(
-                        `Aborting ${row.id.slice(0, LIST_ID_SHORT_CHARS)} — SIGTERM sent; the row drops out when the child exits.`
+                        `Aborting ${shortSubagentId(row.id)} — SIGTERM sent; the row drops out when the child exits.`
                     )
                 } catch {
                     showNotice(
-                        `Abort failed: child of ${row.id.slice(0, LIST_ID_SHORT_CHARS)} is already dead`,
+                        `Abort failed: child of ${shortSubagentId(row.id)} is already dead`,
                         true
                     )
                 }
@@ -3059,7 +3067,7 @@ async function openSubagentsManager(ctx: ExtensionContext): Promise<void> {
                     showNotice('background applies to running rows only', true)
                     return
                 }
-                const short = row.id.slice(0, LIST_ID_SHORT_CHARS)
+                const short = shortSubagentId(row.id)
                 if (!row.entry.backgroundize) {
                     showNotice('background applies to foreground single-mode runs only', true)
                     return
@@ -3094,7 +3102,7 @@ async function openSubagentsManager(ctx: ExtensionContext): Promise<void> {
                 if (refusal) showNotice(refusal, true)
                 else
                     showNotice(
-                        `Deleted ${row.id.slice(0, LIST_ID_SHORT_CHARS)} artifacts (.jsonl/.meta/.pid).`
+                        `Deleted ${shortSubagentId(row.id)} artifacts (.jsonl/.meta/.pid).`
                     )
                 return
             }
@@ -3136,7 +3144,7 @@ async function openSubagentInspectView(
     const reportLines = buildSubagentInspectReport(subagentId, INSPECT_DEFAULT_LIMIT).split(
         '\n'
     )
-    const shortId = subagentId.slice(0, LIST_ID_SHORT_CHARS)
+    const shortId = shortSubagentId(subagentId)
     // Header + footer rows on top of the attach view's dock reservation.
     const INSPECT_CHROME_ROWS = 2
 
@@ -3282,7 +3290,7 @@ const SubagentParams = Type.Object({
     resume: Type.Optional(
         Type.String({
             description:
-                'Id (exact or unique prefix) of a persisted subagent run to resume (single mode only)',
+                'Id (exact or unique suffix) of a persisted subagent run to resume (single mode only)',
         })
     ),
     background: Type.Optional(
@@ -3318,7 +3326,7 @@ const SubagentParams = Type.Object({
 
 const SubagentInspectParams = Type.Object({
     id: Type.String({
-        description: 'Subagent id (exact filename id or unique prefix)',
+        description: 'Subagent id (exact filename id or unique suffix)',
     }),
     limit: Type.Optional(
         Type.Number({
@@ -3799,10 +3807,10 @@ export default function (pi: ExtensionAPI) {
                                 {
                                     type: 'text',
                                     text: [
-                                        `Background subagent ${entry.id.slice(0, LIST_ID_SHORT_CHARS)} started (agent: ${params.agent}).`,
+                                        `Background subagent ${shortSubagentId(entry.id)} started (agent: ${params.agent}).`,
                                         `Task: ${previewText(params.task, LIST_TASK_PREVIEW_CHARS)}`,
                                         `You'll be notified when it completes. Call subagent_collect { id: "${entry.id}" } for the result;`,
-                                        `subagent_inspect { id: "${entry.id.slice(0, LIST_ID_SHORT_CHARS)}" } for progress.`,
+                                        `subagent_inspect { id: "${shortSubagentId(entry.id)}" } for progress.`,
                                     ].join('\n'),
                                 },
                             ],
@@ -3850,10 +3858,10 @@ export default function (pi: ExtensionAPI) {
                             {
                                 type: 'text',
                                 text: [
-                                    `Subagent ${result.subagentId.slice(0, LIST_ID_SHORT_CHARS)} (agent: ${params.agent}) was sent to the background by the user; it keeps running.`,
+                                    `Subagent ${shortSubagentId(result.subagentId)} (agent: ${params.agent}) was sent to the background by the user; it keeps running.`,
                                     `Task: ${previewText(params.task, LIST_TASK_PREVIEW_CHARS)}`,
                                     `You'll be notified when it completes. Call subagent_collect { id: "${result.subagentId}" } for the result;`,
-                                    `subagent_inspect { id: "${result.subagentId.slice(0, LIST_ID_SHORT_CHARS)}" } for progress.`,
+                                    `subagent_inspect { id: "${shortSubagentId(result.subagentId)}" } for progress.`,
                                 ].join('\n'),
                             },
                         ],
@@ -4300,7 +4308,7 @@ export default function (pi: ExtensionAPI) {
         name: 'subagent_inspect',
         label: 'Subagent Inspect',
         description: [
-            'Inspect a persisted subagent run by id (exact or unique prefix): status, agent, task, usage,',
+            'Inspect a persisted subagent run by id (exact or unique suffix): status, agent, task, usage,',
             'and the tail of its transcript. Works on running subagents (e.g. debugging stuck runs).',
             'Failed and aborted runs persist until resumed; successful runs are cleaned up on completion,',
             "so their output is only in the parent session's tool result.",
@@ -4348,7 +4356,7 @@ export default function (pi: ExtensionAPI) {
         name: 'subagent_collect',
         label: 'Subagent Collect',
         description: [
-            'Collect the result of a background subagent run by id (exact or unique prefix). Running runs',
+            'Collect the result of a background subagent run by id (exact or unique suffix). Running runs',
             'return their current progress immediately (non-blocking); settled background runs return the',
             'full result and are removed from the ready set. Persisted runs from other sessions use',
             'subagent_inspect / /subagents.',
@@ -4356,7 +4364,7 @@ export default function (pi: ExtensionAPI) {
         parameters: Type.Object({
             id: Type.String({
                 description:
-                    'Subagent id (exact or unique prefix): running or settled-background',
+                    'Subagent id (exact or unique suffix): running or settled-background',
             }),
         }),
 
@@ -4403,7 +4411,7 @@ export default function (pi: ExtensionAPI) {
                 : isFailedResult(result)
                   ? 'failed'
                   : 'succeeded'
-            const shortId = resolved.id.slice(0, LIST_ID_SHORT_CHARS)
+            const shortId = shortSubagentId(resolved.id)
             const lines: string[] = [
                 `Background subagent ${shortId} (${result.agent}) — ${status}`,
             ]
@@ -4469,7 +4477,7 @@ export default function (pi: ExtensionAPI) {
                 return
             }
             if (sub === 'abort') {
-                // Registry-resolved like attach (exact/unique prefix/single-entry
+                // Registry-resolved like attach (exact/unique suffix/single-entry
                 // default); SIGTERMs the child and lets the existing close
                 // handlers settle the registry and any pending tool result.
                 const resolved = resolveAttachTarget(rest[0])
@@ -4484,7 +4492,7 @@ export default function (pi: ExtensionAPI) {
                 }
                 emitCommandNotice(
                     ctx,
-                    `Aborting subagent ${resolved.id.slice(0, LIST_ID_SHORT_CHARS)} (SIGTERM sent).`,
+                    `Aborting subagent ${shortSubagentId(resolved.id)} (SIGTERM sent).`,
                     'info'
                 )
                 return

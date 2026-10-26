@@ -14,6 +14,11 @@ pi coding-agent extensions, TypeScript, loaded directly by pi (no build step).
   binary via `IDX_BIN` → PATH → `~/.local/bin/idx`; when absent, the tool fails
   with an install hint, and appends a use-`index`-first system-prompt nudge only when the binary
   is found and the tool is active.
+- **`multi-opencode-go/`** — manual failover switch for the `opencode-go` provider:
+  `/opencode-switch` toggles outgoing requests between pi's primary key and a second failover
+  key from `auth.json["opencode-go-failover"]`. No usage polling, cooldowns, or automatic
+  rotation. Adapted from
+  [pi-multi-opencode-go](https://github.com/huaxel/pi-multi-opencode-go) (MIT).
 - **`simplify/`** — `/simplify` command: reviews changed code for clarity, consistency, and
   maintainability, scoped to changed line ranges. Default scope is everything unpushed plus
   uncommitted and untracked changes; `--ref=<git-ref>` diffs against another base, `--staged`
@@ -75,6 +80,7 @@ ln -s "$PWD/subagent" ~/.pi/agent/extensions/subagent
 ln -s "$PWD/ask-user-question" ~/.pi/agent/extensions/ask-user-question
 ln -s "$PWD/index" ~/.pi/agent/extensions/index
 ln -s "$PWD/simplify" ~/.pi/agent/extensions/simplify
+ln -s "$PWD/multi-opencode-go" ~/.pi/agent/extensions/multi-opencode-go
 ```
 
 Type-checks against host pi package stubs in `types.d.ts`; see `AGENTS.md` for the check

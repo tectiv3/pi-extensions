@@ -19,6 +19,13 @@ pi coding-agent extensions, TypeScript, loaded directly by pi (no build step).
   key from `auth.json["opencode-go-failover"]`. No usage polling, cooldowns, or automatic
   rotation. Adapted from
   [pi-multi-opencode-go](https://github.com/huaxel/pi-multi-opencode-go) (MIT).
+- **`smart-fold/`** — transcript compaction: finished thinking collapses to one
+  `Thought for 12.4s` line (click to expand; live thinking shows a scrolling tail plus elapsed
+  time), tool output folds at session start, and `write`/`edit` rows get `+N -M` stat headers.
+  Folding is display-only — nothing changes in the conversation sent to the model. `/fold` opens
+  a settings picker; settings are session-only. Vendored from
+  [`@clapecho233/pi-smart-fold`](https://www.npmjs.com/package/@clapecho233/pi-smart-fold) (MIT)
+  with its on-disk config file removed.
 - **`simplify/`** — `/simplify` command: reviews changed code for clarity, consistency, and
   maintainability, scoped to changed line ranges. Default scope is everything unpushed plus
   uncommitted and untracked changes; `--ref=<git-ref>` diffs against another base, `--staged`
@@ -80,6 +87,7 @@ ln -s "$PWD/subagent" ~/.pi/agent/extensions/subagent
 ln -s "$PWD/ask-user-question" ~/.pi/agent/extensions/ask-user-question
 ln -s "$PWD/index" ~/.pi/agent/extensions/index
 ln -s "$PWD/simplify" ~/.pi/agent/extensions/simplify
+ln -s "$PWD/smart-fold" ~/.pi/agent/extensions/smart-fold
 ln -s "$PWD/multi-opencode-go" ~/.pi/agent/extensions/multi-opencode-go
 ```
 

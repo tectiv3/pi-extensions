@@ -23,11 +23,15 @@ declare module '@earendil-works/pi-coding-agent' {
                 description: string
                 getArgumentCompletions?: (
                     argumentPrefix: string
-                ) => Array<{ value: string; label: string; description: string }>
+                ) => Array<{ value: string; label: string; description?: string }>
                 handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>
             }
         ): void
         on(event: string, handler: (event: any, ctx: any) => void): void
+        registerMarkdownTransformer(
+            transformer: (markdown: string, context: MarkdownTransformContext) => string
+        ): void
+        appendEntry<T = unknown>(customType: string, data?: T): void
         sendUserMessage(text: string, opts?: { deliverAs?: string }): void
         exec(
             command: string,
@@ -39,6 +43,28 @@ declare module '@earendil-works/pi-coding-agent' {
         getSessionName(): string | undefined
         events: EventBus
     }
+
+    export interface MarkdownTransformContext {
+        messageType: string
+        availableWidth: number
+        isStreaming: boolean
+    }
+
+    /** Public surface of pi's assistant message row (patched by extensions). */
+    export class AssistantMessageComponent {
+        constructor(...args: any[])
+        updateContent(...args: unknown[]): void
+    }
+
+    export function getSettingsListTheme(): import('@earendil-works/pi-tui').SettingsListTheme
+
+    export function createBashToolDefinition(cwd: string, options?: unknown): ToolDefinition
+    export function createEditToolDefinition(cwd: string, options?: unknown): ToolDefinition
+    export function createFindToolDefinition(cwd: string, options?: unknown): ToolDefinition
+    export function createGrepToolDefinition(cwd: string, options?: unknown): ToolDefinition
+    export function createLsToolDefinition(cwd: string, options?: unknown): ToolDefinition
+    export function createReadToolDefinition(cwd: string, options?: unknown): ToolDefinition
+    export function createWriteToolDefinition(cwd: string, options?: unknown): ToolDefinition
 
     export interface ExtensionContext {
         cwd: string
@@ -148,6 +174,41 @@ declare module '@earendil-works/pi-tui' {
     }
     export class Container {
         addChild(child: unknown): void
+        render(width: number): string[]
+        invalidate(): void
+    }
+    export interface SettingItem {
+        id: string
+        label: string
+        description?: string
+        currentValue: string
+        values?: string[]
+        submenu?: (
+            currentValue: string,
+            done: (selectedValue?: string, options?: { navigateTo?: string }) => void
+        ) => Component
+    }
+    export interface SettingsListTheme {
+        label: (text: string, selected: boolean) => string
+        value: (text: string, selected: boolean) => string
+        description: (text: string) => string
+        cursor: string
+        hint: (text: string) => string
+    }
+    export class SettingsList {
+        constructor(
+            items: SettingItem[],
+            maxVisible: number,
+            theme: SettingsListTheme,
+            onChange: (id: string, newValue: string) => void,
+            onCancel: () => void,
+            options?: { enableSearch?: boolean }
+        )
+        updateValue(id: string, newValue: string): void
+        selectItem(id: string): void
+        invalidate(): void
+        render(width: number): string[]
+        handleInput(data: string): void
     }
     export class Markdown {
         constructor(text: string, x: number, y: number, theme: unknown)

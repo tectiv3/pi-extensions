@@ -463,8 +463,8 @@ function settleBackgroundRun(id: string, result: SingleResult, runEpoch: number)
 }
 
 // One self-contained per-id block for the completion notification (spec
-// 1.2.3). The full id always appears in the text: for the model it is the
-// only id source.
+// 1.2.3). The short id is the only id source for the model; suffix resolution
+// makes it interchangeable with the full id within this session.
 function buildBackgroundNotification(result: SingleResult): string {
     const shortId = shortSubagentId(result.subagentId)
     if (isFailedResult(result)) {
@@ -475,7 +475,7 @@ function buildBackgroundNotification(result: SingleResult): string {
             formatFailureReport(result),
             result.resumeNote ?? '',
             formatResumeHint(result) ? `/subagents resume ${shortId}` : '',
-            `Call subagent_collect { id: "${result.subagentId}" } for the full result.`,
+            `Call subagent_collect { id: "${shortId}" } for the full result.`,
             'If you already collected this id, no action is needed.',
         ]
             .filter(Boolean)
@@ -488,7 +488,7 @@ function buildBackgroundNotification(result: SingleResult): string {
             ? `${finalOutput.slice(0, INSPECT_FINAL_OUTPUT_CAP)}...`
             : finalOutput,
         formatUsageStats(result.usage, result.model),
-        `Call subagent_collect { id: "${result.subagentId}" } for the full result.`,
+        `Call subagent_collect { id: "${shortId}" } for the full result.`,
         'If you already collected this id, no action is needed.',
     ].join('\n\n')
     return result.resumeNote ? `${notification}\n\n${result.resumeNote}` : notification
@@ -800,9 +800,9 @@ function formatResumeHint(result: SingleResult): string | null {
     // (e.g. unknown agent) leave nothing to inspect or resume.
     if (!sessionArtifactsPersisted(result)) return null
     return [
-        `Subagent ID: ${result.subagentId}`,
+        `Subagent ID: ${shortSubagentId(result.subagentId)}`,
         `Inspect with subagent_inspect; continue with subagent ` +
-            `{agent: "${result.agent}", task: "<continuation instruction>", resume: "${result.subagentId}"}.`,
+            `{agent: "${result.agent}", task: "<continuation instruction>", resume: "${shortSubagentId(result.subagentId)}"}.`,
     ].join('\n')
 }
 
@@ -1015,8 +1015,8 @@ function listSessionResumableSubagents(): PersistedSubagentEntry[] {
 
 function formatPersistedSubagentsList(entries: PersistedSubagentEntry[]): string[] {
     return entries.map(entry => {
-        if (!entry.meta) return `- ${entry.id} — (meta sidecar unreadable)`
-        return `- ${entry.id} — agent: ${entry.meta.agent}, status: ${
+        if (!entry.meta) return `- ${shortSubagentId(entry.id)} — (meta sidecar unreadable)`
+        return `- ${shortSubagentId(entry.id)} — agent: ${entry.meta.agent}, status: ${
             entry.meta.status ?? 'unknown'
         }, task: ${previewText(entry.meta.task, LIST_TASK_PREVIEW_CHARS)}`
     })
@@ -1502,13 +1502,14 @@ function resolveResumeTarget(
     const resolution = resolvePersistedResumeTarget(resumeId)
     if ('error' in resolution) return resolution.error
     const { id: runId, meta } = resolution
+    const shortId = shortSubagentId(runId)
 
     const { pid: pidPath } = getSubagentFilePaths(runId)
     if (fs.existsSync(pidPath)) {
         const pid = readSubagentPid(pidPath)
         if (pid !== undefined && isProcessAlive(pid)) {
             return (
-                `Subagent "${runId}" is still running (pid ${pid}). ` +
+                `Subagent "${shortId}" is still running (pid ${pid}). ` +
                 'Wait for it to finish or inspect it with subagent_inspect instead of resuming.'
             )
         }
@@ -1518,7 +1519,7 @@ function resolveResumeTarget(
 
     if (meta.agent !== agentName) {
         return (
-            `Cannot resume "${runId}" with agent "${agentName}": the original run used agent "${meta.agent}". ` +
+            `Cannot resume "${shortId}" with agent "${agentName}": the original run used agent "${meta.agent}". ` +
             'Resuming under a different agent changes the system prompt and toolset; use the original agent.'
         )
     }
@@ -1528,7 +1529,7 @@ function resolveResumeTarget(
         ? createHash('sha256').update(agent.systemPrompt).digest('hex')
         : undefined
     if (!agent || currentPromptHash !== meta.promptHash) {
-        return `Cannot resume "${runId}": the "${agentName}" agent definition changed since the original run; start a fresh delegation instead.`
+        return `Cannot resume "${shortId}": the "${agentName}" agent definition changed since the original run; start a fresh delegation instead.`
     }
 
     return { id: runId, meta }
@@ -1787,7 +1788,13 @@ function buildSubagentInspectReport(subagentId: string, limit: number): string {
     const runStatus = deriveSubagentRunStatus(subagentId, meta)
     const status = runStatus.status
 
-    const lines: string[] = [`Subagent: ${subagentId}`]
+    // Cross-session runs resolve only by full id, so their report must keep it.
+    const displayId =
+        currentPiSessionId !== undefined && meta?.parentSessionId === currentPiSessionId
+            ? shortSubagentId(subagentId)
+            : subagentId
+
+    const lines: string[] = [`Subagent: ${displayId}`]
     lines.push(`Status: ${formatSubagentStatus(runStatus)}`)
     if (meta) {
         lines.push(`Agent: ${meta.agent}`)
@@ -1847,7 +1854,7 @@ function buildSubagentInspectReport(subagentId: string, limit: number): string {
 
     if ((status === 'failed' || status === 'aborted') && meta) {
         lines.push(
-            `Resume with subagent {agent: "${meta.agent}", task: "<continuation instruction>", resume: "${subagentId}"}.`
+            `Resume with subagent {agent: "${meta.agent}", task: "<continuation instruction>", resume: "${displayId}"}.`
         )
     }
 
@@ -3809,7 +3816,7 @@ export default function (pi: ExtensionAPI) {
                                     text: [
                                         `Background subagent ${shortSubagentId(entry.id)} started (agent: ${params.agent}).`,
                                         `Task: ${previewText(params.task, LIST_TASK_PREVIEW_CHARS)}`,
-                                        `You'll be notified when it completes. Call subagent_collect { id: "${entry.id}" } for the result;`,
+                                        `You'll be notified when it completes. Call subagent_collect { id: "${shortSubagentId(entry.id)}" } for the result;`,
                                         `subagent_inspect { id: "${shortSubagentId(entry.id)}" } for progress.`,
                                     ].join('\n'),
                                 },
@@ -3860,7 +3867,7 @@ export default function (pi: ExtensionAPI) {
                                 text: [
                                     `Subagent ${shortSubagentId(result.subagentId)} (agent: ${params.agent}) was sent to the background by the user; it keeps running.`,
                                     `Task: ${previewText(params.task, LIST_TASK_PREVIEW_CHARS)}`,
-                                    `You'll be notified when it completes. Call subagent_collect { id: "${result.subagentId}" } for the result;`,
+                                    `You'll be notified when it completes. Call subagent_collect { id: "${shortSubagentId(result.subagentId)}" } for the result;`,
                                     `subagent_inspect { id: "${shortSubagentId(result.subagentId)}" } for progress.`,
                                 ].join('\n'),
                             },

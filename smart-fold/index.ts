@@ -71,7 +71,13 @@ import {
     AssistantMessageComponent,
     getSettingsListTheme,
 } from '@earendil-works/pi-coding-agent'
-import { Container, SettingsList, Text, truncateToWidth } from '@earendil-works/pi-tui'
+import {
+    Container,
+    SettingsList,
+    Text,
+    truncateToWidth,
+    wrapTextWithAnsi,
+} from '@earendil-works/pi-tui'
 import type { Component, SettingItem } from '@earendil-works/pi-tui'
 
 import {
@@ -507,6 +513,24 @@ function trimLineFiller(line: string): string {
     return line.replace(ANSI_TRAILING_PATTERN, '$1').replace(/[ \t]+$/, '')
 }
 
+/** A line without visible content (bar filler / spacer lines). */
+function isBlankLine(line: string): boolean {
+    return (
+        trimLineFiller(
+            line.replace(ANSI_CSI_PATTERN, '').replace(ANSI_OSC_PATTERN, '')
+        ).trim() === ''
+    )
+}
+
+/** Re-pad a wrapped line to `width` so background bars keep their full size. */
+function padToWidth(line: string, width: number): string {
+    const missing = width - displayWidth(line)
+    if (missing <= 0) return line
+    const resetMatch = line.match(ANSI_RESET_TAIL_PATTERN)
+    const tail = resetMatch ? resetMatch[0] : ''
+    return line.slice(0, line.length - tail.length) + ' '.repeat(missing) + tail
+}
+
 /**
  * Insert text into a rendered line's trailing padding, eating an equal
  * number of padding columns so the line keeps its exact width (and thus its
@@ -832,6 +856,8 @@ export default function smartFold(pi: ExtensionAPI): void {
         invalidateRef: (() => void) | undefined
         /** Collapsed style: header-only (write/edit) vs truncated first line. */
         headerOnly = false
+        /** Keep the whole wrapped header (file tools) instead of cutting it. */
+        wrapHeader = false
         /** Stats computed straight from the call args (edit). */
         statFromArgs:
             ((args: unknown) => { added: number; removed: number } | undefined) | undefined
@@ -851,6 +877,11 @@ export default function smartFold(pi: ExtensionAPI): void {
             const lines = this.inner.render(width)
             if (lines.length === 0) return lines
             const headerIndex = firstContentLine(lines)
+            // pi wraps the single header line itself, so every line after it up to
+            // the next blank one is a continuation of the same header. Treating
+            // them as separate content is what lets a long path survive.
+            let headerEnd = headerIndex + 1
+            while (headerEnd < lines.length && !isBlankLine(lines[headerEnd])) headerEnd++
 
             const stat = config.writeStat
                 ? this.statFromMap
@@ -863,15 +894,36 @@ export default function smartFold(pi: ExtensionAPI): void {
                       ` ${this.theme.fg('error', `-${stat.removed}`)}`
                     : ''
 
-            /** Place the stat on the header line without ever exceeding `width`. */
-            const withStat = (line: string): string => {
-                const padded = insertIntoLinePadding(line, suffix)
-                if (padded !== null) return padded
-                // Appending past `width` crashes pi's renderer, so the fallback
-                // has to truncate the header instead of overflowing it.
-                const room = width - displayWidth(suffix)
-                if (room <= 1) return truncateToWidth(line, width, '…')
-                return truncateToWidth(trimLineFiller(line), room, '…') + suffix
+            /**
+             * Place the stat on the header, wrapping rather than truncating: a cut
+             * path loses the parameter the row exists to show. pi's renderer aborts
+             * on lines wider than `width`, so wrapping is the only safe alternative.
+             */
+            const withStat = (header: string[]): string[] => {
+                if (!suffix) return header
+                const out = header.slice()
+                const last = out.length - 1
+                const padded = insertIntoLinePadding(out[last], suffix)
+                if (padded !== null) {
+                    out[last] = padded
+                    return out
+                }
+                // No padding left: re-wrap the last header line at the width the
+                // stat leaves so the stat still rides the header.
+                const budget = width - displayWidth(suffix)
+                const pieces =
+                    budget > 8
+                        ? wrapTextWithAnsi(trimLineFiller(out[last]), budget)
+                        : wrapTextWithAnsi(trimLineFiller(out[last]), width)
+                if (budget > 8) {
+                    pieces[pieces.length - 1] = (pieces[pieces.length - 1] ?? '') + suffix
+                } else {
+                    pieces.push(suffix.trimStart())
+                }
+                return out
+                    .slice(0, last)
+                    .concat(pieces)
+                    .map(line => padToWidth(line, width))
             }
 
             // Pass pi's lines through untouched apart from the stat: expanded rows
@@ -880,26 +932,27 @@ export default function smartFold(pi: ExtensionAPI): void {
             // already decided to show.
             if (this.expanded || (this.headerOnly && config.writeCollapsed === 'preview')) {
                 const out = lines.slice()
-                if (suffix) out[headerIndex] = withStat(out[headerIndex])
+                if (suffix) out.splice(headerIndex, 1, ...withStat([out[headerIndex]]))
                 return out
             }
 
             if (this.headerOnly && config.writeCollapsed === 'header') {
+                const header = withStat(lines.slice(headerIndex, headerEnd))
                 // Some tools render their own shell (edit: renderShell "self" — no
-                // outer box). Keep their full-width background lines and inject the
-                // stat into the header line's padding so the bar keeps its size.
+                // outer box), so the surrounding background bars have to stay.
                 if (headerIndex > 0) {
-                    const header = suffix ? withStat(lines[headerIndex]) : lines[headerIndex]
-                    return [lines[headerIndex - 1], header, lines[lines.length - 1]]
+                    const bottom = headerEnd < lines.length ? [lines[lines.length - 1]] : []
+                    return [lines[headerIndex - 1], ...header, ...bottom]
                 }
-                // Plain inner (write): a single header line carrying the stat.
-                return [suffix ? withStat(lines[headerIndex]) : lines[headerIndex]]
+                return header
             }
 
-            // Collapsed shell/file rows without their own preview: single first
-            // content line, truncated to the terminal width with an ellipsis (an
-            // extra `…` marks hidden continuation lines).
-            let line = trimLineFiller(lines[headerIndex])
+            const header = lines.slice(headerIndex, headerEnd)
+            if (this.wrapHeader) return withStat(header)
+
+            // Collapsed shell rows stay one line: their truncation is deliberate
+            // (a `…` also marks hidden continuation lines).
+            let line = trimLineFiller(header[0])
             if (suffix) line += suffix
             if (lines.length > headerIndex + 1) line += ' …'
             return [truncateToWidth(line, width, '…')]
@@ -915,6 +968,7 @@ export default function smartFold(pi: ExtensionAPI): void {
         base: { renderCall?: unknown } & Record<string, unknown>,
         opts: {
             headerOnly?: boolean
+            wrapHeader?: boolean
             statFromArgs?: (args: unknown) => { added: number; removed: number } | undefined
             statFromMap?: boolean
             displayArgs?: (args: unknown, context: ToolRenderContextLike) => unknown
@@ -943,6 +997,7 @@ export default function smartFold(pi: ExtensionAPI): void {
             if (!wrapper) {
                 wrapper = new ToolCallWrapper(String(context.toolCallId ?? ''), inner)
                 wrapper.headerOnly = Boolean(opts.headerOnly)
+                wrapper.wrapHeader = Boolean(opts.wrapHeader)
                 wrapper.statFromArgs = opts.statFromArgs
                 wrapper.statFromMap = Boolean(opts.statFromMap)
             } else {
@@ -1004,7 +1059,7 @@ export default function smartFold(pi: ExtensionAPI): void {
             case 'grep':
             case 'find':
             case 'ls':
-                return {}
+                return { wrapHeader: true }
             case 'edit':
                 return {
                     headerOnly: true,

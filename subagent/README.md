@@ -14,7 +14,7 @@ Delegate tasks to specialized subagents with isolated context windows.
 - **Resume**: Continue a persisted run in the same conversation (`resume: "<id or unique suffix>"`, single mode)
 - **Recoverable abort**: Interrupting the parent returns an error tool result with partial output, not an exception
 - **Background runs**: `background: true` returns immediately, leaving the child running; completion is delivered as a notification and fetched with `subagent_collect` (single mode); a running foreground single run can also be converted mid-flight from `/subagents` (`b`)
-- **Running-subagents footer**: the pi footer shows live running subagents (`⏳ <n>: <agent> <elapsed>`, refreshed every 10s)
+- **Running-subagents footer**: the pi footer shows live running subagents (`⏳ <n>: <agent> <id> <elapsed> <turns>t ↓<output>`, elapsed refreshed every 10s, counters per turn)
 
 ## Structure
 
@@ -347,10 +347,15 @@ action is needed.
 
 ### Running-subagents footer
 
-While subagents run, the pi footer shows `⏳ <n>: <agent> <elapsed>, …` — up to three
-agent/elapsed pairs, with extras collapsed to `+N` — refreshed every 10 s. The line clears
-as soon as the running count reaches 0. It shows running runs only; settled-but-uncollected
-results are surfaced by the completion notification, not the footer.
+While subagents run, the pi footer shows
+`⏳ <n>: <agent> <short-id> <elapsed> <turns>t ↓<out-tokens>, …` — up to three segments,
+with extras collapsed to `+N`. Elapsed is recomputed every 10 s; the turn and output-token
+counters advance on each assistant message and stay omitted until non-zero. A single
+running agent also appends ` — <task preview>` (40 chars); with two or more the preview is
+dropped so the counters fit.
+
+The line clears as soon as the running count reaches 0. It shows running runs only;
+settled-but-uncollected results are surfaced by the completion notification, not the footer.
 
 ## Output Display
 
@@ -429,6 +434,15 @@ resume hint:
 - **Chain mode**: Stops at the first failing step and reports which step failed
 - **Parallel mode**: The batch is not rejected; each failed task gets a per-task summary
   with its own id and resume hint
+- **Swallowed persistence/parse failures**: none of these fail a run — artifact writes (dir
+  setup, `.meta`, pidfile), artifact removals, tail-frame drops, unparsable child frames, and
+  unreadable pid/session files. They are written to a file-only diagnostic log when
+  `PI_RC_DEBUG` is set to any non-empty value (`PI_RC_DEBUG=0` enables it too) or
+  `PI_RC_DEBUG_FILE=<path>` is set; the default log is `~/.pi/agent/rc-debug.log`, shared with
+  the other extensions' diagnostics. Without either variable they are silent. Unparsable child
+  frames are logged individually for the first 3, then only as a suppressed total at exit, so a
+  frame flood cannot stall the run on sync log writes. A dropped frame can still leave a run
+  marked successful with truncated output.
 
 ## Limitations
 

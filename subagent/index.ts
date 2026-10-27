@@ -69,6 +69,9 @@ const INSPECT_ENTRY_PREVIEW_CHARS = 100
 const INSPECT_FINAL_OUTPUT_CAP = 2000
 const SHORT_ID_CHARS = 8
 const LIST_TASK_PREVIEW_CHARS = 60
+// Unparsable stdout frames are the one failure a grandchild can drive at
+// arbitrary rate through the inherited pipe, and each log line is a sync write.
+const FRAME_PARSE_LOG_LIMIT = 3
 // UUIDv7 ids lead with a millisecond timestamp; the distinguishing random part is at the tail.
 function shortSubagentId(id: string): string {
     return id.slice(-SHORT_ID_CHARS)
@@ -90,6 +93,7 @@ const RESUME_SPAWN_TIMEOUT_MS = 15_000
 // per-agent segments before extras collapse to "+N".
 const SUBAGENT_STATUS_INTERVAL_MS = 10_000
 const SUBAGENT_STATUS_MAX_ITEMS = 3
+const SUBAGENT_STATUS_TASK_PREVIEW_CHARS = 40
 
 // /subagents attach live-view sizing and preview caps. While attached, the
 // view is de-facto fullscreen: it occupies nearly all terminal rows, its own
@@ -309,6 +313,11 @@ interface ActiveSubagent {
     proc: ChildProcess
     // Spawn time (epoch ms) — drives the elapsed column in the manager view.
     startedAt: number
+    // Live per-run counters for the footer status line: the authoritative
+    // accumulation lives in runSingleAgent's closure, so these are mirrored
+    // from assistant message_end frames for the registry's readers.
+    turns: number
+    outputTokens: number
     eventEmitter: EventEmitter
     settled: boolean
     events: SubagentStreamEvent[]
@@ -394,12 +403,28 @@ let notifyDrainTimer: ReturnType<typeof setTimeout> | undefined
 
 function subagentStatusText(): string {
     const entries = [...activeSubagents.values()]
-    const pairs = entries
-        .slice(0, SUBAGENT_STATUS_MAX_ITEMS)
-        .map(entry => `${entry.agent} ${formatElapsedMs(Date.now() - entry.startedAt)}`)
+    const pairs = entries.slice(0, SUBAGENT_STATUS_MAX_ITEMS).map(entry => {
+        const counters = [
+            entry.turns > 0 ? `${entry.turns}t` : '',
+            entry.outputTokens > 0 ? `↓${formatTokens(entry.outputTokens)}` : '',
+        ]
+            .filter(Boolean)
+            .join(' ')
+        return (
+            `${entry.agent} ${shortSubagentId(entry.id).slice(-4)} ` +
+            `${formatElapsedMs(Date.now() - entry.startedAt)}` +
+            (counters ? ` ${counters}` : '')
+        )
+    })
     const extras = entries.length - pairs.length
     if (extras > 0) pairs.push(`+${extras}`)
-    return `⏳ ${entries.length}: ${pairs.join(', ')}`
+    // A task preview only fits once there is a single agent; with two or more
+    // it would crowd out the counters the line exists to show.
+    const suffix =
+        entries.length === 1
+            ? ` — ${previewText(entries[0].task, SUBAGENT_STATUS_TASK_PREVIEW_CHARS)}`
+            : ''
+    return `⏳ ${entries.length}: ${pairs.join(', ')}${suffix}`
 }
 
 // Idempotent recompute of the running-only footer line. The timer and the
@@ -914,8 +939,13 @@ function ensureSubagentsDir(): void {
         })
         // mkdir's mode is masked by the process umask; enforce the private mode explicitly.
         fs.chmodSync(getSubagentsDir(), SUBAGENTS_DIR_MODE)
-    } catch {
+    } catch (err) {
         /* persistence setup failures must not crash the delegation; the child run surfaces them */
+        subagentDebugLog(
+            `[subagent] subagents dir setup failed (${getSubagentsDir()}, ${
+                (err as NodeJS.ErrnoException).syscall ?? 'setup'
+            }): ${err instanceof Error ? err.message : String(err)}`
+        )
     }
 }
 
@@ -925,8 +955,11 @@ function writeSubagentMetaFile(metaPath: string, meta: SubagentMeta): void {
             encoding: 'utf-8',
             mode: 0o600,
         })
-    } catch {
-        /* ignore */
+    } catch (err) {
+        // Resume/inspect list reads this sidecar; a lost write must at least leave a trace.
+        subagentDebugLog(
+            `[subagent] meta write failed (${metaPath}): ${err instanceof Error ? err.message : String(err)}`
+        )
     }
 }
 
@@ -935,8 +968,15 @@ function readSessionHeaderId(sessionPath: string): string | undefined {
         const firstLine = fs.readFileSync(sessionPath, 'utf-8').split('\n', 1)[0]
         const entry = JSON.parse(firstLine)
         if (entry?.type === 'session' && typeof entry.id === 'string') return entry.id
-    } catch {
-        /* missing session file, torn first line, or unparsable header */
+    } catch (err) {
+        // A torn header drops the session id that resume needs for the original cwd.
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+            subagentDebugLog(
+                `[subagent] session header unreadable (${sessionPath}): ${
+                    err instanceof Error ? err.message : String(err)
+                }`
+            )
+        }
     }
     return undefined
 }
@@ -944,8 +984,11 @@ function readSessionHeaderId(sessionPath: string): string | undefined {
 function removeSubagentFile(filePath: string): void {
     try {
         fs.rmSync(filePath, { force: true })
-    } catch {
-        /* ignore */
+    } catch (err) {
+        // A failed rm leaves a stale .pid guard, an orphaned .jsonl, or a phantom .meta entry.
+        subagentDebugLog(
+            `[subagent] rm failed (${filePath}): ${err instanceof Error ? err.message : String(err)}`
+        )
     }
 }
 
@@ -1661,9 +1704,25 @@ function resolvePersistedResumeTarget(requestedId: string): PersistedResumeResol
 
 function readSubagentPid(pidPath: string): number | undefined {
     try {
-        const pid = Number.parseInt(fs.readFileSync(pidPath, 'utf-8').trim(), 10)
-        return Number.isNaN(pid) || pid <= 0 ? undefined : pid
-    } catch {
+        const raw = fs.readFileSync(pidPath, 'utf-8').trim()
+        const pid = Number.parseInt(raw, 10)
+        if (Number.isNaN(pid) || pid <= 0) {
+            // An unparsable pidfile is indistinguishable from no pidfile to every caller,
+            // which is what lets a live child be treated as resumable/deletable.
+            subagentDebugLog(
+                `[subagent] pidfile unparsable (${pidPath}): ${JSON.stringify(raw.slice(0, 40))}`
+            )
+            return undefined
+        }
+        return pid
+    } catch (err) {
+        // ENOENT is the normal state for completed runs; anything else means the pidfile
+        // exists but cannot be trusted.
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+            subagentDebugLog(
+                `[subagent] pidfile unreadable (${pidPath}): ${err instanceof Error ? err.message : String(err)}`
+            )
+        }
         return undefined
     }
 }
@@ -2081,6 +2140,8 @@ async function runSingleAgent(
               })
             : undefined
 
+        // Counted outside the exit promise: the settle log reports the suppressed total.
+        let frameParseFailures = 0
         const exitCodePromise = new Promise<number>(resolve => {
             const invocation = getPiInvocation(args)
             debug(`spawn: ${invocation.command} ${invocation.args.join(' ')}`)
@@ -2096,8 +2157,12 @@ async function runSingleAgent(
                         encoding: 'utf-8',
                         mode: 0o600,
                     })
-                } catch {
-                    /* ignore */
+                } catch (err) {
+                    // No pidfile: deriveSubagentRunStatus reports 'unknown' while the child is
+                    // still alive, so /subagents can resume or delete a running run.
+                    debug(
+                        `pid write failed (${pidPath}): ${err instanceof Error ? err.message : String(err)}`
+                    )
                 }
             }
             let buffer = ''
@@ -2128,8 +2193,14 @@ async function runSingleAgent(
             const drainBuffer = () => {
                 try {
                     if (buffer.trim()) processLine(buffer)
-                } catch {
-                    /* final-line parse must not prevent resolve */
+                } catch (err) {
+                    // Losing the tail frame (usually the last message_end) can leave the run
+                    // looking successful with truncated output; resolve must still happen.
+                    debug(
+                        `tail frame dropped (${buffer.length}ch): ${
+                            err instanceof Error ? err.message : String(err)
+                        } — ${JSON.stringify(buffer.slice(0, 200))}`
+                    )
                 }
                 buffer = ''
             }
@@ -2285,6 +2356,8 @@ async function runSingleAgent(
                 task,
                 proc,
                 startedAt: Date.now(),
+                turns: 0,
+                outputTokens: 0,
                 eventEmitter: new EventEmitter(),
                 settled: false,
                 events: [],
@@ -2331,7 +2404,16 @@ async function runSingleAgent(
                 let event: any
                 try {
                     event = JSON.parse(line)
-                } catch {
+                } catch (err) {
+                    // Torn/truncated child frame: the run can settle short without this trace.
+                    frameParseFailures++
+                    if (frameParseFailures <= FRAME_PARSE_LOG_LIMIT) {
+                        debug(
+                            `unparsable frame #${frameParseFailures} (${line.length}ch): ${
+                                err instanceof Error ? err.message : String(err)
+                            } — ${JSON.stringify(line.slice(0, 200))}`
+                        )
+                    }
                     return
                 }
                 lastActivityTime = Date.now()
@@ -2448,11 +2530,18 @@ async function runSingleAgent(
                             currentResult.usage.cost += usage.cost?.total || 0
                             currentResult.usage.contextTokens = usage.totalTokens || 0
                         }
+                        entry.turns = currentResult.usage.turns
+                        entry.outputTokens = currentResult.usage.output
                         if (!currentResult.model && msg.model) currentResult.model = msg.model
                         if (msg.stopReason) currentResult.stopReason = msg.stopReason
                         if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage
                     }
                     emitUpdate()
+                    try {
+                        refreshSubagentStatus()
+                    } catch {
+                        // Best-effort footer status; never break the event path.
+                    }
                 } else if (event.type === 'tool_result_end' && event.message) {
                     currentResult.messages.push(event.message as Message)
                     debug(`tool_result_end`)
@@ -2614,6 +2703,11 @@ async function runSingleAgent(
             }
 
             debug(`returning: status=${status} stopReason=${currentResult.stopReason ?? '-'}`)
+            if (frameParseFailures > FRAME_PARSE_LOG_LIMIT) {
+                debug(
+                    `unparsable frames: ${frameParseFailures} total (${FRAME_PARSE_LOG_LIMIT} logged individually)`
+                )
+            }
             if (backgrounded) {
                 // Synchronous, no awaits: preserves the store-before-notify
                 // ordering the sink's invariants rely on (spec 1.2.2).

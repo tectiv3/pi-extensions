@@ -13,13 +13,33 @@ pi coding-agent extensions (TypeScript, run inside the pi process):
 All are symlinked into the consuming pi setup (`~/.pi/agent/extensions/<name>`); there is no
 build step — pi loads the `.ts` files directly.
 
+## Host source
+
+The pi source checkout is at `~/code/pi-mono` (same packages as the installed host:
+`packages/coding-agent` is `@earendil-works/pi-coding-agent`). Read host APIs, types, docs and
+examples there instead of digging through `node_modules`, the pnpm store, or the bundled dist.
+
+| What | Path |
+|---|---|
+| Extension API + event types | `packages/coding-agent/src/core/extensions/` |
+| Built-in tools and their renderers | `packages/coding-agent/src/core/tools/` |
+| Docs (extensions, themes, codemode, MCP, …) | `packages/coding-agent/docs/` |
+| Working extension examples | `packages/coding-agent/examples/extensions/` |
+| TUI components (`Component`, `Container`, `Text`, …) | `packages/tui/src/` |
+| Provider/model layer | `packages/ai/src/`, `packages/agent/src/` |
+| Settings/models/theme JSON schemas | `packages/coding-agent/schemas/` |
+
+Check the checkout's version against `pi --version` before trusting a signature
+(`packages/coding-agent/package.json`); when they differ, the installed host wins.
+
 ## Types
 
 Runtime dependencies (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`,
 `@earendil-works/pi-ai`, `@earendil-works/pi-agent-core`, `typebox`) are provided by the host
 pi installation, not by this repo. `types.d.ts` at the repo root declares stubs for them so the
-tree type-checks standalone. Only `node` types plus the dev toolchain (eslint, typescript,
-prettier) are installed here.
+tree type-checks standalone — the stubs are deliberately looser than the real package types, so
+use them for this repo's own consistency only, never as documentation of the host API. Only
+`node` types plus the dev toolchain (eslint, typescript, prettier) are installed here.
 
 ## Checks
 

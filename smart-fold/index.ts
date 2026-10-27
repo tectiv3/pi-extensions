@@ -45,9 +45,10 @@
  *      hides the preview.
  *
  * Thinking text is never modified on disk or in the LLM context: folding is
- * display-only, applied through pi's markdown-transformer hook. The write
- * override delegates to pi's own write tool implementation; only the TUI
- * rendering is customized.
+ * display-only, applied through pi's markdown-transformer hook. Tool rows are
+ * drawn through pi's tool-renderer resolvers, so execution stays with the
+ * host's own tool definitions (per-session cwd, settings-driven tool options);
+ * only the TUI rendering is customized.
  *
  * Runtime control:
  *   /fold                          open the /config-style settings list
@@ -67,13 +68,6 @@ import { resolve as resolvePath } from 'node:path'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import {
     AssistantMessageComponent,
-    createBashToolDefinition,
-    createEditToolDefinition,
-    createFindToolDefinition,
-    createGrepToolDefinition,
-    createLsToolDefinition,
-    createReadToolDefinition,
-    createWriteToolDefinition,
     getSettingsListTheme,
 } from '@earendil-works/pi-coding-agent'
 import { Container, SettingsList, Text, truncateToWidth } from '@earendil-works/pi-tui'
@@ -965,54 +959,53 @@ export default function smartFold(pi: ExtensionAPI): void {
         }
     }
 
-    // Register the overrides: shell/file tools get collapsed-line truncation;
-    // write/edit additionally get `+N -M` stats and header-only collapse.
-    // `hideResultWhenCollapsed` decides per tool whether the result area
-    // disappears while collapsed.
-    const hideWriteDetailsWhenCollapsed = (): boolean => config.writeCollapsed === 'header'
-    const toolOverrides: Array<
-        [
-            Record<string, unknown>,
-            Parameters<typeof wrapToolRenderCall>[1] & {
-                hideResultWhenCollapsed?: () => boolean
-            },
-        ]
-    > = [
-        [
-            createBashToolDefinition(process.cwd()) as unknown as Record<string, unknown>,
-            { hideResultWhenCollapsed: () => true },
-        ],
-        [createReadToolDefinition(process.cwd()) as unknown as Record<string, unknown>, {}],
-        [createGrepToolDefinition(process.cwd()) as unknown as Record<string, unknown>, {}],
-        [createFindToolDefinition(process.cwd()) as unknown as Record<string, unknown>, {}],
-        [createLsToolDefinition(process.cwd()) as unknown as Record<string, unknown>, {}],
-        [
-            createEditToolDefinition(process.cwd()) as unknown as Record<string, unknown>,
-            {
-                headerOnly: true,
-                statFromArgs: countEditsLineDiff,
-                hideResultWhenCollapsed: hideWriteDetailsWhenCollapsed,
-            },
-        ],
-        [
-            createWriteToolDefinition(process.cwd()) as unknown as Record<string, unknown>,
-            {
-                headerOnly: true,
-                statFromMap: true,
-                hideResultWhenCollapsed: hideWriteDetailsWhenCollapsed,
-            },
-        ],
-    ]
-    for (const [baseTool, opts] of toolOverrides) {
-        const renderResult = opts.hideResultWhenCollapsed
-            ? wrapToolRenderResult(baseTool, opts.hideResultWhenCollapsed)
-            : undefined
-        pi.registerTool({
-            ...(baseTool as object),
-            renderCall: wrapToolRenderCall(baseTool, opts),
-            ...(renderResult ? { renderResult } : {}),
-        } as never)
+    // Choose row rendering per tool: shell/file tools get collapsed-line
+    // truncation; write/edit additionally get `+N -M` stats and header-only
+    // collapse. `hideResultWhenCollapsed` decides per tool whether the result
+    // area disappears while collapsed.
+    type ToolStyle = Parameters<typeof wrapToolRenderCall>[1] & {
+        hideResultWhenCollapsed?: () => boolean
     }
+    const hideWriteDetailsWhenCollapsed = (): boolean => config.writeCollapsed === 'header'
+    const toolStyleFor = (toolName: string): ToolStyle | undefined => {
+        switch (toolName) {
+            case 'bash':
+                return { hideResultWhenCollapsed: () => true }
+            case 'read':
+            case 'grep':
+            case 'find':
+            case 'ls':
+                return {}
+            case 'edit':
+                return {
+                    headerOnly: true,
+                    statFromArgs: countEditsLineDiff,
+                    hideResultWhenCollapsed: hideWriteDetailsWhenCollapsed,
+                }
+            case 'write':
+                return {
+                    headerOnly: true,
+                    statFromMap: true,
+                    hideResultWhenCollapsed: hideWriteDetailsWhenCollapsed,
+                }
+            default:
+                return undefined
+        }
+    }
+    pi.registerToolRenderer((toolName, next) => {
+        const style = toolStyleFor(toolName)
+        if (!style) return undefined
+        const base = next()
+        if (!base?.renderCall) return undefined
+        const renderResult = style.hideResultWhenCollapsed
+            ? wrapToolRenderResult(base, style.hideResultWhenCollapsed)
+            : undefined
+        return {
+            ...base,
+            renderCall: wrapToolRenderCall(base, style),
+            ...(renderResult ? { renderResult } : {}),
+        }
+    })
 
     // Read the previous file content right before the write executes, so the
     // header can show a git-style `+N -M` stat.

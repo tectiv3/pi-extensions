@@ -31,6 +31,24 @@ declare module '@earendil-works/pi-coding-agent' {
         registerMarkdownTransformer(
             transformer: (markdown: string, context: MarkdownTransformContext) => string
         ): void
+        registerToolRenderer(
+            resolver: (
+                toolName: string,
+                next: () =>
+                    | {
+                          renderShell?: unknown
+                          renderCall?: (...args: any[]) => any
+                          renderResult?: (...args: any[]) => any
+                      }
+                    | undefined
+            ) =>
+                | {
+                      renderShell?: unknown
+                      renderCall?: (...args: any[]) => any
+                      renderResult?: (...args: any[]) => any
+                  }
+                | undefined
+        ): void
         appendEntry<T = unknown>(customType: string, data?: T): void
         sendUserMessage(text: string, opts?: { deliverAs?: string }): void
         exec(

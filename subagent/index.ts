@@ -3398,7 +3398,9 @@ const SubagentParams = Type.Object({
         Type.Boolean({
             description:
                 'Single mode only. Return immediately; the child keeps running detached from parent Escape. ' +
-                'Completion arrives as a notification; fetch the result via subagent_collect { id }.',
+                'Completion arrives as a notification; fetch the result via subagent_collect { id }. ' +
+                'Do NOT wait for it: end your turn with a summary. Sleeping or polling only adds delay ' +
+                'on top of the notification, and subagent_collect on a running run returns immediately by design.',
         })
     ),
     tasks: Type.Optional(
@@ -3912,6 +3914,10 @@ export default function (pi: ExtensionAPI) {
                                         `Task: ${previewText(params.task, LIST_TASK_PREVIEW_CHARS)}`,
                                         `You'll be notified when it completes. Call subagent_collect { id: "${shortSubagentId(entry.id)}" } for the result;`,
                                         `subagent_inspect { id: "${shortSubagentId(entry.id)}" } for progress.`,
+                                        'There is nothing to wait for: end your turn now. The ' +
+                                            'completion notification starts your next turn; ' +
+                                            'sleeping or polling delays it without bringing the ' +
+                                            'result any sooner.',
                                     ].join('\n'),
                                 },
                             ],
@@ -3963,6 +3969,8 @@ export default function (pi: ExtensionAPI) {
                                     `Task: ${previewText(params.task, LIST_TASK_PREVIEW_CHARS)}`,
                                     `You'll be notified when it completes. Call subagent_collect { id: "${shortSubagentId(result.subagentId)}" } for the result;`,
                                     `subagent_inspect { id: "${shortSubagentId(result.subagentId)}" } for progress.`,
+                                    'End your turn — there is nothing to wait for; the ' +
+                                        'completion notification starts your next turn.',
                                 ].join('\n'),
                             },
                         ],

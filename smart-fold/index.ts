@@ -63,6 +63,7 @@
  */
 import { existsSync, statSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { resolve as resolvePath } from 'node:path'
 
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
@@ -524,6 +525,31 @@ function insertIntoLinePadding(line: string, insert: string): string | null {
     return line.slice(0, end) + insert + keptPadding + tail
 }
 
+/** `cd <dir> && rest` — the form the bash tool call gets when the model re-states the session cwd. */
+const SHELL_CD_PREFIX = /^\s*cd\s+(?:--\s+)?("[^"]*"|'[^']*'|[^\s;&|]+)\s*&&\s*(\S[\s\S]*)$/
+
+/**
+ * Collapsed bash rows otherwise all begin with the same `cd <session cwd> &&`, which
+ * pushes the distinguishing part of the command past the truncation point. Display-only:
+ * a `cd` into any other directory is kept, since it carries information.
+ */
+const stripRedundantCd = (args: unknown, context: ToolRenderContextLike): unknown => {
+    if (!args || typeof args !== 'object') return args
+    const command = (args as { command?: unknown }).command
+    if (typeof command !== 'string') return args
+    const match = SHELL_CD_PREFIX.exec(command)
+    if (!match) return args
+    const target = match[1].replace(/^(['"])([\s\S]*)\1$/, '$2')
+    if (/[$*?`]/.test(target)) return args // cannot resolve a variable or glob
+    const cwd = resolvePath(context.cwd ?? process.cwd())
+    const resolved =
+        target === '~' || target.startsWith('~/')
+            ? resolvePath(homedir(), target.slice(1))
+            : resolvePath(cwd, target)
+    if (resolved !== cwd) return args
+    return { ...(args as Record<string, unknown>), command: match[2] }
+}
+
 export default function smartFold(pi: ExtensionAPI): void {
     const config: SmartFoldConfig = { ...defaultConfig }
 
@@ -891,6 +917,7 @@ export default function smartFold(pi: ExtensionAPI): void {
             headerOnly?: boolean
             statFromArgs?: (args: unknown) => { added: number; removed: number } | undefined
             statFromMap?: boolean
+            displayArgs?: (args: unknown, context: ToolRenderContextLike) => unknown
         } = {}
     ) => {
         const baseRenderCall = base.renderCall as (
@@ -907,7 +934,9 @@ export default function smartFold(pi: ExtensionAPI): void {
                 context.lastComponent instanceof ToolCallWrapper
                     ? (context.lastComponent as ToolCallWrapper)
                     : undefined
-            const inner = baseRenderCall(args, theme, {
+            const innerArgs =
+                opts.displayArgs && !context.expanded ? opts.displayArgs(args, context) : args
+            const inner = baseRenderCall(innerArgs, theme, {
                 ...context,
                 lastComponent: wrapper?.inner,
             })
@@ -970,7 +999,7 @@ export default function smartFold(pi: ExtensionAPI): void {
     const toolStyleFor = (toolName: string): ToolStyle | undefined => {
         switch (toolName) {
             case 'bash':
-                return { hideResultWhenCollapsed: () => true }
+                return { hideResultWhenCollapsed: () => true, displayArgs: stripRedundantCd }
             case 'read':
             case 'grep':
             case 'find':
@@ -994,9 +1023,11 @@ export default function smartFold(pi: ExtensionAPI): void {
     }
     pi.registerToolRenderer((toolName, next) => {
         const style = toolStyleFor(toolName)
-        if (!style) return undefined
+        // A resolver that returns nothing ends the chain: tools we do not style
+        // (extension and MCP tools included) must defer instead.
+        if (!style) return next()
         const base = next()
-        if (!base?.renderCall) return undefined
+        if (!base?.renderCall) return base
         const renderResult = style.hideResultWhenCollapsed
             ? wrapToolRenderResult(base, style.hideResultWhenCollapsed)
             : undefined

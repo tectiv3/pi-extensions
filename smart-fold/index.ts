@@ -568,7 +568,7 @@ const stripRedundantCd = (args: unknown, context: ToolRenderContextLike): unknow
     const cwd = resolvePath(context.cwd ?? process.cwd())
     const resolved =
         target === '~' || target.startsWith('~/')
-            ? resolvePath(homedir(), target.slice(1))
+            ? resolvePath(homedir(), target.slice(2))
             : resolvePath(cwd, target)
     if (resolved !== cwd) return args
     return { ...(args as Record<string, unknown>), command: match[2] }

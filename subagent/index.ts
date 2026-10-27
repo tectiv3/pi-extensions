@@ -310,6 +310,7 @@ interface ActiveSubagent {
     id: string
     agent: string
     task: string
+    cwd: string
     proc: ChildProcess
     // Spawn time (epoch ms) — drives the elapsed column in the manager view.
     startedAt: number
@@ -645,10 +646,40 @@ function clampLines(lines: string[], width: number): string[] {
     return lines.map(line => truncateToWidth(line, width))
 }
 
+/** `cd <dir> && rest` — the form the bash tool call gets when the model re-states the run cwd. */
+const SHELL_CD_PREFIX = /^\s*cd\s+(?:--\s+)?("[^"]*"|'[^']*'|[^\s;&|]+)\s*&&\s*(\S[\s\S]*)$/
+
+/**
+ * Subagent bash rows otherwise all begin with the same `cd <run cwd> &&`, which
+ * pushes the distinguishing part of the command past the truncation point. Display-only:
+ * a `cd` into any other directory is kept, since it carries information. Mirrors
+ * smart-fold's helper so both surfaces read the same command.
+ */
+function stripRedundantCd(
+    args: Record<string, unknown>,
+    cwd: string | undefined
+): Record<string, unknown> {
+    if (!cwd) return args
+    const command = args.command
+    if (typeof command !== 'string') return args
+    const match = SHELL_CD_PREFIX.exec(command)
+    if (!match) return args
+    const target = match[1].replace(/^(['"])([\s\S]*)\1$/, '$2')
+    if (/[$*?`]/.test(target)) return args // cannot resolve a variable or glob
+    const runCwd = path.resolve(cwd)
+    const resolved =
+        target === '~' || target.startsWith('~/')
+            ? path.resolve(os.homedir(), target.slice(2))
+            : path.resolve(runCwd, target)
+    if (resolved !== runCwd) return args
+    return { ...args, command: match[2] }
+}
+
 function formatToolCall(
     toolName: string,
     args: Record<string, unknown>,
-    themeFg: (color: any, text: string) => string
+    themeFg: (color: any, text: string) => string,
+    cwd?: string
 ): string {
     const shortenPath = (p: string) => {
         const home = os.homedir()
@@ -657,7 +688,7 @@ function formatToolCall(
 
     switch (toolName) {
         case 'bash': {
-            const command = (args.command as string) || '...'
+            const command = (stripRedundantCd(args, cwd).command as string) || '...'
             const preview = command.length > 60 ? `${command.slice(0, 60)}...` : command
             return themeFg('muted', '$ ') + themeFg('toolOutput', preview)
         }
@@ -743,6 +774,9 @@ interface SingleResult {
     resumeNote?: string
     errorMessage?: string
     step?: number
+    // Run cwd; display-only, lets the renderer drop a redundant `cd <cwd> &&`
+    // from bash rows. Never feeds execution.
+    cwd?: string
     // Set when a foreground run was runtime-backgrounded: the awaiting tool
     // call returned early with the backgrounded notice instead of the result.
     runtimeBackgrounded?: boolean
@@ -774,6 +808,8 @@ interface SubagentMeta {
     stopReason?: string
     exitCode?: number
     sessionHeaderId?: string
+    // Run cwd at spawn; absent on metas written before it was recorded.
+    cwd?: string
 }
 
 interface ResumeTarget {
@@ -1208,7 +1244,8 @@ function decodeSteerText(data: string): string | undefined {
 // queue_update frames, until delivery swaps them for the ‹you› line.
 function buildAttachItems(
     events: SubagentStreamEvent[],
-    themeFg: (color: any, text: string) => string
+    themeFg: (color: any, text: string) => string,
+    cwd?: string
 ): Component[] {
     const items: Component[] = []
 
@@ -1284,7 +1321,7 @@ function buildAttachItems(
                     items.push(
                         new Text(
                             themeFg('muted', '→ ') +
-                                formatToolCall(part.name, part.arguments, themeFg),
+                                formatToolCall(part.name, part.arguments, themeFg, cwd),
                             0,
                             0
                         )
@@ -1337,7 +1374,8 @@ async function attachToSubagent(ctx: ExtensionContext, entry: ActiveSubagent): P
             if (cachedLines && cachedWidth === width) return cachedLines
             const items = buildAttachItems(
                 [...entry.events, ...steerErrors],
-                theme.fg.bind(theme)
+                theme.fg.bind(theme),
+                entry.cwd
             )
             const lines: string[] = []
             for (let i = 0; i < items.length; i++) {
@@ -1897,7 +1935,7 @@ function buildSubagentInspectReport(subagentId: string, limit: number): string {
                     : preview
             )
         } else {
-            lines.push(formatToolCall(item.name, item.args, plainThemeFg))
+            lines.push(formatToolCall(item.name, item.args, plainThemeFg, meta?.cwd))
         }
     }
 
@@ -1963,6 +2001,7 @@ async function runSingleAgent(
     overrideModel?: string
 ): Promise<SingleResult> {
     const subagentId = resume?.id ?? uuidv7()
+    const resolvedCwd = cwd ?? defaultCwd
     const runEpoch = currentSessionEpoch()
     const {
         session: sessionPath,
@@ -1992,6 +2031,7 @@ async function runSingleAgent(
                 turns: 0,
             },
             step,
+            cwd: resolvedCwd,
         }
     }
 
@@ -2083,6 +2123,7 @@ async function runSingleAgent(
         model,
         step,
         resumeNote,
+        cwd: resolvedCwd,
     }
 
     const emitUpdate = () => {
@@ -2124,6 +2165,7 @@ async function runSingleAgent(
             // Omitted (undefined) when the spawn was not a tool call (e.g. /subagents resume).
             toolCallId: toolCallId || undefined,
             resumedCount: resume ? (resume.meta.resumedCount ?? 0) + 1 : undefined,
+            cwd: resolvedCwd,
         }
         writeSubagentMetaFile(metaPath, spawnMeta)
 
@@ -2146,7 +2188,7 @@ async function runSingleAgent(
             const invocation = getPiInvocation(args)
             debug(`spawn: ${invocation.command} ${invocation.args.join(' ')}`)
             const proc = spawn(invocation.command, invocation.args, {
-                cwd: cwd ?? defaultCwd,
+                cwd: resolvedCwd,
                 shell: false,
                 stdio: ['pipe', 'pipe', 'pipe'],
             })
@@ -2354,6 +2396,7 @@ async function runSingleAgent(
                 id: subagentId,
                 agent: agentName,
                 task,
+                cwd: resolvedCwd,
                 proc,
                 startedAt: Date.now(),
                 turns: 0,
@@ -3744,6 +3787,7 @@ export default function (pi: ExtensionAPI) {
                             contextTokens: 0,
                             turns: 0,
                         },
+                        cwd: params.tasks[i].cwd ?? ctx.cwd,
                     }
                 }
 
@@ -4080,7 +4124,11 @@ export default function (pi: ExtensionAPI) {
 
             const mdTheme = getMarkdownTheme()
 
-            const renderDisplayItems = (items: DisplayItem[], limit?: number) => {
+            const renderDisplayItems = (
+                items: DisplayItem[],
+                limit?: number,
+                cwd?: string
+            ) => {
                 const toShow = limit ? items.slice(-limit) : items
                 const skipped = limit && items.length > limit ? items.length - limit : 0
                 let text = ''
@@ -4092,7 +4140,7 @@ export default function (pi: ExtensionAPI) {
                             : item.text.split('\n').slice(0, 3).join('\n')
                         text += `${theme.fg('toolOutput', preview)}\n`
                     } else {
-                        text += `${theme.fg('muted', '→ ') + formatToolCall(item.name, item.args, theme.fg.bind(theme))}\n`
+                        text += `${theme.fg('muted', '→ ') + formatToolCall(item.name, item.args, theme.fg.bind(theme), cwd)}\n`
                     }
                 }
                 return text.trimEnd()
@@ -4131,7 +4179,8 @@ export default function (pi: ExtensionAPI) {
                                             formatToolCall(
                                                 item.name,
                                                 item.args,
-                                                theme.fg.bind(theme)
+                                                theme.fg.bind(theme),
+                                                r.cwd
                                             ),
                                         0,
                                         0
@@ -4159,7 +4208,7 @@ export default function (pi: ExtensionAPI) {
                 else if (displayItems.length === 0)
                     text += `\n${theme.fg('muted', '(no output)')}`
                 else {
-                    text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`
+                    text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT, r.cwd)}`
                     if (displayItems.length > COLLAPSED_ITEM_COUNT)
                         text += `\n${theme.fg('muted', '(Ctrl+O to expand)')}`
                 }
@@ -4244,7 +4293,8 @@ export default function (pi: ExtensionAPI) {
                                             formatToolCall(
                                                 item.name,
                                                 item.args,
-                                                theme.fg.bind(theme)
+                                                theme.fg.bind(theme),
+                                                r.cwd
                                             ),
                                         0,
                                         0
@@ -4287,7 +4337,7 @@ export default function (pi: ExtensionAPI) {
                     text += `\n\n${theme.fg('muted', `─── Step ${r.step}: `)}${theme.fg('accent', r.agent)} ${rIcon}`
                     if (displayItems.length === 0)
                         text += `\n${theme.fg('muted', '(no output)')}`
-                    else text += `\n${renderDisplayItems(displayItems, 5)}`
+                    else text += `\n${renderDisplayItems(displayItems, 5, r.cwd)}`
                 }
                 const usageStr = formatUsageStats(aggregateUsage(details.results))
                 if (usageStr) text += `\n\n${theme.fg('dim', `Total: ${usageStr}`)}`
@@ -4355,7 +4405,8 @@ export default function (pi: ExtensionAPI) {
                                             formatToolCall(
                                                 item.name,
                                                 item.args,
-                                                theme.fg.bind(theme)
+                                                theme.fg.bind(theme),
+                                                r.cwd
                                             ),
                                         0,
                                         0
@@ -4398,7 +4449,7 @@ export default function (pi: ExtensionAPI) {
                     text += `\n\n${theme.fg('muted', '─── ')}${theme.fg('accent', r.agent)} ${rIcon}`
                     if (displayItems.length === 0)
                         text += `\n${theme.fg('muted', r.exitCode === -1 ? '(running...)' : '(no output)')}`
-                    else text += `\n${renderDisplayItems(displayItems, 5)}`
+                    else text += `\n${renderDisplayItems(displayItems, 5, r.cwd)}`
                 }
                 if (!isRunning) {
                     const usageStr = formatUsageStats(aggregateUsage(details.results))

@@ -843,17 +843,24 @@ export default function smartFold(pi: ExtensionAPI): void {
                       ` ${this.theme.fg('error', `-${stat.removed}`)}`
                     : ''
 
+            /** Place the stat on the header line without ever exceeding `width`. */
+            const withStat = (line: string): string => {
+                const padded = insertIntoLinePadding(line, suffix)
+                if (padded !== null) return padded
+                // Appending past `width` crashes pi's renderer, so the fallback
+                // has to truncate the header instead of overflowing it.
+                const room = width - displayWidth(suffix)
+                if (room <= 1) return truncateToWidth(line, width, '…')
+                return truncateToWidth(trimLineFiller(line), room, '…') + suffix
+            }
+
             // Pass pi's lines through untouched apart from the stat: expanded rows
             // render in full, and collapsed write/edit rows keep pi's native
             // preview — replacing it with one line would throw away content pi
             // already decided to show.
             if (this.expanded || (this.headerOnly && config.writeCollapsed === 'preview')) {
                 const out = lines.slice()
-                if (suffix) {
-                    out[headerIndex] =
-                        insertIntoLinePadding(out[headerIndex], suffix) ??
-                        trimLineFiller(out[headerIndex]) + suffix
-                }
+                if (suffix) out[headerIndex] = withStat(out[headerIndex])
                 return out
             }
 
@@ -862,23 +869,11 @@ export default function smartFold(pi: ExtensionAPI): void {
                 // outer box). Keep their full-width background lines and inject the
                 // stat into the header line's padding so the bar keeps its size.
                 if (headerIndex > 0) {
-                    const header = suffix
-                        ? (insertIntoLinePadding(lines[headerIndex], suffix) ??
-                          trimLineFiller(lines[headerIndex]) + suffix)
-                        : lines[headerIndex]
+                    const header = suffix ? withStat(lines[headerIndex]) : lines[headerIndex]
                     return [lines[headerIndex - 1], header, lines[lines.length - 1]]
                 }
-                // Plain inner (write): the outer box pads — trim, then append.
-                const header = suffix ? trimLineFiller(lines[headerIndex]) : lines[headerIndex]
-                const out = [header]
-                if (suffix) {
-                    if (displayWidth(header) + displayWidth(suffix) <= width) {
-                        out[0] = header + suffix
-                    } else {
-                        out.splice(1, 0, suffix.trim())
-                    }
-                }
-                return out
+                // Plain inner (write): a single header line carrying the stat.
+                return [suffix ? withStat(lines[headerIndex]) : lines[headerIndex]]
             }
 
             // Collapsed shell/file rows without their own preview: single first

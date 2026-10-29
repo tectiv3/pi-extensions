@@ -12,8 +12,8 @@
  *   shift every later vector. Newlines are collapsed before the wire.
  * - A language mismatch exits `2` *after* writing all output, so a non-zero exit is
  *   not by itself a batch failure. The per-line `langCheck` field carries the CLI's
- *   own §8.2 verdict; a hard mismatch drops that one vector instead of silently
- *   embedding garbage.
+ *   own §8.2 verdict; a hard mismatch drops that one vector and warns instead of
+ *   silently embedding garbage.
  *
  * The runner and the probe are injectable so tests can count spawns and supply
  * canned JSONL without a built binary.
@@ -332,11 +332,12 @@ export async function embedBatch(
             failed++
             return
         }
-        // A skipped vector is an expected outcome: the CLI already reports the
-        // classification on stderr, and a mixed-language store is normal, so this
-        // drop is not worth a transcript line. `failed` stays untouched too — the
-        // aggregate warning counts unparseable lines, not refused ones.
-        if (isHardMismatch(line, entry.text)) return
+        if (isHardMismatch(line, entry.text)) {
+            warn(
+                `text ${position} detected as '${String(line.lang)}' (p=${typeof line.langConfidence === 'number' ? line.langConfidence.toFixed(3) : '?'}); the '${EMBED_LANG}' model would produce noise, so it was not embedded`
+            )
+            return
+        }
         vectors[entry.index] = vector
     })
 
@@ -407,33 +408,12 @@ function parseLines(stdout: string): EmbedLine[] {
     return parsed
 }
 
-/**
- * The CLI's language diagnostics, in every shape it emits them. They are all one
- * expected verdict — the text is not English while the loaded model is — so the
- * verdict already travels in the JSONL (`langCheck`) and the consequence is the
- * expected dropped (or noise-only) vector. Surfacing them only floods the
- * transcript, and the per-language aggregate restates the per-text line above it.
- * Each pattern is specific to a language diagnostic; batch-level failures (model
- * load, missing model, crash, timeout) match none of them and still pass through.
- */
-const LANGUAGE_DIAGNOSTIC_WARNINGS: readonly RegExp[] = [
-    // text 0 detected as 'hu' p=0.999 but the 'en' model is loaded; ...
-    /\btext \d+ detected as /,
-    // text 0: ambiguous detection — top hypothesis 'tr' p=0.531 vs 'en' ...
-    /\btext \d+: ambiguous detection\b/,
-    // text 0: no language detected (the cat sat…); assuming the 'en' model ...
-    /\btext \d+: no language detected\b/,
-    // 'hu' text embedded with the 'en' model produces meaningless vectors — ...
-    /'[^']*' text embedded with the '[^']*' model produces meaningless vectors/,
-]
-
 function warningLines(stderr: string): string[] {
     return stderr
         .split('\n')
         .map(line => line.trim())
         .filter(line => /warning:/i.test(line))
         .map(line => line.replace(/^\[nle-embed\]\s*/i, ''))
-        .filter(line => !LANGUAGE_DIAGNOSTIC_WARNINGS.some(pattern => pattern.test(line)))
 }
 
 /**

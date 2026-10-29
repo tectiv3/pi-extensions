@@ -482,7 +482,7 @@ test('memory_write of a gated note without a reason writes nothing', async t => 
     assert.ok(!result.text.includes(SECRET_TOKEN))
 })
 
-test('memory_write reports the diff and no hash, so a read stays the hash source', async t => {
+test('memory_write reports the diff and the hash it produced', async t => {
     ensureNotSubagent(t)
     useStoreDir(t)
     const store = openSeededStore(t)
@@ -491,15 +491,10 @@ test('memory_write reports the diff and no hash, so a read stays the hash source
 
     assert.equal(result.isError, undefined)
     assert.match(result.text, /wrote notes\/page \(global, open\)/)
+    assert.match(result.text, /^hash: [0-9a-f]{64}$/m)
     assert.match(result.text, /\+first line/)
-    assert.ok(
-        !/^hash: /m.test(result.text),
-        `the write result still prints a hash: ${result.text}`
-    )
-    assert.equal((result.details as { hash?: string }).hash, undefined)
-
-    const read = await memoryRead(deps(t, store), { key: 'notes/page' })
-    assert.match((read.details as { hash: string }).hash, /^[0-9a-f]{64}$/)
+    const hash = (result.details as { hash: string }).hash
+    assert.match(hash, /^[0-9a-f]{64}$/)
 })
 
 test('a stale baseHash on a gated write prompts nobody and logs nothing', async t => {
@@ -680,11 +675,6 @@ test('memory_edit with the current baseHash replaces the single match', async t 
 
     assert.equal(result.isError, undefined)
     assert.match(result.text, /edited notes\/page/)
-    assert.ok(
-        !/^hash: /m.test(result.text),
-        `the edit result still prints a hash: ${result.text}`
-    )
-    assert.equal((result.details as { hash?: string }).hash, undefined)
     assert.equal(
         fs.readFileSync(notePath(root, 'global/notes/page.md'), 'utf8'),
         'alpha gamma'

@@ -10,9 +10,12 @@ pi coding-agent extensions (TypeScript, run inside the pi process):
 | `notify/` | Desktop notifications — emits OSC 777/OSC 9 when the agent settles, errors, or waits on a prompt. See `notify/README.md`. |
 | `simplify/` | `/simplify` command — reviews changed code (unpushed + uncommitted by default) within changed line ranges. |
 | `smart-fold/` | Transcript compaction — folds thinking, hides collapsed `bash` output, keeps `read`/`write` previews, adds `+N -M` stats to write/edit rows. Vendored from `@clapecho233/pi-smart-fold` (MIT), config persistence stripped, collapsed-row behaviour retuned. |
+| `agent-memory/` | Agent memory — git-backed markdown notes, SQLite FTS5 + vector index, injected key index, consent gate. Needs `./build.sh`. See `agent-memory/README.md`. |
 
 All are symlinked into the consuming pi setup (`~/.pi/agent/extensions/<name>`); there is no
-build step — pi loads the `.ts` files directly.
+build step for the TypeScript — pi loads the `.ts` files directly. Two exceptions apply to
+`agent-memory/`: it ships one native helper (`bin/nle-embed`, built by its own `./build.sh`), and it is
+the only extension with a runtime dependency (`sqlite-vec`, declared in the root `package.json`).
 
 ## Host source
 
@@ -40,7 +43,8 @@ Runtime dependencies (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui
 pi installation, not by this repo. `types.d.ts` at the repo root declares stubs for them so the
 tree type-checks standalone — the stubs are deliberately looser than the real package types, so
 use them for this repo's own consistency only, never as documentation of the host API. Only
-`node` types plus the dev toolchain (eslint, typescript, prettier) are installed here.
+`node` types plus the dev toolchain (eslint, typescript, prettier) are installed here, with one
+exception: `agent-memory/` declares `sqlite-vec` as a real runtime dependency.
 
 ## Checks
 

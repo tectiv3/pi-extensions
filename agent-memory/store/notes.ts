@@ -32,6 +32,8 @@ import {
     deleteNote as deleteNoteRow,
     getNoteByKey,
     type NoteInput,
+    type NoteRow,
+    type ScopeTarget,
     upsertNote,
 } from '../index/notes.ts'
 import {
@@ -50,6 +52,7 @@ import {
     type ResolvedProject,
     resolveProjectId,
 } from './project.ts'
+import { toPosix } from './walk.ts'
 
 const GIT_TIMEOUT_MS = 10_000
 /** §3.4 step 5: three attempts, 50 ms apart. */
@@ -60,8 +63,9 @@ const ABSENT_HASH = 'absent'
 /** §3.4 step 5's exact failure string. */
 export const INDEX_FAILED_MESSAGE = 'written and committed, but not indexed; run /memory index'
 /**
- * A deleted row is not something reindex can notice — reindex only upserts — so the
- * delete path cannot promise the same recovery as a write.
+ * The row outlives a failed index delete. `--rebuild` names the strongest remedy; a
+ * plain `/memory index` also removes the row, since the pass deletes rows whose file
+ * is gone (F6).
  */
 export const DELETE_INDEX_FAILED_MESSAGE =
     'deleted and committed, but still listed in the index; run /memory index --rebuild'
@@ -83,16 +87,30 @@ export class NoteNotFoundError extends Error {
     readonly scope: Scope
     readonly project: string
     readonly path: string
+    /** Every tier searched, in order; more than one only on a discovery path. */
+    readonly tried: readonly ScopeTarget[]
 
-    constructor(key: string, scope: Scope, project: string, relPath: string) {
-        const where = scope === 'global' ? 'global' : `project ${project}`
+    constructor(
+        key: string,
+        scope: Scope,
+        project: string,
+        relPath: string,
+        alsoTried: readonly ScopeTarget[] = []
+    ) {
+        const tried: ScopeTarget[] = [{ scope, project }, ...alsoTried]
+        const where = tried.map(target => describeScope(target)).join(', ')
         super(`memory note '${key}' not found (${where})`)
         this.name = 'NoteNotFoundError'
         this.key = key
         this.scope = scope
         this.project = project
         this.path = relPath
+        this.tried = tried
     }
+}
+
+function describeScope(target: ScopeTarget): string {
+    return target.scope === 'global' ? 'global' : `project ${target.project}`
 }
 
 /** §5: the `baseHash` precondition. Message is the spec's, not a paraphrase. */
@@ -293,10 +311,9 @@ export interface ResolvedScope {
 /**
  * §5.1 verbatim: explicit wins; omitted is project when resolvable, else global.
  *
- * Resolution is by *cwd*, not by which scope already holds the key, and that is what
- * makes the "key in both scopes" rule fall out: from a repository the project scope
- * is always chosen, so the project note shadows the global one. A global note is
- * therefore reachable from a repository only by naming `scope: 'global'`.
+ * This is the **primary** tier. A write, edit or delete lands here, so an omitted
+ * scope can never guess its way into the other tier; discovery paths use
+ * `resolveScopes` and see both.
  */
 export function resolveScope(cwd: string, explicit?: Scope): ResolvedScope {
     if (explicit === 'global') return { scope: 'global', project: '', info: null }
@@ -306,6 +323,25 @@ export function resolveScope(cwd: string, explicit?: Scope): ResolvedScope {
         return { scope: 'global', project: '', info: null }
     }
     return { scope: 'project', project: info.id, info }
+}
+
+/**
+ * Every tier a **discovery** path must search, in rank order. §5.1's "project wins"
+ * rule is a fallback rule: from inside a repository an omitted scope means "project
+ * first", not "project only", otherwise the global tier is write-only (F3).
+ *
+ * An explicit `scope` narrows this to exactly one tier, and a cwd outside a work tree
+ * resolves to global alone.
+ */
+export function resolveScopes(cwd: string, explicit?: Scope): ResolvedScope[] {
+    const primary = resolveScope(cwd, explicit)
+    if (explicit !== undefined || primary.scope === 'global') return [primary]
+    return [primary, { scope: 'global', project: '', info: null }]
+}
+
+/** The filter form of `resolveScopes`, for the index's multi-tier queries. */
+export function scopeTargets(cwd: string, explicit?: Scope): ScopeTarget[] {
+    return resolveScopes(cwd, explicit).map(({ scope, project }) => ({ scope, project }))
 }
 
 // ---------------------------------------------------------------------------
@@ -374,25 +410,64 @@ function readNoteFile(loc: NoteLocation): NoteFile | null {
  * Reads a note from disk. The index is not consulted: §5's gate decision must reflect
  * the file at operation time, and a hand-edited `access:` is invisible to the index.
  *
+ * With `scope` omitted the tiers are tried in order — project, then global (F3) — so a
+ * global note is reachable from inside a repository. The gate is decided from the
+ * file that was found: only the fallback target's `access` can govern it.
+ *
+ * Mutations deliberately do not fall back: a write, edit or delete must name the tier
+ * it is mutating rather than land in whichever one happens to hold the key. The read
+ * result carries `scope`, which is what a caller needs to name it.
+ *
  * Gating is the *caller's* step — `memory_read` confirms (§5) and `/memory show` logs
  * a user line (§10) — so this function deliberately returns the body either way.
  */
 export function readNote(ctx: NoteContext, input: ReadNoteInput): NoteSnapshot {
-    const resolved = resolveScope(ctx.cwd, input.scope)
-    const loc = locate(ctx.root, input.key, resolved)
-    const file = readNoteFile(loc)
-    if (file === null) {
-        throw new NoteNotFoundError(loc.key, loc.scope, loc.project, loc.relPath)
+    const targets = resolveScopes(ctx.cwd, input.scope)
+    const misses: NoteLocation[] = []
+    for (const target of targets) {
+        const loc = locate(ctx.root, input.key, target)
+        const file = readNoteFile(loc)
+        if (file !== null) {
+            return {
+                key: file.key,
+                scope: file.scope,
+                project: file.project,
+                access: file.access,
+                body: file.body,
+                hash: file.hash,
+                path: file.path,
+                mtime: file.mtime,
+            }
+        }
+        misses.push(loc)
     }
-    return {
-        key: file.key,
-        scope: file.scope,
-        project: file.project,
-        access: file.access,
-        body: file.body,
-        hash: file.hash,
-        path: file.path,
-        mtime: file.mtime,
+    const [first, ...rest] = misses
+    throw new NoteNotFoundError(
+        first.key,
+        first.scope,
+        first.project,
+        first.relPath,
+        rest.map(loc => ({ scope: loc.scope, project: loc.project }))
+    )
+}
+
+/**
+ * The index's `access` is a snapshot of the last reindex, while §2.1 makes the file
+ * authoritative. A note hand-gated mid-session is therefore still `access = 'open'` in
+ * `notes`, and a listing or search that trusts the row would name its key and print its
+ * first line (§5.2 exposure window). Discovery paths call this before showing anything:
+ * a row the file now marks gated is reported as gated, never named.
+ *
+ * An unreadable file keeps the row's value. That direction is fail-closed at the point
+ * it matters — `memory_read` re-parses the file and refuses to return a gated body —
+ * and it keeps a merely unreadable note listed rather than silently deleted.
+ */
+export function resolveRowAccess(root: string, row: Pick<NoteRow, 'path' | 'access'>): Access {
+    if (row.access === 'gated') return 'gated'
+    try {
+        return parseNote(fs.readFileSync(path.join(root, row.path))).access
+    } catch {
+        return row.access
     }
 }
 
@@ -501,7 +576,16 @@ async function persistNote(
     // the body it is about to release, and gating one publishes a body that was open.
     const touchesGated = access === 'gated' || existing?.access === 'gated'
 
-    // 2. gate, before anything is created or replaced.
+    // 2. baseHash precondition, when supplied (§5). Before the gate on purpose (F8):
+    // a stale precondition must not spend an approval on a write that cannot happen.
+    // A rejection here writes **no** log pair — the gate never ran, so there is no
+    // attempt to resolve and no consent decision is invented.
+    if (input.baseHash !== undefined) {
+        const actual = existing === null ? ABSENT_HASH : existing.hash
+        if (input.baseHash !== actual) throw new StaleNoteError(input.baseHash, actual)
+    }
+
+    // 3. gate, before anything is created or replaced.
     let attempt: string | null = null
     if (touchesGated) {
         const decision = await gate(ctx, op, loc, input.reason, input.body)
@@ -511,12 +595,6 @@ async function persistNote(
 
     let outcome: LogResult = 'ok'
     try {
-        // 3. baseHash precondition, when supplied (§5).
-        if (input.baseHash !== undefined) {
-            const actual = existing === null ? ABSENT_HASH : existing.hash
-            if (input.baseHash !== actual) throw new StaleNoteError(input.baseHash, actual)
-        }
-
         const content = renderNote(access, input.body)
         // The diff is computed from the two buffers rather than from the worktree, so
         // a git failure here aborts before the file is touched.
@@ -541,7 +619,10 @@ async function persistNote(
             project: loc.project,
             path: loc.absPath,
             relPath: loc.relPath,
-            access,
+            // The parsed value, not the requested one (F9): a body that opens its own
+            // frontmatter block becomes the file's frontmatter, and the tool result
+            // must describe the note that is on disk.
+            access: applied.access,
             hash: fileHash(buf),
         }
     } catch (err) {
@@ -583,6 +664,8 @@ async function gate(
 interface Applied {
     ok: true
     id: number
+    /** `access` as the written file parses, which is what §2.1 makes authoritative. */
+    access: Access
 }
 
 interface ApplyFailed {
@@ -614,9 +697,11 @@ function applyWriteResult(
     // Step 5 indexes what is on disk, not what we intended to write: `fm_len` and
     // `body_hash` must describe the bytes a reindex would read.
     let row: NoteInput
+    let access: Access
     try {
         const raw = fs.readFileSync(loc.absPath)
         const parsed = parseNote(raw)
+        access = parsed.access
         row = {
             scope: loc.scope,
             project: loc.project,
@@ -659,7 +744,7 @@ function applyWriteResult(
             bodyHash: row.bodyHash,
         })
     } catch {}
-    return { ok: true, id }
+    return { ok: true, id, access }
 }
 
 function applyDeleteResult(ctx: NoteContext, loc: NoteLocation): { ok: true } | ApplyFailed {
@@ -671,7 +756,9 @@ function applyDeleteResult(ctx: NoteContext, loc: NoteLocation): { ok: true } | 
         return {
             ok: false,
             code: `failed:${cls}`,
-            message: describeCommitFailure(cls, commit.stderr),
+            // The file is already gone, so a bare "commit failed" reads as "the
+            // delete did not happen". It did; §3.3's sweep commits it (§3.4 step 6).
+            message: `${describeCommitFailure(cls, commit.stderr)}; the note file is already removed, so the next startup sweep commits the deletion`,
             result: `failed:${cls}`,
         }
     }
@@ -827,8 +914,4 @@ function diffNote(relPath: string, before: Buffer | null, after: Buffer | null):
 function writeMaybe(target: string, content: Buffer | null): void {
     fs.mkdirSync(path.dirname(target), { recursive: true })
     fs.writeFileSync(target, content ?? Buffer.alloc(0))
-}
-
-function toPosix(relPath: string): string {
-    return relPath.split(path.sep).join('/')
 }

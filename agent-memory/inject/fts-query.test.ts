@@ -73,6 +73,60 @@ const CASES = [
     '日本語のノート',
 ]
 
+test('prefix queries match plurals and inflections through a real MATCH', t => {
+    const db = tempIndex(t)
+    upsertNote(db, {
+        scope: 'global',
+        key: 'store/symlinks',
+        path: 'global/store/symlinks.md',
+        body: 'symlinks and symlinked parents are rejected; the leaf is never followed',
+        fmLen: 0,
+        bodyHash: 'hash-c',
+        access: 'open',
+        mtime: 1_700_000_002_000,
+    })
+
+    // The measured defect: `unicode61` does not stem, so the singular found nothing.
+    assert.equal(matchCount(db, '"symlink"'), 0, 'the exact phrase still misses the plural')
+
+    const query = toFtsQuery('symlink')
+    assert.equal(query, '"symlink"*')
+    assert.equal(matchCount(db, query ?? ''), 1, `symlink did not match symlinks`)
+    assert.equal(matchCount(db, toFtsQuery('symlinks') ?? ''), 1)
+    assert.equal(matchCount(db, toFtsQuery('symlinked') ?? ''), 1)
+    // The key is indexed too, so a prefix on a key word still narrows to one note.
+    assert.equal(matchCount(db, toFtsQuery('sym') ?? ''), 1)
+})
+
+test('a two-character token is not expanded, so it cannot sweep the corpus', t => {
+    const db = tempIndex(t)
+    upsertNote(db, {
+        scope: 'global',
+        key: 'notes/reading',
+        path: 'global/notes/reading.md',
+        body: 'reading list for the release, nothing about a remote or a rebuild',
+        fmLen: 0,
+        bodyHash: 'hash-d',
+        access: 'open',
+        mtime: 1_700_000_003_000,
+    })
+
+    // `re` is below MIN_PREFIX_CHARS, so it stays an exact phrase and matches nothing
+    // in this note.
+    assert.equal(toFtsQuery('re'), '"re"')
+    assert.equal(matchCount(db, toFtsQuery('re') ?? ''), 0)
+    // Expanded, the same two letters would match reading, release, remote and rebuild
+    // at once — two notes in this fixture, more than an exact phrase could justify.
+    assert.ok(
+        matchCount(db, '"re"*') > matchCount(db, toFtsQuery('re') ?? ''),
+        'the prefix form has to be the broader one, which is why it is the guarded one'
+    )
+
+    // Three characters is where expansion starts earning its keep: `rea` still lands
+    // on the one note it should.
+    assert.equal(matchCount(db, toFtsQuery('rea') ?? ''), 1)
+})
+
 test('every non-null query is accepted by a real MATCH', t => {
     const db = tempIndex(t)
     for (const text of CASES) {
@@ -88,16 +142,27 @@ test('every non-null query is accepted by a real MATCH', t => {
 
 test('toFtsQuery strips FTS5 operators, quotes and column filters', () => {
     // `-rf` unquoted is `NOT rf`; `(re)build` unquoted is a syntax error.
+    // `rf` is two characters, so it stays an exact phrase — only ≥ 3 chars are
+    // expanded to a prefix query (see MIN_PREFIX_CHARS).
     assert.equal(toFtsQuery('-rf'), '"rf"')
-    assert.equal(toFtsQuery('(re)build'), '"re" OR "build"')
-    assert.equal(toFtsQuery('"quoted"'), '"quoted"')
+    assert.equal(toFtsQuery('(re)build'), '"re" OR "build"*')
+    assert.equal(toFtsQuery('"quoted"'), '"quoted"*')
     // A column filter is a column filter only unquoted, and `key` is a real column.
-    assert.equal(toFtsQuery('foo:bar'), '"foo" OR "bar"')
-    assert.equal(toFtsQuery('key:build'), '"key" OR "build"')
-    assert.equal(toFtsQuery('^caret'), '"caret"')
+    assert.equal(toFtsQuery('foo:bar'), '"foo"* OR "bar"*')
+    assert.equal(toFtsQuery('key:build'), '"key"* OR "build"*')
+    assert.equal(toFtsQuery('^caret'), '"caret"*')
     // `NEAR` is an operator keyword and `3` is below the two-character floor.
     assert.equal(toFtsQuery('NEAR/3'), null)
-    assert.equal(toFtsQuery('build NEAR/3 flake'), '"build" OR "flake"')
+    assert.equal(toFtsQuery('build NEAR/3 flake'), '"build"* OR "flake"*')
+})
+
+test('tokens of 3+ characters become prefix queries, shorter ones stay exact', () => {
+    // The length decision, stated as a rule rather than a convenience: a two-character
+    // prefix is close to a term-list scan, and inflection preserves the leading three.
+    assert.equal(toFtsQuery('db'), '"db"')
+    assert.equal(toFtsQuery('go'), '"go"')
+    assert.equal(toFtsQuery('sql'), '"sql"*')
+    assert.equal(toFtsQuery('symlink'), '"symlink"*')
 })
 
 test('toFtsQuery returns null when nothing searchable survives', () => {
@@ -113,7 +178,7 @@ test('a column filter cannot reach an unintended column', t => {
     // contains "nix". Quoted, the same text is a body search and finds the build note.
     assert.equal(matchCount(db, 'key:nix'), 0)
     assert.equal(matchCount(db, toFtsQuery('key:nix') ?? ''), 1)
-    assert.equal(toFtsQuery('key:nix'), '"key" OR "nix"')
+    assert.equal(toFtsQuery('key:nix'), '"key"* OR "nix"*')
 })
 
 test('toFtsQuery caps tokens at 20 and the query at 512 characters', () => {
@@ -121,7 +186,7 @@ test('toFtsQuery caps tokens at 20 and the query at 512 characters', () => {
     const capped = toFtsQuery(hundred)
     assert.ok(capped !== null)
     assert.equal(capped.split(' OR ').length, MAX_QUERY_TOKENS)
-    assert.match(capped, /^"word0" OR "word1"/)
+    assert.match(capped, /^"word0"\* OR "word1"\*/)
     assert.ok(!capped.includes('"word20"'), 'the 21st token survived the cap')
 
     // One 2,000-character unbroken token must not consume the whole budget: the cap is
@@ -130,7 +195,7 @@ test('toFtsQuery caps tokens at 20 and the query at 512 characters', () => {
     const query = toFtsQuery(long)
     assert.ok(query !== null)
     assert.ok(query.length <= MAX_QUERY_CHARS, `query is ${query.length} chars`)
-    assert.match(query, /"grafana" OR "dashboard"$/)
+    assert.match(query, /"grafana"\* OR "dashboard"\*$/)
 
     // Two thousand characters of ordinary words with a few long ones: the character
     // cap, not the token cap, has to bite, and the result must still be a valid MATCH.

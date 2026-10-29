@@ -213,6 +213,12 @@ test('/memory show logs one user line and never confirms', async t => {
         reason: 'seed the fixture',
     })
     const before = readLog(store.root).length
+    // §7.1: a gated write is `pending` + one resolver, never a third line.
+    assert.equal(before, 2, 'the gated seed wrote more than two lines')
+    assert.deepEqual(
+        readLog(store.root).map(entry => entry.decision),
+        ['pending', 'approved']
+    )
 
     const { ctx, notices } = commandContext(tempDir(t, 'pi-memory-cmd-ctx-'))
     await run(pi, 'show secrets/api_token', ctx)
@@ -248,6 +254,7 @@ test('/memory show --gated lists keys without bodies and logs nothing', async t 
         reason: 'seed',
     })
     const before = readLog(store.root).length
+    assert.equal(before, 4, 'two gated seeds at two lines each')
 
     const { ctx } = commandContext(tempDir(t, 'pi-memory-cmd-ctx-'))
     await run(pi, 'show --gated', ctx)
@@ -313,6 +320,76 @@ test('/memory log renders a pending+approved pair as one row and an unresolved p
     assert.equal(unresolved.length, 1)
     assert.match(unresolved[0], /pending \(unresolved\)/)
     assert.ok(unresolved[0].startsWith('!'), 'unresolved rows are marked, not only labelled')
+})
+
+test('/memory log renders a mention decision as one row and never as a consent outcome', async t => {
+    ensureNotSubagent(t)
+    const { store, pi } = await setup(t)
+
+    appendLog(store.root, {
+        ts: '2026-10-29T10:00:00.000Z',
+        op: 'mention',
+        initiator: 'agent',
+        decision: 'inject',
+        scope: 'global',
+        top1: 3.56,
+        m10: 1.55,
+        n: 5,
+        reason: 'injected',
+        keys: ['notes/a', 'notes/b'],
+    })
+    appendLog(store.root, {
+        ts: '2026-10-29T10:00:01.000Z',
+        op: 'mention',
+        initiator: 'agent',
+        decision: 'skip',
+        scope: 'global',
+        top1: 1e-6,
+        m10: 1e-6,
+        n: 3,
+        reason: 'idf-clamp',
+    })
+    // A real declined gated read, so the consent encoding is checked alongside: it must
+    // still pair into one `declined` row, not disappear or turn into `skip`.
+    appendLog(store.root, {
+        ts: '2026-10-29T10:00:02.000Z',
+        attempt: 'dddddddddddddddd',
+        op: 'read',
+        initiator: 'agent',
+        decision: 'pending',
+        scope: 'global',
+        key: 'secrets/api_token',
+        reason: 'checking rotation',
+    })
+    appendLog(store.root, { attempt: 'dddddddddddddddd', decision: 'declined' })
+
+    const { ctx } = commandContext(tempDir(t, 'pi-memory-cmd-ctx-'))
+    await run(pi, 'log --tail 50', ctx)
+    const lines = lastNotice(ctx).split('\n')
+
+    assert.match(lines[0], /access log: last 3 of 3 attempts/)
+    // notice header + column header + separator + three rows
+    assert.equal(lines.length, 6)
+
+    const injected = lines.filter(line => line.includes('notes/a'))
+    assert.equal(injected.length, 1, 'a mention line is one row, not a pair')
+    assert.match(injected[0], /mention/)
+    assert.match(injected[0], /inject/)
+    assert.match(injected[0], /notes\/a, notes\/b/)
+    assert.match(injected[0], /injected/)
+    assert.ok(!injected[0].includes('pending'))
+
+    const skipped = lines.filter(line => line.includes('idf-clamp'))
+    assert.equal(skipped.length, 1)
+    assert.match(skipped[0], /skip/)
+    assert.ok(!skipped[0].includes('pending'))
+
+    const declined = lines.filter(line => line.includes('secrets/api_token'))
+    assert.equal(declined.length, 1, 'the declined pair must stay one row')
+    assert.match(declined[0], /read/)
+    assert.match(declined[0], /declined/)
+    assert.match(declined[0], /checking rotation/)
+    assert.ok(!declined[0].includes('pending'))
 })
 
 test('/memory log applies --tail after concatenating .1 and the live file', async t => {
@@ -439,6 +516,21 @@ test('/memory index --force-unlock clears a live-pid lock', async t => {
     assert.match(text, /force-unlock: cleared lock held by/)
     assert.equal(fs.existsSync(lockFile), false)
     assert.match(text, /indexed: scanned \d+, updated \d+, skipped \d+, errors \d+/)
+})
+
+test('/memory index reports the row of a hand-deleted note as removed', async t => {
+    ensureNotSubagent(t)
+    const { store, pi } = await setup(t)
+    await store.writeNote({ key: 'notes/gone', body: 'deleted by hand later' })
+    await store.writeNote({ key: 'notes/kept', body: 'stays' })
+    fs.rmSync(path.join(store.root, 'global', 'notes', 'gone.md'))
+
+    const { ctx } = commandContext(tempDir(t, 'pi-memory-cmd-ctx-'))
+    await run(pi, 'index', ctx)
+    const text = lastNotice(ctx)
+
+    assert.match(text, /indexed: scanned 1, updated 0, skipped 1, errors 0, removed 1/)
+    assert.equal(getNoteByKey(store.db, 'global', '', 'notes/gone'), null)
 })
 
 test('/memory index --rebuild reports the rebuilt note count', async t => {

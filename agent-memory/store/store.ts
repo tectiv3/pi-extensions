@@ -14,7 +14,7 @@ import * as path from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
 
 import type { GateContext } from '../gate/gate.ts'
-import { openIndex } from '../index/db.ts'
+import { openIndexLocked } from '../index/db.ts'
 import { initStore, sweepUncommitted } from './git.ts'
 import { normalizeKey } from './keys.ts'
 import {
@@ -41,6 +41,7 @@ import {
     storeRoot,
 } from './paths.ts'
 import { type ReindexResult, reindexFromDisk } from './reindex.ts'
+import { removeStaleTemps } from './walk.ts'
 
 export interface StorePaths {
     root: string
@@ -103,7 +104,14 @@ export function openStore(cwd: string, options: OpenStoreOptions = {}): Store {
     const resolvedCwd = path.resolve(cwd)
 
     initStore(root)
-    const db = openIndex(root)
+    // A crashed `writeFileAtomic` leaves `<note>.md.tmp` behind; it is gitignored, so
+    // nothing else would ever remove it.
+    removeStaleTemps(root)
+    // §11: the probe result only exists after the load attempt, and a host that cannot
+    // load `sqlite-vec` must not keep a database whose `vec_notes` can no longer be
+    // dropped — so the open that every session takes also owns the downgrade, and
+    // holds `index.db.lock` across both (F10).
+    const db = openIndexLocked(root)
     const ctx: NoteContext = {
         root,
         db,

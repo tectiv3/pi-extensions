@@ -17,8 +17,8 @@ import type { Scope } from '../store/paths.ts'
 import {
     type MemoryDeps,
     type NoteSummary,
-    scopeLabel,
-    scopeOverview,
+    scopesLabel,
+    scopesOverview,
 } from '../tools/definitions.ts'
 
 /** §6.1: 200 keys or 4,800 characters, whichever comes first. */
@@ -55,14 +55,19 @@ export function clearIndexBlockCache(): void {
 /**
  * §6.1's block content: scope, open keys newest-first, gated count.
  *
+ * Every tier a discovery path covers is named and listed (§5.1, F3): project keys
+ * first, then global ones, under one `scope:` line (`project:<id> + global`). The caps
+ * apply to the combined list, so a large project cannot starve the global tier out of
+ * the block — it is appended, not competing for the same first 200 slots.
+ *
  * Returns `''` for an empty store — an empty section only costs tokens, and an
  * empty section is also how U8's hook knows not to add one at all.
  */
 export function buildIndexBlock(source: IndexBlockSource, scope?: Scope): string {
-    const overview = scopeOverview(source, scope)
+    const overview = scopesOverview(source, scope)
     if (overview.open.length === 0 && overview.gated === 0) return ''
 
-    const lines = [`scope: ${scopeLabel(overview.scope, overview.project)}`]
+    const lines = [`scope: ${scopesLabel(overview.overviews)}`]
     const { text, hidden } = cappedKeys(overview.open)
     if (hidden > 0) {
         // An overflow line on its own is still information: cap, nothing else.
@@ -75,9 +80,10 @@ export function buildIndexBlock(source: IndexBlockSource, scope?: Scope): string
 }
 
 /**
- * Keys arrive already `mtime DESC, id DESC` from `scopeOverview`, so the cap keeps
- * the most recent notes. Gated keys are not in the list at all — `scopeOverview`
- * counts them, never names them (§5.2).
+ * Keys arrive already ranked — project tier first, each tier `mtime DESC, id DESC` —
+ * from `scopesOverview`, so the cap keeps the most recent notes and never lets the
+ * global tier displace the project's. Gated keys are not in the list at all —
+ * `scopesOverview` counts them, never names them (§5.2).
  */
 function cappedKeys(summaries: readonly NoteSummary[]): { text: string; hidden: number } {
     let text = ''

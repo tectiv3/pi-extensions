@@ -134,9 +134,21 @@ test('reindex and sweep are exposed on the store', async t => {
     )
     assert.equal(getNoteByKey(store.db, 'global', '', 'handmade'), null)
 
-    assert.deepEqual(store.reindex(), { scanned: 1, updated: 1, skipped: 0, errors: [] })
+    assert.deepEqual(store.reindex(), {
+        scanned: 1,
+        updated: 1,
+        skipped: 0,
+        removed: 0,
+        errors: [],
+    })
     assert.equal(getNoteByKey(store.db, 'global', '', 'handmade').access, 'gated')
-    assert.deepEqual(store.reindex(), { scanned: 1, updated: 0, skipped: 1, errors: [] })
+    assert.deepEqual(store.reindex(), {
+        scanned: 1,
+        updated: 0,
+        skipped: 1,
+        removed: 0,
+        errors: [],
+    })
 
     // The file is committed by the sweep (§3.3), not left dirty.
     assert.deepEqual(store.sweep(), { committed: ['global/handmade.md'] })

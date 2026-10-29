@@ -25,11 +25,14 @@ const GITIGNORE_CONTENT = ['/index.db*', '/access.log*', '/projects.json', '*.tm
 )
 const GIT_IDENTITY = { name: 'pi memory', email: 'pi-memory@localhost' }
 /**
- * Status codes worth recovering. `A ` is the crash-between-add-and-commit state
- * (§3.3); renames are dropped because both sides of a rename are note paths and
- * the extra NUL token complicates nothing we need.
+ * Status codes worth recovering. ` D` is the delete-in-worktree-not-staged state, which
+ * is exactly the window `deleteNote` can crash in: it unlinks the file before `git add`
+ * runs, so without this code the sweep skipped the one state it exists for (§3.3, F5).
+ * `A ` is the staged add; an unstaged ` A` is not a code `-z` emits and was dropped.
+ * Renames are dropped because both sides of a rename are note paths and the extra NUL
+ * token complicates nothing we need.
  */
-const DIRTY_CODES = new Set(['??', ' M', 'M ', 'A ', ' A', 'D '])
+const DIRTY_CODES = new Set(['??', ' M', 'M ', 'A ', 'D ', ' D'])
 const NOTE_SCOPE_PREFIXES = ['global/', 'projects/'] as const
 
 export class LockTimeoutError extends Error {

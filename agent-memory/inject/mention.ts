@@ -24,11 +24,11 @@
 
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 
-import { appendLog, newAttemptId } from '../gate/log.ts'
+import { appendLog } from '../gate/log.ts'
 import { getMeta } from '../index/db.ts'
 import { type ScoredNote, searchBm25 } from '../index/notes.ts'
 import type { Scope } from '../store/paths.ts'
-import { resolveScope } from '../store/notes.ts'
+import { resolveScope, scopeTargets } from '../store/notes.ts'
 import type { Store } from '../store/store.ts'
 import type { Embedder } from '../tools/definitions.ts'
 import { toFtsQuery } from './fts-query.ts'
@@ -116,8 +116,10 @@ export function detectMentions(
  * a bad `MATCH`, a missing scope or a locked index must not break the caller's turn,
  * and a turn without suggestions is a normal turn.
  *
- * `where` is filled in as a side effect so the log line can still carry the scope the
- * decision was made in when the search itself failed.
+ * `where` is filled in as a side effect with the **primary** tier, so the log line still
+ * carries the scope the decision was resolved in when the search itself failed. Both
+ * tiers are searched (§5.1, F3); the primary one is what `projects.json` and the log
+ * call the session's scope.
  */
 function detect(
     store: Store,
@@ -130,12 +132,13 @@ function detect(
 
     let hits: ScoredNote[]
     try {
-        const resolved = resolveScope(options.cwd ?? process.cwd())
-        where.scope = resolved.scope
-        where.project = resolved.project
+        const targets = scopeTargets(options.cwd ?? process.cwd())
+        // The primary tier names the decision in the log; both tiers are searched
+        // (§5.1, F3), so a cross-cutting global note can still be suggested.
+        where.scope = targets[0]?.scope
+        where.project = targets[0]?.project
         hits = searchBm25(store.db, query, {
-            scope: resolved.scope,
-            project: resolved.project,
+            scopes: targets,
             limit: MENTION_DEPTH,
         })
     } catch {
@@ -189,42 +192,30 @@ function median(values: readonly number[]): number {
 }
 
 /**
- * §7.1's decision enum has no value for "a rule decided, no user was asked", so the
- * least wrong encoding is used and the deviation is made explicit in the line itself:
- * `pending` + `approved`/`declined` keeps `pairAttempts` rendering the decision as one
- * row, while `injected` and `reason` (and the absence of any `key`) say that this was
- * mention detection, not a confirmation. Widening the enum would be the right fix and
- * belongs to `/memory log` (U10), which is the only reader of the field.
+ * §6.2's rule is telemetry, not consent: it writes **one** terminal line per decision
+ * with `op: 'mention'` and `decision: 'inject' | 'skip'`. There is no `pending` line and
+ * no attempt id, because nothing is waiting on a user — `approved`/`declined` would
+ * report a consent decision that never happened (§7.1).
  */
 function logDecision(
     store: Store,
     where: { scope?: Scope; project?: string },
     result: MentionResult
 ): void {
-    const attempt = newAttemptId()
-    const numbers = {
+    const entry = {
+        op: 'mention' as const,
+        initiator: 'agent' as const,
+        decision: result.injected ? ('inject' as const) : ('skip' as const),
+        scope: where.scope,
+        project: where.project,
         top1: round(result.top1),
         m10: round(result.m10),
         n: result.n,
-        injected: result.injected,
         reason: result.reason,
+        ...(result.injected ? { keys: result.keys } : {}),
     }
     try {
-        appendLog(store.root, {
-            attempt,
-            op: 'search',
-            initiator: 'agent',
-            decision: 'pending',
-            scope: where.scope,
-            project: where.project,
-            ...numbers,
-        })
-        appendLog(store.root, {
-            attempt,
-            decision: result.injected ? 'approved' : 'declined',
-            ...(result.injected ? { result: 'ok' as const } : {}),
-            ...numbers,
-        })
+        appendLog(store.root, entry)
     } catch {
         // A read-only or full disk must not cost the user their turn; the injection
         // itself is unaffected by a missing log line.
@@ -272,7 +263,7 @@ export function installMentionHook(
     // One decision per distinct user message: the `context` hook runs before *every*
     // LLM request, so a 15-request turn would otherwise repeat the same detection and
     // the same log pair 15 times, drowning the numbers §6.2 wants to tune `F` with.
-    let lastText: string | undefined
+    let lastKey: string | undefined
     let lastResult: MentionResult | undefined
 
     pi.on('context', (event: ContextEventLike, ctx: { cwd?: string }) => {
@@ -287,12 +278,17 @@ export function installMentionHook(
         const active = storeOf()
         if (active === undefined) return
 
+        const cwd = options.cwd ?? ctx?.cwd
+        // The scope is part of the key, not just the text: `session_start` fires again
+        // for a new session, and the same first message ("continue") from a different
+        // project must not reuse the previous project's keys (F12).
+        const key = cacheKey(cwd, text)
         let result: MentionResult
-        if (text === lastText && lastResult !== undefined) {
+        if (key === lastKey && lastResult !== undefined) {
             result = lastResult
         } else {
-            result = detectMentions(active, text, { ...options, cwd: options.cwd ?? ctx?.cwd })
-            lastText = text
+            result = detectMentions(active, text, { ...options, cwd })
+            lastKey = key
             lastResult = result
         }
         if (!result.injected || result.keys.length === 0) return
@@ -301,6 +297,18 @@ export function installMentionHook(
         // Returning nothing is deliberate: the message object was mutated in place, so
         // the host sees its own array unchanged and keeps the existing system messages.
     })
+}
+
+/**
+ * The memoisation key: the message text **and** the tier it was resolved in, because
+ * `session_start` fires again for a new session and the same first message ("continue")
+ * from a different project must not reuse the previous project's keys (F12).
+ *
+ * NUL-joined: neither part can contain NUL, so text and scope cannot collide.
+ */
+function cacheKey(cwd: string | undefined, text: string): string {
+    const resolved = resolveScope(cwd ?? process.cwd())
+    return `${resolved.scope}\u0000${resolved.project}\u0000${text}`
 }
 
 /** The latest user turn, or `-1`. Tool results and assistant turns are never touched. */

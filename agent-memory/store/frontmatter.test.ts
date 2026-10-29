@@ -91,6 +91,14 @@ test('an upper-case access key and value still parse as gated', () => {
     assert.equal(parsed.body, 'body\n')
 })
 
+test('an indented access key inside a block still parses as gated', () => {
+    // Fail-closed (§2.1): requiring column 0 demoted the block to body, which opened the
+    // note *and* left `access: gated` searchable.
+    const parsed = parse('---\n  access: gated\n---\nsecret body\n')
+    assert.equal(parsed.access, 'gated')
+    assert.equal(parsed.body, 'secret body\n')
+})
+
 test('an explicit access: open block is frontmatter and is stripped', () => {
     const parsed = parse('---\naccess: open\n---\nbody\n')
     assert.equal(parsed.access, 'open')

@@ -129,7 +129,7 @@ test('a newline in the embed text never becomes a second stdin line', () => {
 // language guard (§8.2)
 // ---------------------------------------------------------------------------
 
-test('a hard language mismatch drops that vector and warns', async () => {
+test('a hard language mismatch drops that vector without a warning', async () => {
     const fake = fakeRunner(() => ({
         stdout: [
             line(0, { langCheck: 'match' }),
@@ -145,9 +145,10 @@ test('a hard language mismatch drops that vector and warns', async () => {
     assert.ok(vectors !== null)
     assert.ok(vectors[0] instanceof Float32Array)
     assert.equal(vectors[1], null, 'a mismatch must not be embedded silently')
-    assert.ok(
-        warnings.some(text => /detected as 'de'/.test(text)),
-        `no mismatch warning: ${warnings.join(' | ')}`
+    assert.deepEqual(
+        warnings,
+        [],
+        `a refused vector is expected, not a warning: ${warnings.join(' | ')}`
     )
 })
 
@@ -205,7 +206,14 @@ test('exit 2 keeps the output (the CLI writes it before exiting), exit 1 does no
     const mismatch = fakeRunner(() => ({
         status: 2,
         stdout: line(0, { langCheck: 'ambiguous' }),
-        stderr: "[nle-embed] warning: text 0: ambiguous detection — top hypothesis 'tr'\n",
+        stderr: [
+            "[nle-embed] warning: text 0: ambiguous detection — top hypothesis 'tr' p=0.531 vs 'en' p=0.294; continuing with the 'en' model",
+            "[nle-embed] warning: text 0 detected as 'hu' p=0.999 but the 'en' model is loaded; no 'hu' sentence embedding model exists on this system",
+            "[nle-embed] warning: text 0: no language detected (the cat sat…); assuming the 'en' model applies",
+            "[nle-embed] warning: 'hu' text embedded with the 'en' model produces meaningless vectors — every cosine similarity below is noise. Use --force to silence this exit code.",
+            // Batch-level stderr must survive the per-text filter.
+            '[nle-embed] warning: model load failed, retrying once',
+        ].join('\n'),
     }))
     const warnings: string[] = []
     const vectors = await embedBatch(['the cat sat on the mat'], {
@@ -214,10 +222,49 @@ test('exit 2 keeps the output (the CLI writes it before exiting), exit 1 does no
     })
     assert.ok(vectors !== null)
     assert.ok(vectors[0] instanceof Float32Array)
-    assert.ok(warnings.some(text => /ambiguous detection/.test(text)))
+    assert.ok(
+        warnings.some(text => /model load failed/.test(text)),
+        `an unrelated warning was swallowed: ${warnings.join(' | ')}`
+    )
+    assert.ok(
+        !warnings.some(text =>
+            /ambiguous detection|detected as|no language detected|meaningless vectors/.test(
+                text
+            )
+        ),
+        `per-text language diagnostics reached the transcript: ${warnings.join(' | ')}`
+    )
 
     const failed = fakeRunner(() => ({ status: 1, stdout: '', stderr: 'boom' }))
     assert.equal(await embedBatch(['x'], { runner: failed.runner }), null)
+})
+
+test('every language-diagnostic shape is filtered; other warnings are not', async () => {
+    const diagnostics = [
+        "[nle-embed] warning: text 1 detected as 'hu' p=0.999 but the 'en' model is loaded; no 'hu' sentence embedding model exists on this system",
+        "[nle-embed] warning: text 1: ambiguous detection — top hypothesis 'tr' p=0.531 vs 'en' p=0.294; continuing with the 'en' model",
+        "[nle-embed] warning: 'hu' text embedded with the 'en' model produces meaningless vectors — every cosine similarity below is noise. Use --force to silence this exit code.",
+    ]
+    const unrelated = [
+        '[nle-embed] warning: failed to load the en model; falling back to the system default',
+        '[nle-embed] warning: model download timed out after 30 s',
+    ]
+    const fake = fakeRunner(() => ({
+        stdout: line(0),
+        stderr: [...diagnostics, ...unrelated].join('\n'),
+    }))
+    const warnings: string[] = []
+    const vectors = await embedBatch(['a single english text'], {
+        runner: fake.runner,
+        onWarning: text => warnings.push(text),
+    })
+
+    assert.ok(vectors?.[0] instanceof Float32Array)
+    assert.deepEqual(
+        warnings,
+        unrelated.map(text => text.replace(/^\[nle-embed\]\s*/i, '')),
+        `only the language diagnostics may be dropped: ${warnings.join(' | ')}`
+    )
 })
 
 test('a wrong-dimension vector is a per-line failure, not a batch failure', async () => {

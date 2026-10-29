@@ -22,6 +22,7 @@ import {
     failClosedMessage,
     isSubagent,
     requestGatedAccess,
+    resolveAttempt,
 } from '../gate/gate.ts'
 import type { LogOp } from '../gate/log.ts'
 import {
@@ -36,8 +37,17 @@ import {
     searchVector,
 } from '../index/notes.ts'
 import { DEFAULT_LIMIT, fuse } from '../index/rrf.ts'
+import { MIN_TOKEN_CHARS, toFtsQuery } from '../inject/fts-query.ts'
+import { message } from '../store/errors.ts'
 import type { Access } from '../store/frontmatter.ts'
-import { ReasonRequiredError, type NoteSnapshot, resolveScope } from '../store/notes.ts'
+import {
+    ReasonRequiredError,
+    type NoteSnapshot,
+    resolveRowAccess,
+    resolveScope,
+    resolveScopes,
+    scopeTargets,
+} from '../store/notes.ts'
 import type { Scope } from '../store/paths.ts'
 import type { Store } from '../store/store.ts'
 
@@ -132,54 +142,101 @@ export interface ScopeOverview {
 }
 
 /**
- * The listing behind both `memory_index` and the injected block (§6.1): the resolved
- * scope's open keys, newest first, plus how many gated notes were withheld.
+ * One tier's listing: open keys, newest first, plus how many gated notes were withheld.
+ *
+ * `access` is re-checked against the file for every row that claims to be open, so a
+ * note hand-gated mid-session drops out of the listing immediately instead of at the
+ * next reindex (see `resolveRowAccess`).
  */
-export function scopeOverview(
+function overviewFor(
     deps: Pick<MemoryDeps, 'store' | 'cwd'>,
-    scope?: Scope
+    scope: Scope,
+    project: string
 ): ScopeOverview {
-    const resolved = resolveScope(deps.cwd, scope)
-    const rows = listNotes(deps.store.db, {
-        scope: resolved.scope,
-        project: resolved.project,
-    })
+    const rows = listNotes(deps.store.db, { scope, project })
     const open: NoteSummary[] = []
     let gated = 0
     for (const row of rows) {
-        if (row.access === 'gated') {
+        if (resolveRowAccess(deps.store.root, row) === 'gated') {
             gated++
             continue
         }
         open.push({ key: row.key, firstLine: firstLine(row.body) })
     }
-    return { scope: resolved.scope, project: resolved.project, open, gated }
+    return { scope, project, open, gated }
 }
 
+/**
+ * Every tier a discovery path covers, in rank order (§5.1, F3): the project's notes
+ * first, then the global ones, with the gated counts summed. An explicit `scope`
+ * narrows this to exactly one entry, and a cwd outside a work tree yields global only.
+ */
+export interface ScopesOverview {
+    /** Per-tier listings, primary first. */
+    overviews: ScopeOverview[]
+    /** Open summaries from every tier, in the same order. */
+    open: NoteSummary[]
+    /** Gated notes withheld across every tier. */
+    gated: number
+}
+
+export function scopesOverview(
+    deps: Pick<MemoryDeps, 'store' | 'cwd'>,
+    scope?: Scope
+): ScopesOverview {
+    const overviews = resolveScopes(deps.cwd, scope).map(resolved =>
+        overviewFor(deps, resolved.scope, resolved.project)
+    )
+    return {
+        overviews,
+        open: overviews.flatMap(overview => overview.open),
+        gated: overviews.reduce((sum, overview) => sum + overview.gated, 0),
+    }
+}
+
+/** `project:<id> + global` when both tiers were searched; one label otherwise. */
+export function scopesLabel(overviews: readonly ScopeOverview[]): string {
+    return overviews.map(overview => scopeLabel(overview.scope, overview.project)).join(' + ')
+}
+
+/**
+ * `memory_index`'s text: one header naming every tier searched, the keys in rank order,
+ * and the summed gated count. With more than one tier each row also carries its own
+ * label — ordering alone would make "which tier is this key in" a guess, and the caller
+ * needs the answer to name a `scope` on a later mutation.
+ */
 export function memoryIndex(deps: MemoryDeps, input: IndexInput = {}): ToolResult {
-    let overview: ScopeOverview
+    let overview: ScopesOverview
     try {
-        overview = scopeOverview(deps, input.scope)
+        overview = scopesOverview(deps, input.scope)
     } catch (err) {
         return fail(err)
     }
+    const primary = overview.overviews[0]
 
-    const lines = [`scope: ${scopeLabel(overview.scope, overview.project)}`]
+    const lines = [`scope: ${scopesLabel(overview.overviews)}`]
     if (overview.open.length === 0 && overview.gated === 0) {
         lines.push('(no notes)')
     }
-    for (const summary of overview.open) {
-        lines.push(
-            summary.firstLine === '' ? summary.key : `${summary.key}: ${summary.firstLine}`
-        )
+    const multi = overview.overviews.length > 1
+    for (const entry of overview.overviews) {
+        for (const summary of entry.open) {
+            const line =
+                summary.firstLine === '' ? summary.key : `${summary.key}: ${summary.firstLine}`
+            lines.push(multi ? `${line} (${scopeLabel(entry.scope, entry.project)})` : line)
+        }
     }
     if (overview.gated > 0) lines.push(`gated: ${overview.gated} hidden`)
 
     return {
         text: lines.join('\n'),
         details: {
-            scope: overview.scope,
-            project: overview.project,
+            scope: primary.scope,
+            project: primary.project,
+            scopes: overview.overviews.map(entry => ({
+                scope: entry.scope,
+                project: entry.project,
+            })),
             keys: overview.open.map(summary => summary.key),
             gated: overview.gated,
         },
@@ -200,33 +257,42 @@ export async function memorySearch(deps: MemoryDeps, input: SearchInput): Promis
     }
     const query = input.query.trim()
     if (query === '') return { text: 'memory_search requires a query', isError: true }
+    // §6.2's builder is not mention-detection-only: the same text reaching `MATCH` raw
+    // is a syntax error (`-rf`, `foo:bar`) and, with `unicode61` and no stemming, it
+    // missed every plural of a word it did find. One builder, one query language.
+    const match = toFtsQuery(query)
+    if (match === null) {
+        return {
+            text: `memory_search could not parse the query: no word of at least ${MIN_TOKEN_CHARS} characters in "${query}"`,
+            isError: true,
+        }
+    }
 
     const limit = normalizeLimit(input.limit)
-    let filter: { scope: Scope; project: string }
+    let targets: { scope: Scope; project: string }[]
     try {
-        const resolved = resolveScope(deps.cwd, input.scope)
-        filter = { scope: resolved.scope, project: resolved.project }
+        // §5.1 with the global fallback (F3): every tier is searched, project hits
+        // rank first on ties, and an explicit `scope` narrows to exactly one.
+        targets = scopeTargets(deps.cwd, input.scope)
     } catch (err) {
         return fail(err)
     }
+    const filter = { scopes: targets }
 
     let bm25: ScoredNote[]
     try {
         // §4: depth 50, gated rows excluded in SQL before ranking (`searchBm25`'s
         // default access filter), so a gated row never occupies a candidate slot.
-        bm25 = searchBm25(deps.store.db, query, { ...filter, limit: BM25_DEPTH })
+        bm25 = searchBm25(deps.store.db, match, { ...filter, limit: BM25_DEPTH })
     } catch (err) {
-        // An FTS5 syntax error is the user's query, not a store failure: saying so is
-        // better than a silent empty result.
-        return {
-            text: `memory_search could not parse the query: ${message(err)}`,
-            isError: true,
-        }
+        // `match` is built by `toFtsQuery`, so it cannot be a syntax error: a throw here
+        // is the index failing, not the user's query.
+        return fail(err)
     }
 
     const rows = new Map<number, NoteRow>(bm25.map(row => [row.id, row]))
     const vectorRows: NoteRow[] = []
-    for (const hit of await queryVector(deps, query, filter)) {
+    for (const hit of await queryVector(deps, query, targets)) {
         const seen = rows.get(hit.note_id)
         if (seen !== undefined) {
             vectorRows.push(seen)
@@ -240,7 +306,9 @@ export async function memorySearch(deps: MemoryDeps, input: SearchInput): Promis
         vectorRows.push(row)
     }
 
-    const fused = fuse(bm25, vectorRows, { limit })
+    const fused = fuse(bm25, vectorRows, { limit }).filter(
+        entry => resolveRowAccess(deps.store.root, entry.item) === 'open'
+    )
     if (fused.length === 0) {
         return { text: `no memory notes matched "${query}"`, details: { query, count: 0 } }
     }
@@ -267,7 +335,7 @@ export async function memorySearch(deps: MemoryDeps, input: SearchInput): Promis
 async function queryVector(
     deps: MemoryDeps,
     query: string,
-    filter: { scope: Scope; project: string }
+    targets: readonly { scope: Scope; project: string }[]
 ): Promise<VectorHit[]> {
     if (deps.embed === undefined) return []
     let embedding: Float32Array | null
@@ -278,7 +346,7 @@ async function queryVector(
     }
     if (embedding === null || embedding.length === 0) return []
     try {
-        return searchVector(deps.store.db, embedding, { ...filter, limit: VECTOR_K })
+        return searchVector(deps.store.db, embedding, { scopes: targets, limit: VECTOR_K })
     } catch {
         return []
     }
@@ -325,6 +393,10 @@ export async function memoryRead(deps: MemoryDeps, input: ReadInput): Promise<To
             // telling a user who just declined to "use /memory show" is nonsense.
             return { text: denialText(snapshot.key, decision.code), isError: true }
         }
+        // §7.1: the gate writes no resolver on approval, so the caller owns it. A read
+        // has already succeeded by construction — the body is in memory and returning
+        // it cannot fail — so `ok` is a statement of fact here, not a prediction.
+        resolveAttempt(deps.store.root, decision.attempt, 'approved', 'ok')
     }
 
     return {
@@ -419,13 +491,12 @@ function writeResult(
     if (result.ok === true) {
         const header = `${verb} ${result.key} (${scopeLabel(result.scope, result.project)}, ${result.access})`
         return {
-            text: `${header}\nhash: ${result.hash}\n${result.diff === '' ? '(no change)' : result.diff}`,
+            text: `${header}\n${result.diff === '' ? '(no change)' : result.diff}`,
             details: {
                 key: result.key,
                 scope: result.scope,
                 project: result.project,
                 access: result.access,
-                hash: result.hash,
                 diff: result.diff,
             },
         }
@@ -506,10 +577,6 @@ function denialText(key: string, code: GateDenialCode): string {
 
 function fail(err: unknown): ToolResult {
     return { text: message(err), isError: true }
-}
-
-function message(err: unknown): string {
-    return err instanceof Error ? err.message : String(err)
 }
 
 export function scopeLabel(scope: Scope, project: string): string {

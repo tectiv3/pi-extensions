@@ -422,13 +422,21 @@ and no log until the next reindex. The index's `access` column is used only for 
 
 ### 5.1 Scope resolution and `access` defaults
 
-- **`scope` omitted**: project if resolvable from cwd, else global.
-- **cwd is not a git repo**: `scope: project` errors (`"not in a git repository; no project scope"`);
-  global works.
-- **`scope` omitted and the key exists in both**: project wins.
+- **`scope` omitted, reads**: try **project first, then global**. Only the tier the file was actually
+  found in governs the gate. The not-found error names every tier tried.
+- **`scope` omitted, discovery** (`memory_index`, `memory_search`, mention detection, the injected
+  block): cover **both** tiers, project results ranked first on ties, each row labelled with its tier,
+  gated counts summed. "Project wins" only means something if a project miss falls back to global —
+  revision 5 filtered to the resolved tier, which made the global tier **unreachable from inside any
+  repository**.
+- **Explicit `scope`** narrows to exactly that tier.
+- **cwd is not a git repo**: global only; `scope: project` errors (`"not in a git repository; no project
+  scope"`).
 - **`access` on create**: defaults to `open`.
 - **`access` on update**: **preserved**. A full-body replace must never silently un-gate. Changing it
   requires passing it explicitly.
+- **`baseHash` is checked before the gate.** A stale write must not prompt the user to approve
+  something that is then rejected.
 
 ### 5.2 Why `includeGated` was removed
 
@@ -496,7 +504,8 @@ gated: 3 hidden (ask for one by name)
 
 Cap: 200 keys or 4,800 characters (≈1,200 tokens at 4 chars/token — one comparison basis, evaluated
 against the rendered block). Overflow becomes `+N more (recent first)`, ordered `mtime DESC, id DESC`.
-Keys only, never bodies. Gated keys never appear.
+Project keys first, then global, under one line: `scope: project:<id> + global`. Keys only, never
+bodies. Gated keys never appear.
 
 ### 6.2 Mention detection — per turn
 
@@ -507,12 +516,17 @@ append to that message:
 possibly relevant memories: deploy/grafana_dashboard, auth/session_handling
 ```
 
-Gated notes are excluded in SQL before the top hit is chosen.
+Gated notes are excluded in SQL before the top hit is chosen, in **both** tiers (project and global).
 
 **Query construction**: tokenize on whitespace and punctuation, keep tokens ≥ 2 chars, cap at 20 tokens
-and 512 characters, wrap each token in double quotes, join with `OR`. Drop `-`, `"`, `*`, `:`, `(`,
-`)`, `^`, `NEAR`. ~150 lines of care, as `pi-hermes-memory`'s `store/fts-query.ts` (158 lines)
-demonstrates.
+and 512 characters, quote each token, join with `OR`. Drop `-`, `"`, `*`, `:`, `(`, `)`, `^`, `NEAR`.
+~150 lines of care, as `pi-hermes-memory`'s `store/fts-query.ts` (158 lines) demonstrates.
+
+**Tokens of ≥ 3 chars become prefix queries** (`"symlink"*`), which is what makes `symlink` match
+`symlinks` and `symlinked`. FTS5's default `unicode61` tokenizer does no stemming, and measured, an
+exact-phrase query misses every inflection — the agent then concludes the memory does not exist.
+2-char tokens stay exact phrases: a 3-char prefix would match too much. This is a deliberate, tested
+rule, not a formatting detail.
 
 **Threshold — measured, not assumed.** `bm25()` on the host's SQLite (3.53.3) returns **negative**
 scores; a realistic 30-note store yields 2–8 for a matching term (`"grafana"` 3.99, `"sqlite"` 3.16,
@@ -530,7 +544,9 @@ Rule:
 - Inject at most 3 keys when `|top1| ≥ F`, and additionally, **only when `n ≥ 4`**, `|top1| ≥ 1.5 × m10`.
 - **`F = 2.5`** initially, derived from the measured 30-note distribution (single-token noise sits below
   ~1, real matches at 3–8). It is a **per-store tuning constant**: FTS5 IDF shifts with corpus size.
-- Decisions (`top1`, `m10`, `n`, injected) go to `access.log` so `F` can be retuned from data.
+- Decisions (`top1`, `m10`, `n`, injected keys) go to `access.log` as **one line each**, `op: "mention"`,
+  `decision: "inject" | "skip"` — telemetry, not consent, so no `pending`/resolver pair (§7.1). This is
+  what lets `F` be retuned from data.
 
 **Cache cost, stated honestly**: the block is appended to the latest *user* message, so the next turn
 re-sends that message without the block and the prefix diverges from that point. Accepted, because
@@ -558,9 +574,12 @@ key):
 {"ts":"…","attempt":"3f9a1c7e2b4d8a60","decision":"approved","result":"ok"}
 ```
 
-- `op ∈ {read, write, edit, delete, show, search, diff, rotate}`
+- `op ∈ {read, write, edit, delete, show, search, diff, rotate, mention}`
 - `initiator ∈ {agent, user}`
-- `decision ∈ {pending, approved, declined, denied-no-ui, blocked-subagent, error, user}`
+- `decision ∈ {pending, approved, declined, denied-no-ui, blocked-subagent, error, user, inject, skip}`
+- `inject` / `skip` are **mention-detection telemetry, not consent**: one line per decision, no `pending`
+  predecessor, no `attempt` pairing. Using `approved`/`declined` for them would make `/memory log`
+  report a user decision that never happened.
 - `result ∈ {ok, failed:<class>}` where class is one of the §3.4 failure classes
 - `error` is used when `confirm` rejects or throws rather than returning a boolean.
 - `reason` is absent for `initiator: "user"`.
@@ -568,17 +587,24 @@ key):
 **Consent and outcome are separate fields.** `decision` records what the user decided; `result` records
 whether the mutation landed. Without that split, `approved` implies success it cannot know about.
 
-**An approved-then-failed mutation is three lines**, because JSONL is append-only and the gate cannot
-know at approval time whether the write will succeed:
+**An approved-then-failed mutation is still two lines.** Ownership, not line count, is what makes this
+work: the gate writes `pending` and returns the attempt id **without** a resolver; the caller writes the
+single resolver in its `finally` as `approved` + `result: ok | failed:<class>`. A decline, a headless
+denial, a subagent block, and a throwing `confirm` are terminal inside the gate, so the gate writes
+their resolver itself. Every terminal path is therefore exactly two lines:
 
-```
-pending → approved/ok → approved/failed:other
-```
+| outcome | lines |
+|---|---|
+| approved write, success | `pending`, `approved/ok` |
+| approved write, commit failed | `pending`, `approved/failed:<class>` |
+| declined | `pending`, `declined` |
+| no UI / subagent / confirm threw | `pending`, `denied-no-ui` / `blocked-subagent` / `error` |
+| user `/memory show` | one `decision: "user"` line |
 
-`pairAttempts` treats the **last terminal line** as authoritative. Success is two lines; a failed
-post-approval mutation is three, and its final `result` is what matters. `result` is **absent** for
-`declined`, `denied-no-ui`, `blocked-subagent`, and `error` — nothing was attempted, so `ok` would be a
-false statement.
+The earlier design had the gate write an optimistic `approved/ok` and the caller append a second
+resolver, which produced three lines and two contradictory outcomes for one attempt. `result` is
+**absent** for `declined`, `denied-no-ui`, `blocked-subagent`, and `error` — nothing was attempted, so
+`ok` would be a false statement.
 
 `initiator: "user"` lines carry an `attempt` id but no `pending` predecessor, so pairing yields
 `pending: null` and the user line as the resolver.
@@ -872,6 +898,28 @@ criteria 4–7/14/16/17 · `slug` from the remote · token basis · body first l
 | H11 | 4-hex attempt id collides; resolver unpaired | 16 hex, pairing scoped by session + key (§7.1) |
 | H12 | `memory_edit` multi-match undefined; `git diff --no-index` exit 1 misread | Reject on multiple matches; exit 1 = difference, not error (§5) |
 | N | `--tail` before/after concat; `reason` unbounded; `reload` re-runs rotation/sweep; vector filter must precede `k`; `op` enum; unsourced 30 ms | §7.2/§10; 500-char cap (§5); `reload` skip (§3.3, §7.2); `note_id IN (…)` (§4); enum (§7.1); 40–49 ms (§12.11) |
+
+### Found during implementation
+
+| # | Defect | Fix |
+|---|---|---|
+| I1 | Gated mutations wrote three log lines with two contradictory resolvers (gate wrote an optimistic `approved/ok`, the caller appended another) | Ownership split: gate writes `pending` and returns; caller writes the single resolver in `finally`. Every terminal path is two lines (§7.1) |
+| I2 | Search did not match inflections — `symlink` missed `symlinks`, measured | Tokens ≥ 3 chars emitted as prefix queries `"tok"*` (§6.2) |
+| I3 | §11's `vec0` downgrade was wired nowhere in production, so the downgrade could never fire | `openStore` calls `handleVecUnavailable`; verified end-to-end with a genuinely unloadable module (§11, §12.24) |
+| I4 | Mention decisions were logged as `declined`, i.e. as a user decision that never happened | `op:"mention"` + `decision:"inject"|"skip"`, one line, no consent pairing (§6.2, §7.1) |
+
+### Found by the code review
+
+| # | Defect | Fix |
+|---|---|---|
+| C1 | One malformed note aborted the whole reindex pass, silently blanking the index | Per-file error policy: report the path, delete that note's row, continue (§3.3) |
+| C2 | The `vec0` downgrade could delete the index, fail to repopulate, and leave the extension registering no tools | Downgrade shares the per-file policy; a failed recreate closes the handle and names the cause (§11) |
+| C3 | The global tier was unreachable from inside any repository — every discovery path filtered to the resolved tier | Two-tier discovery with project-first ranking and read fallback (§5.1) |
+| C4 | The shutdown drain exceeded its bound (measured 4024 ms for a 2000 ms budget) because an interval tick ran an unbounded drain | Every tick run gets a deadline (§8.1) |
+| C5 | A crashed delete (` D`) was never swept, leaving the worktree permanently dirty and a ghost index row | `' D'` added to the dirty set (§3.3) |
+| C6 | Reindex never removed rows for deleted files | Stale rows deleted, count reported as `removed` |
+| C7 | `writeVector` stamped the *current* `body_hash`, so a stale job could claim a vector it did not build | Expected hash passed in and re-checked (§4) |
+| C8 | The gate prompted before the `baseHash` precondition it was about to fail | Precondition moved above the gate (§5.1) |
 
 ## 15. Implementation sequence
 

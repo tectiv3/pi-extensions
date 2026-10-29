@@ -6,8 +6,8 @@ import type { DatabaseSync } from 'node:sqlite'
 import test, { type TestContext } from 'node:test'
 
 import { openIndex } from '../index/db.ts'
-import { getNoteByKey } from '../index/notes.ts'
-import { FrontmatterError, parseNote } from './frontmatter.ts'
+import { getNoteByKey, upsertNote } from '../index/notes.ts'
+import { parseNote } from './frontmatter.ts'
 import { reindexFromDisk } from './reindex.ts'
 
 const GATED = '---\naccess: gated\n---\n'
@@ -47,7 +47,7 @@ test('reindex picks up a hand-created gated fixture as gated', t => {
     writeFile(root, 'global/plain.md', 'nothing special here\n')
 
     const result = reindexFromDisk(root, db)
-    assert.deepEqual(result, { scanned: 2, updated: 2, skipped: 0, errors: [] })
+    assert.deepEqual(result, { scanned: 2, updated: 2, skipped: 0, removed: 0, errors: [] })
 
     const gated = getNoteByKey(db, 'global', '', 'auth/session')
     assert.equal(gated.access, 'gated')
@@ -97,6 +97,7 @@ test('reindex skips an unchanged file and updates a changed one', t => {
         scanned: 1,
         updated: 1,
         skipped: 0,
+        removed: 0,
         errors: [],
     })
     const before = getNoteByKey(db, 'global', '', 'notes/a')
@@ -106,6 +107,7 @@ test('reindex skips an unchanged file and updates a changed one', t => {
         scanned: 1,
         updated: 0,
         skipped: 1,
+        removed: 0,
         errors: [],
     })
     assert.equal(getNoteByKey(db, 'global', '', 'notes/a').body_hash, before.body_hash)
@@ -115,6 +117,7 @@ test('reindex skips an unchanged file and updates a changed one', t => {
         scanned: 1,
         updated: 1,
         skipped: 0,
+        removed: 0,
         errors: [],
     })
     const after = getNoteByKey(db, 'global', '', 'notes/a')
@@ -142,12 +145,131 @@ test('reindex reports a filename that fails normalizeKey instead of throwing', t
     assert.notEqual(getNoteByKey(db, 'global', '', 'good'), null)
 })
 
-test('reindex throws on an unparseable access value (fail-closed, §2.1)', t => {
+test('one malformed note is reported by path and does not blank the pass', t => {
     const { root, db } = openTemp(t)
-    writeFile(root, 'global/odd.md', '---\naccess: maybe\n---\nbody\n')
+    // `aaa` sorts first: under the old all-or-nothing policy everything after it was
+    // never indexed, and the caller reduced that to one warning that named no file.
+    writeFile(root, 'global/aaa.md', '---\naccess: someday\n---\nsecret\n')
+    writeFile(root, 'global/beta.md', 'beta body\n')
+    writeFile(root, 'global/zeta.md', 'zeta body\n')
 
-    assert.throws(() => reindexFromDisk(root, db), FrontmatterError)
-    assert.equal(getNoteByKey(db, 'global', '', 'odd'), null)
+    const result = reindexFromDisk(root, db)
+
+    assert.equal(result.scanned, 3)
+    assert.equal(result.updated, 2)
+    assert.deepEqual(
+        result.errors.map(error => error.path),
+        ['global/aaa.md']
+    )
+    assert.match(result.errors[0].reason, /unparseable frontmatter access value/)
+    assert.equal(getNoteByKey(db, 'global', '', 'beta').body, 'beta body\n')
+    assert.equal(getNoteByKey(db, 'global', '', 'zeta').body, 'zeta body\n')
+    // Fail-closed per note (§2.1): the unparseable note is absent, not `open`.
+    assert.equal(getNoteByKey(db, 'global', '', 'aaa'), null)
+})
+
+test('a note that stops parsing loses its index row instead of staying searchable', t => {
+    const { root, db } = openTemp(t)
+    writeFile(root, 'global/odd.md', 'indexed while open\n')
+    reindexFromDisk(root, db)
+    assert.notEqual(getNoteByKey(db, 'global', '', 'odd'), null)
+
+    // The hand edit that breaks it: `access:` with a value the parser refuses.
+    writeFile(root, 'global/odd.md', '---\naccess: maybe\n---\nnow gated, maybe\n')
+    const result = reindexFromDisk(root, db)
+
+    assert.deepEqual(
+        result.errors.map(error => error.path),
+        ['global/odd.md']
+    )
+    assert.equal(
+        getNoteByKey(db, 'global', '', 'odd'),
+        null,
+        'the old body stayed searchable behind an unparseable access value'
+    )
+    // The stale row is gone from FTS and vec_notes too, not just from `notes`.
+    const fts = db.prepare('SELECT count(*) AS n FROM notes_fts').get()
+    assert.equal(Number(fts.n), 0)
+})
+
+test('reindex removes the row of a hand-deleted note and counts it', t => {
+    const { root, db } = openTemp(t)
+    writeFile(root, 'global/alpha.md', 'alpha body\n')
+    writeFile(root, 'global/beta.md', 'beta body\n')
+    reindexFromDisk(root, db)
+
+    fs.rmSync(path.join(root, 'global/beta.md'))
+    const result = reindexFromDisk(root, db)
+
+    assert.deepEqual(result, {
+        scanned: 1,
+        updated: 0,
+        skipped: 1,
+        removed: 1,
+        errors: [],
+    })
+    assert.equal(getNoteByKey(db, 'global', '', 'beta'), null)
+    const fts = db.prepare('SELECT count(*) AS n FROM notes_fts WHERE notes_fts MATCH ?')
+    assert.equal(Number(fts.get('beta').n), 0, 'the deleted note is still searchable')
+    assert.equal(Number(fts.get('alpha').n), 1)
+})
+
+test('reindex removes a project row for a deleted project note', t => {
+    const { root, db } = openTemp(t)
+    writeFile(root, 'projects/proj-1a2b3c4d/deploy/grafana.md', 'dashboards\n')
+    writeFile(root, 'global/keep.md', 'keep\n')
+    reindexFromDisk(root, db)
+
+    fs.rmSync(path.join(root, 'projects/proj-1a2b3c4d/deploy/grafana.md'))
+    const result = reindexFromDisk(root, db)
+
+    assert.equal(result.removed, 1)
+    assert.equal(getNoteByKey(db, 'project', 'proj-1a2b3c4d', 'deploy/grafana'), null)
+    assert.notEqual(getNoteByKey(db, 'global', '', 'keep'), null)
+})
+
+test('reindex keeps a row whose file still exists but the walk did not see', t => {
+    const { root, db } = openTemp(t)
+    // The row's file is there, it is simply not a note this pass visits — the same
+    // shape a note written after the walk passed its directory leaves behind. Deleting
+    // it would drop a live note from search until the next pass.
+    writeFile(root, 'global/keep.txt', 'not a note file')
+    upsertNote(db, {
+        scope: 'global',
+        key: 'other',
+        path: 'global/keep.txt',
+        body: 'written while the pass was running\n',
+        fmLen: 0,
+        bodyHash: 'h-other',
+        access: 'open',
+        mtime: 1,
+    })
+
+    const result = reindexFromDisk(root, db)
+    assert.equal(result.removed, 0)
+    assert.notEqual(getNoteByKey(db, 'global', '', 'other'), null)
+})
+
+test('reindex reports a file it cannot read and drops its row', t => {
+    const { root, db } = openTemp(t)
+    if (typeof process.getuid === 'function' && process.getuid() === 0) {
+        t.skip('root reads a 0o000 file regardless of its mode')
+        return
+    }
+    writeFile(root, 'global/secret.md', 'readable first\n')
+    reindexFromDisk(root, db)
+    assert.notEqual(getNoteByKey(db, 'global', '', 'secret'), null)
+
+    const target = path.join(root, 'global/secret.md')
+    fs.chmodSync(target, 0o000)
+
+    const result = reindexFromDisk(root, db)
+    assert.deepEqual(
+        result.errors.map(error => error.path),
+        ['global/secret.md']
+    )
+    assert.match(result.errors[0].reason, /EACCES|EPERM/)
+    assert.equal(getNoteByKey(db, 'global', '', 'secret'), null)
 })
 
 test('reindex tolerates a missing scope directory', t => {
@@ -156,6 +278,7 @@ test('reindex tolerates a missing scope directory', t => {
         scanned: 0,
         updated: 0,
         skipped: 0,
+        removed: 0,
         errors: [],
     })
 })

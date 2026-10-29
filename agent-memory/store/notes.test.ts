@@ -6,6 +6,7 @@ import * as path from 'node:path'
 import test, { type TestContext } from 'node:test'
 
 import type { GateContext } from '../gate/gate.ts'
+import { readLog } from '../gate/log.ts'
 import { EMBED_DIM } from '../index/db.ts'
 import { getNoteByKey, searchBm25, writeVector } from '../index/notes.ts'
 import { fileHash, parseNote } from './frontmatter.ts'
@@ -254,6 +255,203 @@ test('gated create writes the block, round-trips, and a decline touches nothing'
     assert.equal(git(root, ['status', '--porcelain']), '')
     // The attempt is still recorded (§7.3) — that is the only change.
     assert.match(fs.readFileSync(path.join(root, 'access.log'), 'utf8'), /declined/)
+
+    // §7.1: two lines per terminal outcome. The gate writes `pending`; the store's
+    // `finally` writes the one resolver — an approved write is not three lines.
+    const entries = readLog(root)
+    assert.equal(entries.length, 4, 'two attempts, two lines each')
+    assert.deepEqual(
+        entries.map(entry => entry.decision),
+        ['pending', 'approved', 'pending', 'declined']
+    )
+    assert.equal(entries[1].result, 'ok')
+    assert.equal(entries[1].attempt, entries[0].attempt)
+    assert.equal(entries[3].result, undefined, 'nothing was attempted, so no result')
+    assert.equal(entries[3].attempt, entries[2].attempt)
+})
+
+test('a gated write is exactly two log lines: pending + approved/ok', async t => {
+    ensureNotSubagent(t)
+    useStoreDir(t)
+    const store = openTestStore(t, { gate: approveGate() })
+    t.after(() => store.close())
+
+    expectOk(
+        await store.writeNote({
+            key: 'auth/session',
+            body: 'tokens rotate at 90 days',
+            access: 'gated',
+            reason: 'record policy',
+        })
+    )
+
+    const entries = readLog(store.root)
+    assert.equal(entries.length, 2, 'a successful gated write is two lines, not three')
+    assert.deepEqual(
+        entries.map(entry => entry.decision),
+        ['pending', 'approved']
+    )
+    assert.equal(entries[1].result, 'ok')
+    assert.equal(entries[1].attempt, entries[0].attempt)
+    assert.match(entries[1].attempt ?? '', /^[0-9a-f]{16}$/)
+})
+
+test('a post-approval failure is pending + approved/failed:other, never an ok', async t => {
+    ensureNotSubagent(t)
+    const root = useStoreDir(t)
+    const store = openTestStore(t, { gate: approveGate() })
+    t.after(() => store.close())
+
+    // A mutation that fails *after* the gate: the temp file's path is a directory, so
+    // `writeFileAtomic` cannot open it. The gate has already approved, which is the
+    // shape that used to leave `approved/ok` and `approved/failed:other` on one attempt.
+    fs.mkdirSync(path.join(root, 'global/blocked/note.md.tmp'), { recursive: true })
+    const before = readLog(store.root).length
+
+    await assert.rejects(
+        store.writeNote({
+            key: 'blocked/note',
+            body: 'v2 body',
+            access: 'gated',
+            reason: 'write into an unusable path',
+        })
+    )
+
+    const added = readLog(store.root).slice(before)
+    assert.equal(added.length, 2, 'an approved-but-failed write is still two lines')
+    assert.deepEqual(
+        added.map(entry => entry.decision),
+        ['pending', 'approved']
+    )
+    assert.equal(added[1].result, 'failed:other')
+    assert.equal(
+        added.some(entry => entry.result === 'ok'),
+        false,
+        'an optimistic ok was written before the outcome was known'
+    )
+    assert.equal(fs.existsSync(notePath(root, 'global/blocked/note.md')), false)
+})
+
+test('a stale baseHash on a gated note fails before the gate, with no prompt and no log', async t => {
+    ensureNotSubagent(t)
+    const root = useStoreDir(t)
+    const calls: ConfirmCall[] = []
+    const store = openTestStore(t, { gate: approveGate(calls) })
+    t.after(() => store.close())
+
+    const created = expectOk(
+        await store.writeNote({
+            key: 'auth/session',
+            body: 'v1 body',
+            access: 'gated',
+            reason: 'seed',
+        })
+    )
+    assert.equal(calls.length, 1, 'the seed itself is gated')
+    const before = readLog(store.root).length
+    calls.length = 0
+
+    // A stale precondition can never be satisfied by approving the dialog, so it is
+    // rejected first. The rejection writes no log pair: no attempt was started.
+    await assert.rejects(
+        store.writeNote({
+            key: 'auth/session',
+            body: 'v2 body',
+            baseHash: '0'.repeat(64),
+            reason: 'replace body',
+        }),
+        StaleNoteError
+    )
+
+    assert.deepEqual(calls, [], 'the user was asked to approve a write that cannot happen')
+    assert.equal(
+        readLog(store.root).length,
+        before,
+        'a rejected precondition wrote a log pair'
+    )
+    const onDisk = parseNote(fs.readFileSync(notePath(root, 'global/auth/session.md')))
+    assert.equal(onDisk.body, 'v1 body')
+    assert.equal(created.access, 'gated')
+})
+
+test('WriteOk.access is the access the file parses, not the one requested (F9)', async t => {
+    ensureNotSubagent(t)
+    const root = useStoreDir(t)
+    const store = openTestStore(t)
+
+    // An open note is written bare, so a body that opens its own frontmatter block
+    // becomes the file's frontmatter. The tool must not claim `open` for it.
+    const sneaky = expectOk(
+        await store.writeNote({
+            key: 'sneaky',
+            body: '---\naccess: gated\n---\nthe secret\n',
+        })
+    )
+    assert.equal(sneaky.access, 'gated')
+    assert.equal(
+        fs.readFileSync(notePath(root, 'global/sneaky.md'), 'utf8'),
+        '---\naccess: gated\n---\nthe secret\n'
+    )
+    const read = store.readNote({ key: 'sneaky' })
+    assert.equal(read.access, 'gated')
+    assert.equal(read.body, 'the secret\n')
+})
+
+test('WriteOk.access is preserved on an update that does not pass access (F9)', async t => {
+    ensureNotSubagent(t)
+    useStoreDir(t)
+    const store = openTestStore(t, { gate: approveGate() })
+    t.after(() => store.close())
+
+    const first = expectOk(
+        await store.writeNote({
+            key: 'auth/session',
+            body: 'v1 body',
+            access: 'gated',
+            reason: 'seed',
+        })
+    )
+    assert.equal(first.access, 'gated')
+
+    const second = expectOk(
+        await store.writeNote({
+            key: 'auth/session',
+            body: 'v2 body',
+            baseHash: first.hash,
+            reason: 'update the body',
+        })
+    )
+    assert.equal(second.access, 'gated', 'the stored access, not the default')
+    assert.equal(store.readNote({ key: 'auth/session' }).access, 'gated')
+})
+
+test('a gated delete is exactly two log lines: pending + approved/ok', async t => {
+    ensureNotSubagent(t)
+    useStoreDir(t)
+    const store = openTestStore(t, { gate: approveGate() })
+    t.after(() => store.close())
+
+    expectOk(
+        await store.writeNote({
+            key: 'auth/session',
+            body: 'v1 body',
+            access: 'gated',
+            reason: 'seed',
+        })
+    )
+    const before = readLog(store.root).length
+
+    expectDeleteOk(await store.deleteNote({ key: 'auth/session', reason: 'stale' }))
+
+    const added = readLog(store.root).slice(before)
+    assert.equal(added.length, 2, 'a successful gated delete is two lines')
+    assert.deepEqual(
+        added.map(entry => entry.decision),
+        ['pending', 'approved']
+    )
+    assert.equal(added[0].op, 'delete')
+    assert.equal(added[1].result, 'ok')
+    assert.equal(added[1].attempt, added[0].attempt)
 })
 
 // ---------------------------------------------------------------------------
@@ -430,7 +628,7 @@ test('delete removes the file, commits, and clears notes, notes_fts and vec_note
     )
     const embedding = new Array<number>(EMBED_DIM).fill(0)
     embedding[0] = 1
-    writeVector(store.db, created.id, embedding)
+    writeVector(store.db, created.id, embedding, created.hash)
     assert.equal(countRows(store, 'vec_notes'), 1)
 
     const commits = commitCount(root)

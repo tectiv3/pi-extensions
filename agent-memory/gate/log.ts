@@ -9,6 +9,11 @@
  *   the generation it kept writing to.
  * - An attempt is two lines sharing a 16-hex id, because JSONL cannot be
  *   back-filled: `pending` before the confirmation, the resolver after it.
+ *
+ * Mention detection (§6.2) is the exception: no user is asked, so it writes **one**
+ * line per decision — `op: 'mention'` with the terminal `inject`/`skip` decision and
+ * no attempt id. Encoding it as `pending` + `approved`/`declined` would claim a
+ * consent decision that never happened.
  */
 
 import { randomBytes } from 'node:crypto'
@@ -23,7 +28,7 @@ import {
 } from '../store/paths.ts'
 
 export type LogOp =
-    'read' | 'write' | 'edit' | 'delete' | 'show' | 'search' | 'diff' | 'rotate'
+    'read' | 'write' | 'edit' | 'delete' | 'show' | 'search' | 'diff' | 'rotate' | 'mention'
 export type LogInitiator = 'agent' | 'user'
 export type LogDecision =
     | 'pending'
@@ -33,14 +38,20 @@ export type LogDecision =
     | 'blocked-subagent'
     | 'error'
     | 'user'
+    // Terminal, non-consent outcomes of §6.2's rule. `approved`/`declined` describe a
+    // user's answer to a confirmation; nobody is asked about a mention, so those two
+    // must never carry a rule decision.
+    | 'inject'
+    | 'skip'
 export type LogResult = 'ok' | `failed:${CommitFailureClass}`
 
 /**
- * One log line. Three shapes share this type — the `pending` line (everything
- * set), the resolver line (`attempt`/`decision`/`result` only) and the rotate
- * marker (`op` only) — so every field except the line's own shape is optional.
+ * One log line. Four shapes share this type — the `pending` line (everything set),
+ * the resolver line (`attempt`/`decision`/`result` only), the rotate marker (`op` only)
+ * and the mention line (no `attempt`; one terminal decision) — so every field except
+ * the line's own shape is optional.
  *
- * `top1`/`m10`/`n`/`injected`/`reason` belong to mention detection (§6.2), which logs
+ * `top1`/`m10`/`n`/`keys`/`reason` belong to mention detection (§6.2), which logs
  * its threshold inputs so `F` can be retuned from data. They are absent on every
  * gated line.
  */
@@ -63,8 +74,8 @@ export interface LogEntry {
     m10?: number
     /** Candidate count in the mention window. */
     n?: number
-    /** Whether §6.2's rule appended keys to the outgoing message. */
-    injected?: boolean
+    /** The keys §6.2's rule appended to the outgoing message; only on an `inject` line. */
+    keys?: string[]
 }
 
 /** §5: the tool parameter is capped at 500 chars. */
@@ -190,8 +201,9 @@ export interface PairedAttempt {
     attempt: string | null
     pending: LogEntry | null
     /**
-     * The last terminal line for this attempt. An approved mutation that then
-     * failed appends a second resolver, and the later line is the true outcome.
+     * The last terminal line for this attempt. Logs written before §7.1's ownership
+     * fix can carry both an optimistic `approved/ok` and a real `approved/failed:x`;
+     * the later line is the true outcome.
      */
     resolver: LogEntry | null
     /** A `pending` with no resolver: the process died mid-confirm (§7.1). */
@@ -208,7 +220,8 @@ export function pairAttempts(entries: readonly LogEntry[]): PairedAttempt[] {
     for (const entry of entries) {
         const attempt = entry.attempt
         if (attempt === undefined || attempt === '') {
-            // A rotate marker or any other attempt-less line is its own row.
+            // A rotate marker or an attempt-less mention line is its own row: it has no
+            // counterpart by construction, so pairing it would invent one.
             rows.push({
                 attempt: null,
                 pending: null,

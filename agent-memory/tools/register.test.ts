@@ -107,7 +107,11 @@ function ensureNotSubagent(t: TestContext): void {
 /** The slice of pi's context the tools and the gate entry point actually read. */
 function toolContext(
     cwd: string,
-    options: { hasUI?: boolean; confirm?: boolean } = {}
+    options: {
+        hasUI?: boolean
+        confirm?: boolean
+        notify?: (message: string, severity?: string) => void
+    } = {}
 ): ExtensionContext {
     return {
         cwd,
@@ -127,7 +131,9 @@ function toolContext(
             async input() {
                 return undefined
             },
-            notify() {},
+            notify(message: string, severity?: string) {
+                options.notify?.(message, severity)
+            },
             setStatus() {},
         },
     } as unknown as ExtensionContext
@@ -325,6 +331,43 @@ test('the entry point logs one warning and registers nothing when the store cann
         toolContext(tempDir(t, 'pi-memory-ctx-'))
     )
     assert.equal(warnings.length, 1)
+})
+
+test('session_start names a note it could not index through the UI (F1)', async t => {
+    ensureNotSubagent(t)
+    const root = useStoreDir(t)
+    const seeded = openSeedStore(t)
+    await seeded.writeNote({ key: 'notes/good', body: 'kept' })
+    seeded.close()
+    // A hand edit the parser refuses: `access: someday` is not a value §2.1 accepts, so
+    // the note must be skipped — and the file has to be named somewhere the user sees.
+    fs.writeFileSync(
+        path.join(root, 'global', 'notes', 'broken.md'),
+        '---\naccess: someday\n---\nsecret\n'
+    )
+
+    const notices: Array<{ message: string; severity?: string }> = []
+    const pi = fakePi()
+    const handle = agentMemoryExtension(pi.api)
+    await pi.emit(
+        'session_start',
+        { reason: 'startup' },
+        toolContext(tempDir(t, 'pi-memory-ctx-'), {
+            notify: (message, severity) => notices.push({ message, severity }),
+        })
+    )
+    t.after(async () => {
+        await pi.emit('session_shutdown', { reason: 'quit' })
+    })
+
+    // The pass completed: the good note is indexed and the tools are registered.
+    assert.deepEqual([...pi.tools.keys()].sort(), [...MEMORY_TOOL_NAMES].sort())
+    assert.match(handle.indexBlock(), /notes\/good/)
+    assert.equal(notices.length, 1, notices.map(entry => entry.message).join('\n'))
+    assert.equal(notices[0].severity, 'warning')
+    assert.match(notices[0].message, /1 note\(s\) not indexed/)
+    assert.match(notices[0].message, /global\/notes\/broken\.md/)
+    assert.match(notices[0].message, /unparseable frontmatter access value/)
 })
 
 test('session_start with reason reload skips the sweep and rotation', async t => {

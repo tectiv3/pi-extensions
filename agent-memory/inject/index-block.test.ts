@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import test, { type TestContext } from 'node:test'
 
+import { resolveProjectId } from '../store/project.ts'
 import { openStore, type Store } from '../store/store.ts'
 import {
     MAX_INDEX_CHARS,
@@ -154,6 +156,38 @@ test('the character cap cuts before 4,800 characters of keys', t => {
     )
     assert.ok(keysLine(block).length > MAX_INDEX_CHARS - 80, 'the cap stalled far too early')
     assert.match(keysLine(block), /\+\d+ more \(recent first\)$/)
+})
+
+test('inside a repository the block names and lists both tiers, project first', t => {
+    const root = useStoreDir(t)
+    const repo = tempDir(t, 'pi-memory-block-repo-')
+    const init = spawnSync('git', ['init', '--quiet', '-b', 'main'], {
+        cwd: repo,
+        encoding: 'utf8',
+        timeout: 10_000,
+    })
+    assert.equal(init.status, 0, `git init failed: ${init.stderr}`)
+    const store = openStore(repo)
+    t.after(() => store.close())
+    const projectId = resolveProjectId(repo)?.id
+    assert.ok(projectId !== undefined)
+
+    const base = 1_700_000_000_000
+    // The global note is newer: recency alone must not put it ahead of the project's.
+    const projectFile = path.join(root, `projects/${projectId}/build/flags.md`)
+    fs.mkdirSync(path.dirname(projectFile), { recursive: true })
+    fs.writeFileSync(projectFile, 'project build flags')
+    fs.utimesSync(projectFile, new Date(base), new Date(base))
+    seedFile(root, 'editor/prefs', 'global editor prefs', base + 60_000)
+    assert.equal(store.reindex().updated, 2)
+
+    const block = buildIndexBlock({ store, cwd: repo })
+    const lines = block.split('\n')
+    assert.match(lines[0], /^scope: project:\S+ \+ global$/)
+    assert.equal(lines[1], 'build/flags, editor/prefs')
+    // Naming the tier is the whole point: a reader must be able to tell which one a
+    // key came from, and the ordering is the only signal on the key line.
+    assert.ok(!block.includes('gated:'))
 })
 
 // ---------------------------------------------------------------------------

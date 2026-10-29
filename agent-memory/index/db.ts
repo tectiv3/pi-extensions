@@ -19,6 +19,7 @@ import { DatabaseSync } from 'node:sqlite'
 import * as sqliteVec from 'sqlite-vec'
 
 import { withFileLock } from '../store/git.ts'
+import { message } from '../store/errors.ts'
 import { indexLockPath, indexPath, indexPathSidecars } from '../store/paths.ts'
 import { populateFromDisk, transaction } from './notes.ts'
 
@@ -233,46 +234,101 @@ export function migrate(db: DatabaseSync): void {
 // vec0 downgrade / re-upgrade (§11)
 // ---------------------------------------------------------------------------
 
+export interface DowngradeOptions extends OpenIndexOptions {
+    /**
+     * Recreate seam, used by tests to reach the one failure the delete-and-recreate
+     * has no other path to — the delete succeeded and the rebuild did not.
+     */
+    recreate?: (root: string) => DatabaseSync
+}
+
 /**
- * §11's downgrade. When the probe fails and the latch says vectors were on, the
- * database is deleted and recreated without `vec_notes`, then repopulated from the
- * files and marked `vec_enabled='false'`.
+ * Opens the index with `index.db.lock` held, downgrading to a vectorless database
+ * when §11 requires it. Every session takes this, which is what makes the lock cover
+ * the open it protects (F10):
  *
- * The reason the database is destroyed rather than rebuilt in place: with the module
- * absent, `DELETE`/`DROP`/`SELECT` on `vec_notes` all fail with `no such module:
- * vec0`, so §4's rebuild — which begins `DELETE FROM vec_notes` — cannot run in the
- * path that invokes it.
+ * - `openIndex` runs *inside* the lock, so no process can be holding a handle on an
+ *   inode another one is about to unlink, and the schema/migration cannot race.
+ * - `vec_enabled` is read from the file as it is at that moment, so two processes
+ *   cannot both decide to downgrade: the second one opens what the first left behind
+ *   and finds the latch at 'false'.
  *
- * Deletion happens under `index.db.lock`: the repo lock does not cover a database
- * shared across scopes, and deleting a live database is the hazard §4 measured.
+ * The downgrade destroys the database rather than rebuilding it in place because,
+ * with the module absent, `DELETE`/`DROP`/`SELECT` on `vec_notes` all fail with
+ * `no such module: vec0` — §4's rebuild begins `DELETE FROM vec_notes`, so it cannot
+ * run in the path that invokes it.
  *
- * Returns the handle to use. It is a *new* handle when a rebuild happened, and the
- * argument when the call was a no-op.
+ * The cost of holding the lock on *every* open is that a lock left behind by a crash
+ * makes the next open fail loudly (`LockTimeoutError`) for up to the 30 s staleness
+ * window instead of silently opening a database somebody else may be replacing. That
+ * is the same trade `initStore`'s repo lock already makes, and the next session opens
+ * normally.
  */
-export function handleVecUnavailable(
-    root: string,
-    db: DatabaseSync,
-    opts: OpenIndexOptions = {}
-): DatabaseSync {
-    if (vecProbe(db).available) return db
-    // The latch, never `embed_dim`: see the file header.
-    if (getMeta(db, 'vec_enabled') !== 'true') return db
-
+export function openIndexLocked(root: string, opts: DowngradeOptions = {}): DatabaseSync {
     return withFileLock(indexLockPath(root), 'index lock', () => {
-        // Another process may have downgraded while we waited for the lock.
-        if (vecProbe(db).available) return db
-        if (getMeta(db, 'vec_enabled') !== 'true') return db
-
+        const db = openIndex(root, opts)
+        if (!needsDowngrade(db)) return db
+        // Nothing may use the old handle again: its file is about to be unlinked.
         db.close()
         removeIndexFiles(root)
+        return recreateVectorless(root, opts)
+    })
+}
 
-        const fresh = openIndex(root, opts)
+/**
+ * §11's conditions, and only these. `embed_dim` is deliberately not consulted: it is
+ * seeded at creation, so conditioning on it would delete and rebuild the index on
+ * every session start while the module is absent.
+ */
+function needsDowngrade(db: DatabaseSync): boolean {
+    return !vecProbe(db).available && getMeta(db, 'vec_enabled') === 'true'
+}
+
+/**
+ * The recreate half of the downgrade. The old database is already gone, so the two
+ * failures here have to end differently than the old code's leaked handle did:
+ *
+ * - The recreate itself fails: the error names the cause and says the index is
+ *   rebuildable, and the next open starts from a clean file.
+ * - The repopulate fails: the fresh handle is closed. A live, empty index would look
+ *   like a store with no notes — and be indistinguishable from one, which is the
+ *   state that took the extension down (F2).
+ *
+ * Files the repopulate skips are not lost: the reindex pass that follows every open
+ * reports them through the UI (F1).
+ */
+function recreateVectorless(root: string, opts: DowngradeOptions): DatabaseSync {
+    const recreate = opts.recreate ?? ((target: string) => openIndex(target, opts))
+    let fresh: DatabaseSync
+    try {
+        fresh = recreate(root)
+    } catch (err) {
+        throw new Error(
+            `vec0 downgrade could not recreate index.db: ${message(err)}; the index is rebuilt from the notes on the next start`,
+            { cause: err }
+        )
+    }
+
+    try {
         // opts reproduces the failure in tests; a genuinely restored module means
         // this recreate is a normal fresh index, so leave the latch on.
         if (!vecProbe(fresh).available) setMeta(fresh, 'vec_enabled', 'false')
         transaction(fresh, () => populateFromDisk(fresh, root), { immediate: true })
-        return fresh
-    })
+    } catch (err) {
+        closeQuietly(fresh)
+        throw new Error(
+            `vec0 downgrade could not repopulate index.db: ${message(err)}; the index is rebuilt from the notes on the next start`,
+            { cause: err }
+        )
+    }
+    return fresh
+}
+
+/** A double close is not a failure worth masking the real one with. */
+function closeQuietly(db: DatabaseSync): void {
+    try {
+        db.close()
+    } catch {}
 }
 
 /**

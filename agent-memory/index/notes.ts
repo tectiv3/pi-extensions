@@ -16,13 +16,12 @@
  *   through `toVecId()`.
  */
 
-import * as fs from 'node:fs'
-import * as path from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
 
-import { type Access, fileHash, parseNote } from '../store/frontmatter.ts'
+import type { Access } from '../store/frontmatter.ts'
 import { normalizeKey } from '../store/keys.ts'
 import type { Scope } from '../store/paths.ts'
+import { type NoteFileError, readStoreFile, walkNotes } from '../store/walk.ts'
 
 /** §4 candidate depths. Search callers should pass these, not invent their own. */
 export const BM25_DEPTH = 50
@@ -65,10 +64,24 @@ export interface NoteInput {
     mtime: number
 }
 
+/**
+ * One tier a discovery path searches. `''` is the global scope's project, matching
+ * `notes.project`; `scope: 'global'` always carries it (§2.2).
+ */
+export interface ScopeTarget {
+    scope: Scope
+    project: string
+}
+
 export interface NoteFilter {
     scope?: Scope
     project?: string
     access?: Access
+    /**
+     * Several tiers at once, in rank order (§5.1: project, then global). Mutually
+     * exclusive with `scope`/`project`, which name a single tier.
+     */
+    scopes?: readonly ScopeTarget[]
 }
 
 export interface SearchOptions extends NoteFilter {
@@ -237,13 +250,22 @@ export function searchBm25(
     options: SearchOptions = {}
 ): ScoredNote[] {
     const filter = filterSql('n.', { ...options, access: options.access ?? 'open' })
+    // §5.1's "project wins" is a ranking rule, not only a read rule: with two tiers
+    // in one query, equal `bm25()` scores must put the project note first. A global
+    // note that scores strictly better still ranks above, which is what keeps the
+    // fallback tier useful.
+    const tieBreak = isMultiScope(options) ? ", n.scope = 'global' ASC" : ''
     const sql = `SELECT n.*, bm25(notes_fts) AS score
 FROM notes_fts
 JOIN notes n ON n.id = notes_fts.rowid
 WHERE notes_fts MATCH ?${filter.sql}
-ORDER BY bm25(notes_fts) ASC
+ORDER BY bm25(notes_fts) ASC${tieBreak}
 LIMIT ?`
     return allRows<ScoredNote>(db, sql, [query, ...filter.params, options.limit ?? BM25_DEPTH])
+}
+
+function isMultiScope(filter: NoteFilter): boolean {
+    return filter.scopes !== undefined && filter.scopes.length > 1
 }
 
 /**
@@ -260,20 +282,12 @@ export function searchVector(
     options: Omit<SearchOptions, 'access'> = {}
 ): VectorHit[] {
     if (!hasVecTable(db)) return []
-    const clauses = ["access = 'open'"]
-    const params: Bind[] = [vecBlob(embedding), options.limit ?? VECTOR_K]
-    if (options.scope !== undefined) {
-        clauses.push('scope = ?')
-        params.push(options.scope)
-    }
-    if (options.project !== undefined) {
-        clauses.push('project = ?')
-        params.push(options.project)
-    }
+    const filter = filterSql('', { ...options, access: 'open' })
+    const params: Bind[] = [vecBlob(embedding), options.limit ?? VECTOR_K, ...filter.params]
     const rows = allRows<{ note_id: number | bigint; distance: number }>(
         db,
         `SELECT note_id, distance FROM vec_notes
-WHERE embedding MATCH ? AND k = ? AND note_id IN (SELECT id FROM notes WHERE ${clauses.join(' AND ')})
+WHERE embedding MATCH ? AND k = ? AND note_id IN (SELECT id FROM notes WHERE 1 = 1${filter.sql})
 ORDER BY distance`,
         params
     )
@@ -304,8 +318,9 @@ export function needsEmbedding(db: DatabaseSync): NoteRow[] {
 export function writeVector(
     db: DatabaseSync,
     noteId: number,
-    embedding: ArrayLike<number>
-): void {
+    embedding: ArrayLike<number>,
+    bodyHash: string
+): boolean {
     const vecId = toVecId(noteId)
     if (!hasVecTable(db)) throw new Error('writeVector: vec_notes is unavailable')
     if (oneRow(db, 'SELECT 1 AS present FROM notes WHERE id = ?', [noteId]) === null) {
@@ -323,12 +338,23 @@ export function writeVector(
             )
         } catch (err) {
             if (!isUniqueViolation(err)) throw err
-            update.run(blob, vecId)
+            if (Number(update.run(blob, vecId).changes) === 0) {
+                throw new Error(
+                    `writeVector: vec_notes lost note ${noteId} during the insert`,
+                    { cause: err }
+                )
+            }
         }
     }
-    // Read at the last moment: a body written meanwhile leaves vec_hash behind
-    // body_hash, which is exactly what the re-enqueue predicate looks for.
-    db.prepare('UPDATE notes SET vec_hash = body_hash WHERE id = ?').run(noteId)
+    // `bodyHash` is the body the *vector* was built from, not whatever the row says
+    // now. Stamping the row's current hash would make a stale vector look fresh and
+    // silently disable §4's re-enqueue predicate, so the stamp is conditional and a
+    // mismatch discards it — the vector stays written, `vec_hash` stays stale, and the
+    // next backfill rebuilds it.
+    const stamped = db
+        .prepare('UPDATE notes SET vec_hash = ? WHERE id = ? AND body_hash = ?')
+        .run(bodyHash, noteId, bodyHash)
+    return Number(stamped.changes) > 0
 }
 
 function vecBlob(embedding: ArrayLike<number>): Buffer {
@@ -364,7 +390,7 @@ function isUniqueViolation(err: unknown): boolean {
  * carry `notes.id` across a rebuild. Embedding jobs are keyed by
  * `(scope, project, key, body_hash)` (§8.2).
  */
-export function rebuildIndex(root: string, db: DatabaseSync): number {
+export function rebuildIndex(root: string, db: DatabaseSync): PopulateResult {
     return transaction(
         db,
         () => {
@@ -378,108 +404,41 @@ export function rebuildIndex(root: string, db: DatabaseSync): number {
     )
 }
 
+export interface PopulateResult {
+    /** Notes written into the index. */
+    indexed: number
+    /** Files that could not be indexed, each named by path. */
+    errors: NoteFileError[]
+}
+
 /**
  * Reads every note file under `global/` and `projects/*` into `notes`. The caller
- * owns the transaction; this is also the downgrade path's body, where the database
- * is freshly created and must not touch `vec_notes` at all.
+ * owns the transaction; this is also §11's downgrade body, where the database is
+ * freshly recreated and must not touch `vec_notes` at all.
  *
- * `parseNote` is authoritative for `access` (§2.1) and for `fm_len`, which is why a
- * frontmatter error aborts the rebuild instead of silently un-gating the note.
+ * `parseNote` is authoritative for `access` (§2.1) and for `fm_len`, so a note it
+ * refuses is **left out** of the index and reported, never stored as `open`. The
+ * skip is per file: this function is on the downgrade path, where throwing would
+ * leave the recreated database empty and take the extension down with it (F2).
  */
-export function populateFromDisk(db: DatabaseSync, root: string): number {
-    let count = 0
-    for (const file of noteFiles(root)) {
-        const buf = fs.readFileSync(file.absPath)
-        const parsed = parseNote(buf)
+export function populateFromDisk(db: DatabaseSync, root: string): PopulateResult {
+    const result: PopulateResult = { indexed: 0, errors: [] }
+    for (const file of walkNotes(root, error => result.errors.push(error))) {
+        const read = readStoreFile(file)
+        if ('error' in read) {
+            result.errors.push(read.error)
+            continue
+        }
         upsertNote(db, {
             scope: file.scope,
             project: file.project,
             key: file.key,
             path: file.relPath,
-            body: parsed.body,
-            fmLen: parsed.fmLen,
-            bodyHash: fileHash(buf),
-            access: parsed.access,
-            mtime: Math.floor(fs.statSync(file.absPath).mtimeMs),
+            ...read,
         })
-        count++
+        result.indexed++
     }
-    return count
-}
-
-interface DiskNote {
-    scope: Scope
-    project: string
-    key: string
-    relPath: string
-    absPath: string
-}
-
-function noteFiles(root: string): DiskNote[] {
-    const files: DiskNote[] = []
-    collectNotes(root, 'global', '', path.join(root, 'global'), files)
-    const projectsRoot = path.join(root, 'projects')
-    for (const project of directoryNames(projectsRoot)) {
-        collectNotes(root, 'project', project, path.join(projectsRoot, project), files)
-    }
-    return files
-}
-
-function collectNotes(
-    root: string,
-    scope: Scope,
-    project: string,
-    scopeRoot: string,
-    files: DiskNote[]
-): void {
-    const walk = (dir: string): void => {
-        for (const name of directoryNames(dir)) walk(path.join(dir, name))
-        // A stable order keeps ids reproducible across a rebuild of unchanged files,
-        // which makes diffs of the index and test failures readable.
-        for (const name of fileNames(dir)) {
-            if (!name.endsWith('.md')) continue
-            const absPath = path.join(dir, name)
-            files.push({
-                scope,
-                project,
-                // `normalizeKey` is the only way a key enters the system (§2.2): it
-                // strips `.md` and lowercases, so a hand-written `Notes.md` indexes as
-                // `notes` rather than as a second note.
-                key: normalizeKey(toPosix(path.relative(scopeRoot, absPath))),
-                relPath: toPosix(path.relative(root, absPath)),
-                absPath,
-            })
-        }
-    }
-    walk(scopeRoot)
-}
-
-function directoryNames(dir: string): string[] {
-    return sortedEntries(dir)
-        .filter(entry => entry.isDirectory())
-        .map(entry => entry.name)
-}
-
-function fileNames(dir: string): string[] {
-    return sortedEntries(dir)
-        .filter(entry => entry.isFile())
-        .map(entry => entry.name)
-}
-
-function sortedEntries(dir: string): fs.Dirent[] {
-    try {
-        return fs
-            .readdirSync(dir, { withFileTypes: true })
-            .slice()
-            .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
-    } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return []
-        throw err
-    }
-}
-
-function toPosix(relPath: string): string {
-    return relPath.split(path.sep).join('/')
+    return result
 }
 
 // ---------------------------------------------------------------------------
@@ -489,13 +448,21 @@ function toPosix(relPath: string): string {
 function filterSql(prefix: string, filter: NoteFilter): SqlFragment {
     const clauses: string[] = []
     const params: Bind[] = []
-    if (filter.scope !== undefined) {
-        clauses.push(`${prefix}scope = ?`)
-        params.push(filter.scope)
-    }
-    if (filter.project !== undefined) {
-        clauses.push(`${prefix}project = ?`)
-        params.push(filter.project)
+    if (filter.scopes !== undefined && filter.scopes.length > 0) {
+        // One OR group per tier, ANDed with the access filter so a gated row is still
+        // excluded before ranking in every tier.
+        const tiers = filter.scopes.map(() => `(${prefix}scope = ? AND ${prefix}project = ?)`)
+        clauses.push(`(${tiers.join(' OR ')})`)
+        for (const target of filter.scopes) params.push(target.scope, target.project)
+    } else {
+        if (filter.scope !== undefined) {
+            clauses.push(`${prefix}scope = ?`)
+            params.push(filter.scope)
+        }
+        if (filter.project !== undefined) {
+            clauses.push(`${prefix}project = ?`)
+            params.push(filter.project)
+        }
     }
     if (filter.access !== undefined) {
         clauses.push(`${prefix}access = ?`)

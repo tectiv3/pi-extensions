@@ -6,157 +6,116 @@
  * rather than a gate bypass. Files whose hash is unchanged are skipped, so this stays
  * cheap enough for `session_start`.
  *
- * The error policy is deliberately asymmetric:
+ * The error policy is per **file**, never per pass:
  *
- * - A filename that fails `normalizeKey` is **reported, not thrown**. The store is
- *   hand-editable markdown; one stray `Bad Name.md` must not brick reindex for the
- *   hundreds of valid notes beside it.
- * - An unparseable `access:` **is** thrown. §2.1 fails closed: skipping a gated note
- *   as if it were open would both un-gate it and leave `access: gated` in the body,
- *   where it becomes searchable. A loud failure is the only safe outcome.
+ * - A filename that fails `normalizeKey` is **reported and skipped** (`walkNotes`).
+ * - A file that cannot be read or whose frontmatter does not parse is **reported and
+ *   its index row is dropped**. §2.1 fails closed: an unparseable `access:` must not
+ *   be treated as `open`, and a row left behind would keep saying whatever it said
+ *   before — including `access` — while the file says something else. Either way the
+ *   pass completes, so one bad note cannot hide the store behind it.
+ * - A row whose file is gone is **deleted** (F6) — but only after a complete walk,
+ *   never one cut short by an unreadable directory.
  */
 
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
 
-import { getNoteByKey, type NoteInput, upsertNote } from '../index/notes.ts'
-import { fileHash, parseNote } from './frontmatter.ts'
-import { normalizeKey } from './keys.ts'
-import type { Scope } from './paths.ts'
+import { deleteNote, getNoteByKey, upsertNote } from '../index/notes.ts'
+import { type NoteFileError, type StoreFile, readStoreFile, walkNotes } from './walk.ts'
 
-export interface ReindexError {
-    /** Path relative to the store root, in posix form. */
-    path: string
-    reason: string
-}
+export type ReindexError = NoteFileError
 
 export interface ReindexResult {
     scanned: number
     updated: number
     skipped: number
+    /** Rows deleted because their note file is no longer on disk. */
+    removed: number
     errors: ReindexError[]
 }
 
 export function reindexFromDisk(root: string, db: DatabaseSync): ReindexResult {
-    const result: ReindexResult = { scanned: 0, updated: 0, skipped: 0, errors: [] }
+    const result: ReindexResult = {
+        scanned: 0,
+        updated: 0,
+        skipped: 0,
+        removed: 0,
+        errors: [],
+    }
+    /** Every `(scope, project, key)` whose file is still on disk, keyed by `rowKey`. */
+    const seen = new Set<string>()
 
-    for (const file of noteFiles(root)) {
+    for (const file of walkNotes(root, error => {
+        result.errors.push(error)
+        // An unnameable file is part of the pass's cost and of its report, so it
+        // counts as scanned even though it never reaches the index.
         result.scanned++
+    })) {
+        result.scanned++
+        seen.add(rowKey(file.scope, file.project, file.key))
 
-        let key: string
-        try {
-            key = normalizeKey(toPosix(path.relative(file.scopeRoot, file.absPath)))
-        } catch (err) {
-            result.errors.push({ path: file.relPath, reason: reasonOf(err) })
+        const read = readStoreFile(file)
+        if ('error' in read) {
+            result.errors.push(read.error)
+            dropRow(db, file)
             continue
         }
 
-        // `parseNote` throws here, by design: see the module comment.
-        const raw = fs.readFileSync(file.absPath)
-        const parsed = parseNote(raw)
-        const bodyHash = fileHash(raw)
-
-        const existing = getNoteByKey(db, file.scope, file.project, key)
-        if (existing !== null && existing.body_hash === bodyHash) {
+        const existing = getNoteByKey(db, file.scope, file.project, file.key)
+        if (existing !== null && existing.body_hash === read.bodyHash) {
             // Whole-file hash covers `access` too (§2.3), so an unchanged hash means
             // nothing at all needs rewriting.
             result.skipped++
             continue
         }
 
-        const row: NoteInput = {
+        upsertNote(db, {
             scope: file.scope,
             project: file.project,
-            key,
+            key: file.key,
             path: file.relPath,
-            body: parsed.body,
-            fmLen: parsed.fmLen,
-            bodyHash,
-            access: parsed.access,
-            mtime: Math.floor(fs.statSync(file.absPath).mtimeMs),
-        }
-        upsertNote(db, row)
+            ...read,
+        })
         result.updated++
     }
 
+    result.removed = removeUnseen(root, db, seen)
     return result
 }
 
-interface DiskFile {
-    scope: Scope
-    /** `''` for the global scope. */
-    project: string
-    scopeRoot: string
-    absPath: string
-    relPath: string
+/** Fail closed per note: an unparseable body must not stay searchable as it was. */
+function dropRow(db: DatabaseSync, file: StoreFile): void {
+    const existing = getNoteByKey(db, file.scope, file.project, file.key)
+    if (existing !== null) deleteNote(db, existing.id)
 }
 
-function noteFiles(root: string): DiskFile[] {
-    const files: DiskFile[] = []
-    collect(root, 'global', '', path.join(root, 'global'), files)
-    const projectsRoot = path.join(root, 'projects')
-    for (const project of directoryNames(projectsRoot)) {
-        // A project directory name is used verbatim: it is the id `projects.json`
-        // records, and the id — not the checkout path — is what identity resolves to.
-        collect(root, 'project', project, path.join(projectsRoot, project), files)
+/**
+ * Rows whose note file is gone (F6). Two conditions, because one is not enough:
+ *
+ * - The row is not in `seen`, which only a complete walk may populate — `walkNotes`
+ *   throws on an unreadable directory rather than return a short list.
+ * - The file its `path` names does not exist. A row this pass did not see can simply
+ *   be one another process wrote after the walk passed its directory, and deleting a
+ *   live note's row would drop it from search until the next pass.
+ */
+function removeUnseen(root: string, db: DatabaseSync, seen: Set<string>): number {
+    const rows = db.prepare('SELECT id, scope, project, key, path FROM notes').all()
+    let removed = 0
+    for (const row of rows) {
+        const scope = String(row.scope)
+        const project = String(row.project)
+        const key = String(row.key)
+        if (seen.has(rowKey(scope, project, key))) continue
+        if (fs.existsSync(path.join(root, String(row.path)))) continue
+        deleteNote(db, Number(row.id))
+        removed++
     }
-    return files
+    return removed
 }
 
-function collect(
-    root: string,
-    scope: Scope,
-    project: string,
-    scopeRoot: string,
-    files: DiskFile[]
-): void {
-    const walk = (dir: string): void => {
-        for (const name of directoryNames(dir)) walk(path.join(dir, name))
-        for (const name of fileNames(dir)) {
-            if (!name.endsWith('.md')) continue
-            const absPath = path.join(dir, name)
-            files.push({
-                scope,
-                project,
-                scopeRoot,
-                absPath,
-                relPath: toPosix(path.relative(root, absPath)),
-            })
-        }
-    }
-    walk(scopeRoot)
-}
-
-function directoryNames(dir: string): string[] {
-    return entries(dir)
-        .filter(entry => entry.isDirectory())
-        .map(entry => entry.name)
-}
-
-function fileNames(dir: string): string[] {
-    return entries(dir)
-        .filter(entry => entry.isFile())
-        .map(entry => entry.name)
-}
-
-/** A missing `global/` or `projects/` directory is an empty one, not an error. */
-function entries(dir: string): fs.Dirent[] {
-    try {
-        return fs
-            .readdirSync(dir, { withFileTypes: true })
-            .slice()
-            .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
-    } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return []
-        throw err
-    }
-}
-
-function reasonOf(err: unknown): string {
-    return err instanceof Error ? err.message : String(err)
-}
-
-function toPosix(relPath: string): string {
-    return relPath.split(path.sep).join('/')
+/** NUL-joined: a key may contain `/` but never NUL, so the parts cannot collide. */
+function rowKey(scope: string, project: string, key: string): string {
+    return `${scope}\u0000${project}\u0000${key}`
 }

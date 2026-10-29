@@ -253,6 +253,43 @@ test('stop terminates the interval and stops accepting work', async t => {
     assert.equal(worker.stats().processed, 0)
 })
 
+test('stop(2000) stays within its budget while an interval tick is draining (F4)', async t => {
+    ensureNotSubagent(t)
+    useStoreDir(t)
+    const store = openTestStore(t)
+    // Slow on purpose (§8.1 budgets for a slow machine): 20 batches of 150 ms is 3 s of
+    // work, so an unbounded tick cannot be waited out inside the 2.5 s assertion below.
+    const fake = fakeEmbed({ delayMs: 150 })
+    const worker = createEmbedWorker({
+        store,
+        embed: fake.embed,
+        available: () => true,
+        batchSize: 2,
+        intervalMs: 10,
+    })
+    t.after(() => worker.stop(0))
+
+    for (let index = 0; index < 40; index++) {
+        worker.enqueue(seedNote(store, `notes/${index}`, `body ${index}`))
+    }
+
+    // Let the interval start a run, then prove it really is in flight.
+    const tickDeadline = Date.now() + 1_000
+    while (fake.calls.length === 0 && Date.now() < tickDeadline) await delay(10)
+    assert.ok(fake.calls.length >= 1, 'the interval tick never started a run')
+
+    const started = Date.now()
+    const stopped = await worker.stop(2_000)
+    const elapsed = Date.now() - started
+
+    assert.ok(elapsed < 2_500, `stop(2000) took ${elapsed} ms`)
+    // Bounded, not complete: the interval tick's own deadline stopped it early, and the
+    // shutdown drain stopped at its deadline too.
+    assert.equal(stopped.timedOut, true)
+    assert.ok(stopped.remaining > 0, 'the 3 s of queued work cannot have drained')
+    assert.ok(stopped.processed < 40)
+})
+
 // ---------------------------------------------------------------------------
 // backfill
 // ---------------------------------------------------------------------------

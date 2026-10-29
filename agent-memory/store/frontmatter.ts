@@ -29,7 +29,12 @@ export interface ParsedNote {
 }
 
 const DELIMITER = /^---[ \t]*$/
-const ACCESS_LINE = /^access[ \t]*:(.*)$/i
+/**
+ * Leading whitespace is allowed on purpose: `  access: gated` inside a block that
+ * already parsed as frontmatter must not demote the block to body, which would
+ * un-gate the note *and* make the line searchable (§2.1's fail-open class).
+ */
+const ACCESS_LINE = /^[ \t]*access[ \t]*:(.*)$/i
 
 export function parseNote(buf: Buffer): ParsedNote {
     // Latin-1 decoding is a 1:1 byte→char map, so string indices are byte offsets

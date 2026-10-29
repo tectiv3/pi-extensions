@@ -5,7 +5,6 @@ import * as path from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
 import test, { type TestContext } from 'node:test'
 
-import { FrontmatterError } from '../store/frontmatter.ts'
 import { EMBED_DIM, openIndex } from './db.ts'
 import {
     deleteNote,
@@ -51,6 +50,11 @@ function noteInput(overrides: Partial<NoteInput> = {}): NoteInput {
         mtime: 1_700_000_000_000,
         ...overrides,
     }
+}
+
+/** The body hash `noteInput` gives a key; `writeVector` takes the expected one (F7). */
+function hashOf(key: string): string {
+    return `hash-${key}`
 }
 
 /** A 512-dim basis vector; `writeVector` normalises it, so length stays 1. */
@@ -127,7 +131,7 @@ test('delete removes notes, fts and vec rows, and ids are never reused', t => {
     assert.ok(hasVecTable(db))
 
     const first = upsertNote(db, noteInput({ key: 'a/one', body: 'quokka' }))
-    writeVector(db, first, vectorFor(0))
+    writeVector(db, first, vectorFor(0), hashOf('a/one'))
     assert.deepEqual(vectorIds(db), [first])
 
     deleteNote(db, first)
@@ -145,7 +149,7 @@ test('writeVector inserts when absent and updates when present', t => {
     const { db } = openTemp(t)
     const id = upsertNote(db, noteInput({ key: 'a/one' }))
 
-    writeVector(db, id, vectorFor(0))
+    writeVector(db, id, vectorFor(0), hashOf('a/one'))
     assert.deepEqual(vectorIds(db), [id])
     const first = searchVector(db, vectorFor(0), { limit: 1 })
     assert.ok(first[0].distance < 1e-6)
@@ -153,7 +157,7 @@ test('writeVector inserts when absent and updates when present', t => {
 
     // Calling twice is the reproduced insert-after-insert race: the second call must
     // not throw on `UNIQUE constraint failed`.
-    writeVector(db, id, vectorFor(1))
+    writeVector(db, id, vectorFor(1), hashOf('a/one'))
     assert.deepEqual(vectorIds(db), [id])
     const second = searchVector(db, vectorFor(1), { limit: 1 })
     assert.ok(second[0].distance < 1e-6)
@@ -213,11 +217,11 @@ test('searchVector filters gated notes before k', t => {
     const { db } = openTemp(t)
 
     const open = upsertNote(db, noteInput({ key: 'open/one', access: 'open' }))
-    writeVector(db, open, vectorFor(2))
+    writeVector(db, open, vectorFor(2), hashOf('open/one'))
     const gated: number[] = []
     for (const [i, key] of ['gated/one', 'gated/two', 'gated/three'].entries()) {
         const id = upsertNote(db, noteInput({ key, access: 'gated' }))
-        writeVector(db, id, nearVector(0.02 * (i + 1)))
+        writeVector(db, id, nearVector(0.02 * (i + 1)), hashOf(key))
         gated.push(id)
     }
 
@@ -238,6 +242,29 @@ test('searchVector filters gated notes before k', t => {
     )
 })
 
+test('writeVector stamps vec_hash only for the body the vector was built from (F7)', t => {
+    const { db } = openTemp(t)
+    const id = upsertNote(db, noteInput({ key: 'a/one', bodyHash: 'H1' }))
+
+    // The body moved on after the vector was computed: the stale write must not claim
+    // it describes H2, or the re-enqueue predicate would never see the mismatch.
+    upsertNote(db, noteInput({ key: 'a/one', body: 'new body', bodyHash: 'H2' }))
+    assert.equal(writeVector(db, id, vectorFor(0), 'H1'), false)
+
+    const row = getNoteByKey(db, 'global', '', 'a/one')
+    assert.equal(row?.body_hash, 'H2')
+    assert.equal(row?.vec_hash, null, 'a stale vector stamped the current body hash')
+    assert.deepEqual(
+        needsEmbedding(db).map(stale => stale.key),
+        ['a/one']
+    )
+
+    // The matching write is accepted and pins the pair.
+    assert.equal(writeVector(db, id, vectorFor(0), 'H2'), true)
+    assert.equal(getNoteByKey(db, 'global', '', 'a/one')?.vec_hash, 'H2')
+    assert.deepEqual(needsEmbedding(db), [])
+})
+
 test('needsEmbedding selects NULL and stale vec_hash only', t => {
     const { db } = openTemp(t)
 
@@ -247,7 +274,7 @@ test('needsEmbedding selects NULL and stale vec_hash only', t => {
         ['a/one']
     )
 
-    writeVector(db, id, vectorFor(0))
+    writeVector(db, id, vectorFor(0), 'v1')
     assert.deepEqual(needsEmbedding(db), [])
 
     // The upsert leaves vec_hash stale on purpose: it records the body the stored
@@ -259,7 +286,7 @@ test('needsEmbedding selects NULL and stale vec_hash only', t => {
     )
 })
 
-test('rebuildIndex repopulates from disk and rolls back on a bad file', t => {
+test('rebuildIndex repopulates from disk and skips a bad file', t => {
     const { root, db } = openTemp(t)
 
     writeNoteFile(root, 'global/a/one.md', 'quokka body')
@@ -268,7 +295,7 @@ test('rebuildIndex repopulates from disk and rolls back on a bad file', t => {
         'projects/proj-1a2b3c4d/auth/session.md',
         '---\naccess: gated\n---\nsecret body'
     )
-    assert.equal(rebuildIndex(root, db), 2)
+    assert.equal(rebuildIndex(root, db).indexed, 2)
 
     const global = getNoteByKey(db, 'global', '', 'a/one')
     const gated = getNoteByKey(db, 'project', 'proj-1a2b3c4d', 'auth/session')
@@ -290,9 +317,44 @@ test('rebuildIndex repopulates from disk and rolls back on a bad file', t => {
         .map(row => row.id)
         .sort((a, b) => a - b)
 
-    // An unparseable `access:` is an index error, never a silent `open` (§2.1).
+    // An unparseable `access:` is never indexed as `open` (§2.1), and never aborts the
+    // rebuild either: the same function is §11's downgrade body, where a throw would
+    // leave a freshly recreated index empty and take the extension down (F2).
     writeNoteFile(root, 'global/a/broken.md', '---\naccess: hidden\n---\nsecret')
-    assert.throws(() => rebuildIndex(root, db), FrontmatterError)
+    const rebuilt = rebuildIndex(root, db)
+    assert.equal(rebuilt.indexed, 2)
+    assert.deepEqual(
+        rebuilt.errors.map(error => error.path),
+        ['global/a/broken.md']
+    )
+    assert.equal(getNoteByKey(db, 'global', '', 'a/broken'), null)
+    assert.equal(matchCount(db, 'quokka'), 1)
+    assert.equal(matchCount(db, 'hidden'), 0)
+    // A rebuild reassigns ids; embedding jobs are keyed by (scope, project, key,
+    // body_hash) for exactly this reason (§8.2).
+    assert.ok(
+        listNotes(db).every(row => !idsBefore.includes(row.id)),
+        'rebuild must reassign ids'
+    )
+})
+
+test('rebuildIndex rolls back when the walk itself fails', t => {
+    const { root, db } = openTemp(t)
+
+    writeNoteFile(root, 'global/a/one.md', 'quokka body')
+    assert.equal(rebuildIndex(root, db).indexed, 1)
+    const idsBefore = listNotes(db)
+        .map(row => row.id)
+        .sort((a, b) => a - b)
+
+    // A regular file where the `global/` directory belongs is ENOTDIR out of the walk:
+    // the one failure a rebuild cannot absorb per file, because a short walk would look
+    // like a store whose notes were deleted.
+    const global = path.join(root, 'global')
+    fs.rmSync(global, { recursive: true, force: true })
+    fs.writeFileSync(global, 'not a directory')
+
+    assert.throws(() => rebuildIndex(root, db), /ENOTDIR/)
     assert.deepEqual(
         listNotes(db)
             .map(row => row.id)
@@ -303,14 +365,4 @@ test('rebuildIndex repopulates from disk and rolls back on a bad file', t => {
     // The ROLLBACK is what makes this observable: a leaked BEGIN IMMEDIATE would
     // leave every later write failing after busy_timeout.
     upsertNote(db, noteInput({ key: 'a/after-rollback' }))
-
-    fs.rmSync(path.join(root, 'global/a/broken.md'))
-    upsertNote(db, noteInput({ key: 'a/after-rollback' }))
-    assert.equal(rebuildIndex(root, db), 2)
-    // A rebuild reassigns ids; embedding jobs are keyed by (scope, project, key,
-    // body_hash) for exactly this reason (§8.2).
-    assert.ok(
-        listNotes(db).every(row => !idsBefore.includes(row.id)),
-        'rebuild must reassign ids'
-    )
 })

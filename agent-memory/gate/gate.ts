@@ -63,6 +63,15 @@ export function isSubagent(): boolean {
  * Approval is per operation, never cached: the caller gets an attempt id and must
  * resolve it (see `resolveAttempt`) in a `finally` so a mutation that fails after
  * approval reports `failed:<class>` rather than an unexplained `approved`.
+ *
+ * **Ownership of the resolver.** This function writes the `pending` line and, for
+ * every outcome that is terminal here, its own resolver — `blocked-subagent`,
+ * `denied-no-ui`, `declined`, `error` — because the caller returns immediately in
+ * those cases. On approval it writes **nothing**: only the caller knows whether the
+ * write/edit/delete/read actually landed, and an `approved/ok` emitted here would be
+ * a claim the gate cannot make. That is what split `decision` from `result` (§7.1);
+ * an optimistic `ok` followed by `failed:<class>` is two contradictory resolvers for
+ * one attempt. The caller therefore owns exactly one terminal line per attempt.
  */
 export async function requestGatedAccess(
     ctx: GateContext,
@@ -99,7 +108,7 @@ export async function requestGatedAccess(
         return { allowed: false, code: 'declined' }
     }
 
-    resolveAttempt(req.root, attempt, 'approved', 'ok')
+    // No resolver here: the caller's `finally` writes `approved` + the real `result`.
     return { allowed: true, attempt }
 }
 

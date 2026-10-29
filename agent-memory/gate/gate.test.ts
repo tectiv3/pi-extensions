@@ -95,21 +95,23 @@ function decisions(root: string): (string | undefined)[] {
     return readLog(root).map(entry => entry.decision)
 }
 
-test('approval writes pending then approved/ok sharing one 16-hex attempt', async t => {
+test('approval writes pending only; the caller owns the single resolver', async t => {
     const root = makeRoot(t)
     const calls: ConfirmCall[] = []
 
     const result = await requestGatedAccess(ctxWithUI(true, calls), gateRequest(root))
     const entries = readLog(root)
 
+    // §7.1 gives the gate no way to know whether the mutation lands, so it must not
+    // write `approved/ok`: that would be an optimistic claim, and a commit failure
+    // would then leave two contradictory resolvers for one attempt.
+    assert.equal(entries.length, 1, 'the gate wrote a resolver it cannot know')
     assert.deepEqual(
         entries.map(entry => entry.decision),
-        ['pending', 'approved']
+        ['pending']
     )
-    const [pending, resolver] = entries
+    const [pending] = entries
     assert.match(pending.attempt ?? '', /^[0-9a-f]{16}$/)
-    assert.equal(resolver.attempt, pending.attempt)
-    assert.equal(resolver.result, 'ok')
     assert.equal(pending.op, 'read')
     assert.equal(pending.initiator, 'agent')
     assert.equal(pending.scope, 'project')
@@ -127,6 +129,17 @@ test('approval writes pending then approved/ok sharing one 16-hex attempt', asyn
     assert.ok(calls[0].message.includes(PREVIEW_TOKEN))
     // The preview is gated content: shown, never logged.
     assert.equal(rawLog(root).includes(PREVIEW_TOKEN), false)
+
+    // What the caller's `finally` does; the pair is exactly two lines.
+    resolveAttempt(root, pending.attempt ?? '', 'approved', 'ok')
+    const resolved = readLog(root)
+    assert.equal(resolved.length, 2, 'a successful gated operation is two lines')
+    assert.deepEqual(
+        resolved.map(entry => entry.decision),
+        ['pending', 'approved']
+    )
+    assert.equal(resolved[1].attempt, pending.attempt)
+    assert.equal(resolved[1].result, 'ok')
 })
 
 test('decline writes pending then declined and leaks no body text', async t => {
@@ -136,6 +149,7 @@ test('decline writes pending then declined and leaks no body text', async t => {
     const result = await requestGatedAccess(ctxWithUI(false, calls), gateRequest(root))
 
     assert.deepEqual(decisions(root), ['pending', 'declined'])
+    assert.equal(readLog(root).length, 2, 'a declined gate attempt is two lines')
     assert.equal(result.allowed, false)
     assert.equal(result.allowed ? null : result.code, 'declined')
     assert.equal(readLog(root)[1].result, undefined)
@@ -160,6 +174,7 @@ test('no UI fails closed as denied-no-ui', async t => {
     const result = await requestGatedAccess(ctx, gateRequest(root))
 
     assert.deepEqual(decisions(root), ['pending', 'denied-no-ui'])
+    assert.equal(readLog(root).length, 2, 'a fail-closed attempt is two lines')
     assert.equal(result.allowed, false)
     assert.equal(result.allowed ? null : result.code, 'denied-no-ui')
     assert.equal(confirmed, false)
@@ -192,6 +207,7 @@ test('subagent is blocked before hasUI is consulted', async t => {
     const result = await requestGatedAccess(ctx, gateRequest(root))
 
     assert.deepEqual(decisions(root), ['pending', 'blocked-subagent'])
+    assert.equal(readLog(root).length, 2, 'a subagent block is two lines')
     assert.equal(result.allowed, false)
     assert.equal(result.allowed ? null : result.code, 'blocked-subagent')
     assert.equal(confirmed, false)
@@ -206,23 +222,34 @@ test('a throwing confirm is logged as error, not declined', async t => {
     )
 
     assert.deepEqual(decisions(root), ['pending', 'error'])
+    assert.equal(readLog(root).length, 2, 'a failed confirmation is two lines')
     assert.equal(result.allowed, false)
     assert.equal(result.allowed ? null : result.code, 'error')
     assert.equal(readLog(root)[1].result, undefined)
 })
 
-test('an approved-but-failed mutation resolves its attempt', async t => {
+test('an approved-but-failed mutation is pending + approved/failed, never an ok', async t => {
     const root = makeRoot(t)
     const result = await requestGatedAccess(ctxWithUI(true), gateRequest(root))
     assert.equal(result.allowed, true)
     const attempt = result.allowed ? result.attempt : ''
 
-    // §3.4 step 6: the resolver written in the finally is the honest outcome.
+    // §3.4 step 6: the resolver written in the caller's finally is the honest outcome,
+    // and it is the only one — there is no optimistic `ok` in front of it.
     resolveAttempt(root, attempt, 'approved', 'failed:other')
 
     const entries = readLog(root)
-    assert.equal(entries.length, 3)
-    assert.equal(entries[2].result, 'failed:other')
+    assert.equal(entries.length, 2, 'a failed post-approval mutation is still two lines')
+    assert.deepEqual(
+        entries.map(entry => entry.decision),
+        ['pending', 'approved']
+    )
+    assert.equal(entries[1].result, 'failed:other')
+    assert.equal(
+        entries.some(entry => entry.result === 'ok'),
+        false,
+        'an optimistic ok survived the fix'
+    )
 
     const rows = pairAttempts(entries)
     assert.equal(rows.length, 1)

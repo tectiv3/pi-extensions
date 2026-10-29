@@ -38,6 +38,8 @@ import {
 } from './inject/index-block.ts'
 import { installMentionHook } from './inject/mention.ts'
 import { installIndexSection } from './inject/system-prompt.ts'
+import { message } from './store/errors.ts'
+import type { ReindexError } from './store/reindex.ts'
 import { openStore, type Store } from './store/store.ts'
 import type { Embedder } from './tools/definitions.ts'
 import { registerMemoryTools, sessionGate } from './tools/register.ts'
@@ -137,9 +139,17 @@ export default function agentMemoryExtension(
             }
 
             // Hand edits and crashed writes are the authoritative source (§3.3); the
-            // pass is per-file and skips unchanged notes.
+            // pass is per-file and skips unchanged notes. A note it could not index is
+            // named through the UI: the hand edit is the only thing that fixes it, and a
+            // silent skip reads as "the agent forgot everything" (F1).
             try {
-                opened.reindex()
+                const reindexed = opened.reindex()
+                if (reindexed.errors.length > 0) {
+                    ctx.ui.notify(
+                        `agent-memory: ${reindexed.errors.length} note(s) not indexed — ${summariseErrors(reindexed.errors)}`,
+                        'warning'
+                    )
+                }
             } catch (err) {
                 warn('reindex', `reindex failed: ${message(err)}`)
             }
@@ -197,6 +207,9 @@ export default function agentMemoryExtension(
     }
 }
 
-function message(err: unknown): string {
-    return err instanceof Error ? err.message : String(err)
+/** Up to three `path: reason` pairs; `/memory index` prints the whole list. */
+function summariseErrors(errors: ReindexError[]): string {
+    const shown = errors.slice(0, 3).map(error => `${error.path}: ${error.reason}`)
+    const rest = errors.length - shown.length
+    return rest > 0 ? `${shown.join('; ')}; +${rest} more (/memory index)` : shown.join('; ')
 }

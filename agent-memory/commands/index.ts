@@ -28,18 +28,20 @@ import { logUserAccess } from '../gate/gate.ts'
 import { pairAttempts, readLog, type LogEntry, type PairedAttempt } from '../gate/log.ts'
 import { cacheIndexBlock } from '../inject/index-block.ts'
 import { listNotes, rebuildIndex } from '../index/notes.ts'
+import { message } from '../store/errors.ts'
 import { parseNote } from '../store/frontmatter.ts'
 import { withFileLock } from '../store/git.ts'
 import { normalizeKey } from '../store/keys.ts'
 import { resolveScope } from '../store/notes.ts'
 import { repoLockPath } from '../store/paths.ts'
+import { toPosix } from '../store/walk.ts'
 import type { Store } from '../store/store.ts'
 import {
     type Embedder,
     type MemoryDeps,
     memorySearch,
     scopeLabel,
-    scopeOverview,
+    scopesOverview,
 } from '../tools/definitions.ts'
 
 /** The exact AGENTS.md line `/memory import` tells the user to remove (§1, §10). */
@@ -162,6 +164,8 @@ interface IndexReport {
     scanned: number
     updated: number
     skipped: number
+    /** Rows dropped because their note file is gone (F6). */
+    removed: number
     errors: Array<{ path: string; reason: string }>
 }
 
@@ -194,15 +198,22 @@ async function runIndex(
 
     const verb = rebuild ? 'rebuilt' : 'indexed'
     lines.push(
-        `${verb}: scanned ${report.scanned}, updated ${report.updated}, skipped ${report.skipped}, errors ${report.errors.length}`
+        `${verb}: scanned ${report.scanned}, updated ${report.updated}, skipped ${report.skipped}, errors ${report.errors.length}, removed ${report.removed}`
     )
     for (const error of report.errors) lines.push(`  ${error.path}: ${error.reason}`)
     return lines.join('\n')
 }
 
 function rebuildReport(store: Store): IndexReport {
-    const scanned = rebuildIndex(store.root, store.db)
-    return { scanned, updated: scanned, skipped: 0, errors: [] }
+    const rebuilt = rebuildIndex(store.root, store.db)
+    // A rebuild replaces the table outright, so nothing can be left over to remove.
+    return {
+        scanned: rebuilt.indexed + rebuilt.errors.length,
+        updated: rebuilt.indexed,
+        skipped: 0,
+        removed: 0,
+        errors: rebuilt.errors,
+    }
 }
 
 /**
@@ -285,7 +296,7 @@ async function runSearch(
     // Same path as the tool (§4): gated rows are excluded in SQL before ranking, so
     // there is no gated result for a command to gate afterwards.
     const result = await memorySearch(deps, { query })
-    const overview = scopeOverview(deps)
+    const overview = scopesOverview(deps)
     if (overview.gated === 0) return result.text
     const note = `${overview.gated} gated note${overview.gated === 1 ? '' : 's'} withheld; /memory show --gated lists them`
     return `${result.text}\n(${note})`
@@ -336,6 +347,8 @@ function lastTimestamp(pair: PairedAttempt): number {
 function toLogRow(pair: PairedAttempt): LogRow {
     const first: LogEntry = pair.pending ?? pair.lines[0] ?? { op: 'rotate' }
     const resolver = pair.resolver
+    // A mention line is terminal on arrival (`inject`/`skip`) and has no pending
+    // counterpart, so it renders as one row from `first` and never as unresolved.
     const decision = pair.unresolved
         ? 'pending (unresolved)'
         : (resolver?.decision ?? first.decision ?? '-')
@@ -348,12 +361,20 @@ function toLogRow(pair: PairedAttempt): LogRow {
             pair.unresolved ? `!${time}` : time,
             first.op ?? '-',
             first.initiator ?? '-',
-            first.key ?? (first.op === 'rotate' ? '(rotated)' : '-'),
+            keyCell(first),
             String(decision),
             String(result),
             truncate(first.reason ?? '-', 40),
         ],
     }
+}
+
+/** A mention line names the suggested keys instead of one accessed key. */
+function keyCell(entry: LogEntry): string {
+    if (entry.keys !== undefined && entry.keys.length > 0)
+        return truncate(entry.keys.join(', '), 60)
+    if (entry.key !== undefined) return entry.key
+    return entry.op === 'rotate' ? '(rotated)' : '-'
 }
 
 function renderTable(rows: readonly LogRow[]): string {
@@ -688,12 +709,4 @@ function isDirectory(target: string): boolean {
 function truncate(text: string, limit: number): string {
     if (text.length <= limit) return text
     return `${text.slice(0, limit - 1)}…`
-}
-
-function toPosix(relPath: string): string {
-    return relPath.split(path.sep).join('/')
-}
-
-function message(err: unknown): string {
-    return err instanceof Error ? err.message : String(err)
 }

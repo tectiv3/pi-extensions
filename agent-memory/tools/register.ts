@@ -71,7 +71,7 @@ const SCOPE: JsonSchema = {
     type: 'string',
     enum: ['project', 'global'],
     description:
-        "'project' or 'global'. Omit for the default: the current project when the working directory is a git repository, otherwise global.",
+        "'project' or 'global'. Omit to cover both: project notes rank first, global notes remain discoverable, and a read falls back to global when the key is not in the project. A working directory outside a git repository has only global.",
 }
 
 const REASON: JsonSchema = {
@@ -142,7 +142,9 @@ export function registerMemoryTools(
                 limit: {
                     type: 'number',
                     minimum: 1,
-                    description: 'Maximum results (default 10).',
+                    maximum: 50,
+                    description:
+                        'Maximum results, 1-50. Omit for the default of 10; a value below 1 or above 50 is clamped into range.',
                 },
             },
             ['query']
@@ -162,7 +164,7 @@ export function registerMemoryTools(
         name: 'memory_read',
         label: 'Memory Read',
         description:
-            'Read one memory note by key (without frontmatter). A gated note asks the user first and needs `reason`.',
+            'Read one memory note by key (without frontmatter). With `scope` omitted a project note wins and a global note of the same key is the fallback. A gated note asks the user first and needs `reason`.',
         executionMode: 'parallel',
         parameters: params({ key: KEY, scope: SCOPE, reason: REASON }, ['key']),
         async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -180,7 +182,7 @@ export function registerMemoryTools(
         name: 'memory_write',
         label: 'Memory Write',
         description:
-            'Create a note or fully replace its body. Returns a unified diff and the new hash. A gated note asks the user first and needs `reason`; `access` is preserved unless passed.',
+            'Create a note or fully replace its body. Returns a unified diff. A gated note asks the user first and needs `reason`; `access` is preserved unless passed.',
         // Mutations serialize: two writes in one turn must not race on the repo lock.
         executionMode: 'sequential',
         parameters: params(
@@ -197,7 +199,7 @@ export function registerMemoryTools(
                 baseHash: {
                     type: 'string',
                     description:
-                        'Hash from a previous read/write. Supplied and stale → the write is rejected.',
+                        'Hash from a previous read. Supplied and stale → the write is rejected.',
                 },
                 reason: REASON,
             },

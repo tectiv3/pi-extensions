@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -84,16 +85,9 @@ function logEntries(root: string): LogEntry[] {
         .map(line => JSON.parse(line) as LogEntry)
 }
 
-/** The `pending` lines of mention decisions, with their resolvers paired by attempt. */
-function searchDecisions(root: string): { pending: LogEntry; resolver?: LogEntry }[] {
-    const entries = logEntries(root)
-    const pending = entries.filter(entry => entry.op === 'search')
-    return pending.map(line => ({
-        pending: line,
-        resolver: entries.find(
-            entry => entry.attempt === line.attempt && entry.decision !== 'pending'
-        ),
-    }))
+/** §6.2's mention decisions, newest last. One line per decision, no attempt pairing. */
+function mentionLines(root: string): LogEntry[] {
+    return logEntries(root).filter(entry => entry.op === 'mention')
 }
 
 // ---------------------------------------------------------------------------
@@ -195,9 +189,23 @@ test('a message with no searchable words runs no query at all', t => {
     assert.equal(result.injected, false)
     assert.equal(result.reason, 'no-query')
     assert.equal(result.n, 0)
-    const logged = searchDecisions(root)
-    assert.equal(logged.length, 1, 'the skip was not logged')
-    assert.equal(logged[0].resolver?.decision, 'declined')
+    const logged = mentionLines(root)
+    assert.equal(logged.length, 1, 'a skip must be exactly one line')
+    assert.equal(logged[0].decision, 'skip')
+    assert.equal(logged[0].reason, 'no-query')
+    // Telemetry, not consent: no pending line and no resolver may be invented for it.
+    assert.equal(logged[0].attempt, undefined)
+    assert.deepEqual(
+        logEntries(root).filter(entry => entry.decision === 'pending'),
+        [],
+        'a rule decision must not write a pending line'
+    )
+    assert.ok(
+        logEntries(root).every(
+            entry => entry.decision !== 'approved' && entry.decision !== 'declined'
+        ),
+        'nobody was asked, so no consent decision may be logged'
+    )
 })
 
 test('a query that matches nothing is logged as no-match with n = 0', t => {
@@ -214,40 +222,47 @@ test('a query that matches nothing is logged as no-match with n = 0', t => {
 // logging (§6.2: "so F can be retuned from data")
 // ---------------------------------------------------------------------------
 
-test('every decision is logged with top1, m10, n and an outcome', t => {
+test('every decision is logged as one mention line with top1, m10, n and an outcome', t => {
     const { root, store, cwd } = seedCorpus(t)
 
     const inject = detectMentions(store, 'grafana', { cwd })
     const skip = detectMentions(store, 'common', { cwd })
 
-    // Two lines per decision: pending (the inputs) and a resolver (the outcome).
-    const pairs = searchDecisions(root)
-    assert.equal(pairs.length, 2)
-    assert.equal(logEntries(root).length, 4)
-    for (const { pending: line } of pairs) {
+    // One terminal line per decision: no `pending`, no resolver, no attempt id.
+    const lines = mentionLines(root)
+    assert.equal(lines.length, 2)
+    assert.equal(logEntries(root).length, 2, 'a mention decision is a single line')
+    for (const line of lines) {
+        assert.equal(line.op, 'mention')
         assert.equal(line.initiator, 'agent')
+        assert.equal(line.attempt, undefined)
         assert.equal(typeof line.top1, 'number')
         assert.equal(typeof line.m10, 'number')
         assert.equal(typeof line.n, 'number')
-        assert.equal(typeof line.injected, 'boolean')
         assert.equal(typeof line.reason, 'string')
         assert.equal(line.scope, 'global')
     }
-    const [first, second] = pairs
-    assert.equal(first.pending.top1, Math.round(inject.top1 * 1e4) / 1e4)
-    assert.equal(first.pending.m10, Math.round(inject.m10 * 1e4) / 1e4)
-    assert.equal(first.pending.n, inject.n)
-    assert.equal(first.pending.injected, true)
-    assert.equal(first.pending.reason, 'injected')
-    assert.equal(second.pending.injected, false)
-    assert.equal(second.pending.reason, 'idf-clamp')
 
-    // The resolver shares the attempt id and records the outcome.
-    assert.equal(first.resolver?.decision, 'approved')
-    assert.equal(first.resolver?.result, 'ok')
-    assert.equal(second.resolver?.decision, 'declined')
-    assert.equal(second.resolver?.result, undefined, 'nothing was attempted on a skip')
+    const [first, second] = lines
+    assert.equal(first.decision, 'inject')
+    assert.deepEqual(first.keys, inject.keys)
+    assert.deepEqual(first.keys, ['notes/topic07'])
+    assert.equal(first.top1, Math.round(inject.top1 * 1e4) / 1e4)
+    assert.equal(first.m10, Math.round(inject.m10 * 1e4) / 1e4)
+    assert.equal(first.n, inject.n)
+    assert.equal(first.reason, 'injected')
+
+    assert.equal(second.decision, 'skip')
+    assert.equal(second.keys, undefined, 'a skip suggested no keys')
+    assert.equal(second.reason, 'idf-clamp')
     assert.equal(skip.reason, 'idf-clamp')
+
+    // Writing the same decision twice must not look like an approved/declined pair.
+    for (const line of lines) {
+        assert.notEqual(line.decision, 'approved')
+        assert.notEqual(line.decision, 'declined')
+        assert.notEqual(line.decision, 'pending')
+    }
 })
 
 // ---------------------------------------------------------------------------
@@ -382,17 +397,17 @@ test('the same message is detected and logged once per distinct text', t => {
     installMentionHook(pi.api, store)
 
     // The `context` hook fires before every LLM request, so a long turn asks the same
-    // question many times; the decision (and its two log lines) must not repeat.
+    // question many times; the decision (and its single log line) must not repeat.
     pi.emit('context', { type: 'context', messages: conversation('grafana') }, { cwd })
     pi.emit('context', { type: 'context', messages: conversation('grafana') }, { cwd })
-    assert.equal(searchDecisions(root).length, 1, 'the repeated request was logged again')
+    assert.equal(mentionLines(root).length, 1, 'the repeated request was logged again')
 
     pi.emit(
         'context',
         { type: 'context', messages: conversation('grafana shared widget') },
         { cwd }
     )
-    assert.equal(searchDecisions(root).length, 2)
+    assert.equal(mentionLines(root).length, 2)
 })
 
 test('the hook tolerates a store that has not opened yet', () => {
@@ -406,4 +421,106 @@ test('the hook tolerates a store that has not opened yet', () => {
         undefined
     )
     assert.deepEqual(messages, before)
+})
+
+// ---------------------------------------------------------------------------
+// both tiers (§5.1, F3) and the cache key (F12)
+// ---------------------------------------------------------------------------
+
+function makeRepo(t: TestContext): string {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-memory-mention-repo-'))
+    t.after(() => fs.rmSync(repo, { recursive: true, force: true }))
+    const init = spawnSync('git', ['init', '--quiet', '-b', 'main'], {
+        cwd: repo,
+        encoding: 'utf8',
+        timeout: 10_000,
+    })
+    assert.equal(init.status, 0, `git init failed: ${init.stderr}`)
+    return repo
+}
+
+/** A store whose root is fresh and whose note operations resolve against `cwd`. */
+function openStoreAt(t: TestContext, cwd: string): { store: Store; root: string } {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-memory-mention-store-'))
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    const saved = process.env.PI_MEMORY_DIR
+    process.env.PI_MEMORY_DIR = root
+    t.after(() => {
+        if (saved === undefined) delete process.env.PI_MEMORY_DIR
+        else process.env.PI_MEMORY_DIR = saved
+    })
+    const store = openStore(cwd)
+    t.after(() => store.close())
+    return { store, root }
+}
+
+/**
+ * `quokka` in two of eight notes, one per tier. Both tiers matching the same word is
+ * not enough on its own: §6.2's IDF clamp collapses the score when a term appears in
+ * half the corpus, so the fillers are what make this a *scored* match.
+ */
+async function seedQuokkaCorpus(
+    store: Store,
+    options: { globalNote?: boolean } = {}
+): Promise<void> {
+    for (let index = 0; index < 6; index++) {
+        const filler = await store.writeNote({
+            key: `filler/${index}`,
+            body: `filler note number ${index} about nothing`,
+            scope: 'global',
+        })
+        assert.equal(filler.ok, true)
+    }
+    const project = await store.writeNote({
+        key: 'project/quokka',
+        body: 'quokka quokka marsupial',
+        scope: 'project',
+    })
+    assert.equal(project.ok, true)
+    if (options.globalNote === false) return
+    const global = await store.writeNote({
+        key: 'global/quokka',
+        body: 'quokka quokka marsupial',
+        scope: 'global',
+    })
+    assert.equal(global.ok, true)
+}
+
+test('a global note is a mention candidate from inside a repository', async t => {
+    const repo = makeRepo(t)
+    const { store } = openStoreAt(t, repo)
+    await seedQuokkaCorpus(store)
+
+    // F is a per-store tuning constant (§6.2). The tier behaviour is what this test
+    // pins, not the threshold, so the floor is lowered rather than re-tuning the
+    // corpus to clear it.
+    const result = detectMentions(store, 'quokka', { cwd: repo, floor: 1 })
+
+    assert.equal(result.injected, true)
+    assert.equal(result.n, 2, 'the global note must be a candidate inside a repository')
+    assert.ok(result.keys.includes('project/quokka'))
+    assert.ok(result.keys.includes('global/quokka'))
+})
+
+test('the mention cache does not carry into a session in another project', async t => {
+    const repoA = makeRepo(t)
+    const repoB = makeRepo(t)
+    const { store } = openStoreAt(t, repoA)
+    // No global note: repoB must have nothing to find, so an appended key there can
+    // only come from the cache.
+    await seedQuokkaCorpus(store, { globalNote: false })
+
+    const pi = fakePi()
+    installMentionHook(pi.api, store, { floor: 1 })
+
+    const first = conversation('quokka')
+    pi.emit('context', { type: 'context', messages: first }, { cwd: repoA })
+    assert.match(String(first[2].content), /possibly relevant memories: project\/quokka/)
+
+    // The same first message in a new session whose cwd is another project: the cached
+    // keys belong to repoA and must not be reused for repoB.
+    const second = conversation('quokka')
+    const before = structuredClone(second)
+    pi.emit('context', { type: 'context', messages: second }, { cwd: repoB })
+    assert.deepEqual(second, before, "the previous project's suggestion leaked")
 })

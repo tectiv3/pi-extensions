@@ -26,6 +26,7 @@ import {
     transaction,
     writeVector,
 } from '../index/notes.ts'
+import { message } from '../store/errors.ts'
 import type { EmbedJob } from '../store/notes.ts'
 import type { Store } from '../store/store.ts'
 import { embedderAvailable } from './cli.ts'
@@ -113,9 +114,20 @@ export function createEmbedWorker(options: EmbedWorkerOptions): EmbedWorker {
     const timer = setInterval(() => {
         if (stopped || tickQueued || queue.size === 0) return
         tickQueued = true
-        void enqueueRun().finally(() => {
-            tickQueued = false
-        })
+        // Every run carries a deadline, the interval's included: a tick without one
+        // loops until the queue is empty, and `stop` chains its bounded drain behind
+        // whatever is in flight — which is how `stop(2000)` took 4 s (F4). Four
+        // intervals is long enough to make progress and short enough to bound the wait.
+        void enqueueRun(Date.now() + intervalMs * 4).then(
+            () => {
+                tickQueued = false
+            },
+            () => {
+                // `processQueue` catches everything today; a rejected run must still
+                // clear the flag rather than become an unhandled rejection.
+                tickQueued = false
+            }
+        )
     }, intervalMs)
     // A worker must never be the reason a process stays alive; `stop` is explicit.
     timer.unref?.()
@@ -244,7 +256,7 @@ export function createEmbedWorker(options: EmbedWorkerOptions): EmbedWorker {
                         entry.job.key
                     )
                     if (current === null || current.body_hash !== entry.job.bodyHash) return
-                    writeVector(store.db, current.id, vector)
+                    writeVector(store.db, current.id, vector, entry.job.bodyHash)
                 })
             } catch (err) {
                 lastError = message(err)
@@ -254,7 +266,10 @@ export function createEmbedWorker(options: EmbedWorkerOptions): EmbedWorker {
 
     function currentStats(): WorkerStats {
         return {
-            available: unavailable ? false : probed ? true : isAvailable(),
+            // Deliberately non-probing: `stats()` is a getter, and the real probe is a
+            // `spawnSync` that can also clear the timer. Before the first run the
+            // probe has not happened, so "unavailable" is the honest report.
+            available: !unavailable && probed,
             processed,
             queued: queue.size,
             ...(lastError === undefined ? {} : { lastError }),
@@ -338,8 +353,4 @@ export function backfill(store: Store, worker: EmbedWorker): number {
         })
     }
     return rows.length
-}
-
-function message(err: unknown): string {
-    return err instanceof Error ? err.message : String(err)
 }

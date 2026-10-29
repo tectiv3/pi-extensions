@@ -389,6 +389,35 @@ test('dirtyNotePaths finds note states and ignores store artefacts', t => {
     ])
 })
 
+test('a delete that crashed before `git add` is swept (F5)', t => {
+    const root = makeStore(t)
+    writeNote(root, 'global/doomed.md', 'to be deleted\n')
+    withRepoLock(root, () => {
+        assert.equal(
+            commitPath(root, 'global/doomed.md', 'memory: create doomed').status,
+            'committed'
+        )
+    })
+
+    // `deleteNote` unlinks first and commits second; a crash between them leaves
+    // porcelain ` D` — delete in the worktree, nothing staged.
+    fs.unlinkSync(path.join(root, 'global/doomed.md'))
+    assert.match(runGit(root, ['status', '--porcelain']).stdout, /^ D global\/doomed\.md$/m)
+    assert.deepEqual(dirtyNotePaths(root), ['global/doomed.md'])
+
+    assert.deepEqual(sweepUncommitted(root), { committed: ['global/doomed.md'] })
+    assert.equal(
+        runGit(root, ['log', '-1', '--pretty=%s']).stdout.trim(),
+        'memory: recover uncommitted'
+    )
+    assert.equal(
+        runGit(root, ['status', '--porcelain']).stdout.trim(),
+        '',
+        'the worktree must be clean after the sweep'
+    )
+    assert.notEqual(runGit(root, ['cat-file', '-e', 'HEAD:global/doomed.md']).status, 0)
+})
+
 test('sweepUncommitted commits leftover notes once, then no-ops', t => {
     const root = makeStore(t)
     assert.deepEqual(sweepUncommitted(root), { committed: [] })

@@ -39,6 +39,10 @@ export type LogResult = 'ok' | `failed:${CommitFailureClass}`
  * One log line. Three shapes share this type — the `pending` line (everything
  * set), the resolver line (`attempt`/`decision`/`result` only) and the rotate
  * marker (`op` only) — so every field except the line's own shape is optional.
+ *
+ * `top1`/`m10`/`n`/`injected`/`reason` belong to mention detection (§6.2), which logs
+ * its threshold inputs so `F` can be retuned from data. They are absent on every
+ * gated line.
  */
 export interface LogEntry {
     ts?: string
@@ -53,6 +57,14 @@ export interface LogEntry {
     key?: string
     session?: string
     reason?: string
+    /** `|bm25|` of the best mention candidate. */
+    top1?: number
+    /** Median `|bm25|` of the top 10 candidates. */
+    m10?: number
+    /** Candidate count in the mention window. */
+    n?: number
+    /** Whether §6.2's rule appended keys to the outgoing message. */
+    injected?: boolean
 }
 
 /** §5: the tool parameter is capped at 500 chars. */

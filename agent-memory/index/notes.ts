@@ -205,6 +205,10 @@ export function getNoteByKey(
     )
 }
 
+export function getNoteById(db: DatabaseSync, id: number): NoteRow | null {
+    return oneRow<NoteRow>(db, 'SELECT * FROM notes WHERE id = ?', [id])
+}
+
 export function listNotes(db: DatabaseSync, filter: NoteFilter = {}): NoteRow[] {
     const where = filterSql('', filter)
     return allRows<NoteRow>(

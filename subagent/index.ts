@@ -13,7 +13,7 @@
  * accepts JSON-line commands (initial task, steer, abort).
  */
 
-import { spawn, type ChildProcess } from 'node:child_process'
+import type { ChildProcess } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import * as fs from 'node:fs'
@@ -46,6 +46,7 @@ import {
 } from '@earendil-works/pi-tui'
 import { Type } from 'typebox'
 import { type AgentConfig, type AgentScope, discoverAgents } from './agents.ts'
+import { spawnChild } from './child-env.ts'
 import {
     advanceSessionEpoch,
     currentSessionEpoch,
@@ -2187,11 +2188,7 @@ async function runSingleAgent(
         const exitCodePromise = new Promise<number>(resolve => {
             const invocation = getPiInvocation(args)
             debug(`spawn: ${invocation.command} ${invocation.args.join(' ')}`)
-            const proc = spawn(invocation.command, invocation.args, {
-                cwd: resolvedCwd,
-                shell: false,
-                stdio: ['pipe', 'pipe', 'pipe'],
-            })
+            const proc = spawnChild(invocation.command, invocation.args, resolvedCwd)
             debug(`pid: ${proc.pid ?? 'none'}`)
             if (proc.pid !== undefined) {
                 try {

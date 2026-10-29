@@ -568,6 +568,21 @@ key):
 **Consent and outcome are separate fields.** `decision` records what the user decided; `result` records
 whether the mutation landed. Without that split, `approved` implies success it cannot know about.
 
+**An approved-then-failed mutation is three lines**, because JSONL is append-only and the gate cannot
+know at approval time whether the write will succeed:
+
+```
+pending → approved/ok → approved/failed:other
+```
+
+`pairAttempts` treats the **last terminal line** as authoritative. Success is two lines; a failed
+post-approval mutation is three, and its final `result` is what matters. `result` is **absent** for
+`declined`, `denied-no-ui`, `blocked-subagent`, and `error` — nothing was attempted, so `ok` would be a
+false statement.
+
+`initiator: "user"` lines carry an `attempt` id but no `pending` predecessor, so pairing yields
+`pending: null` and the user line as the resolver.
+
 A `pending` with no resolver means the process died mid-confirm — deliberately better than no record.
 The resolver is written in a `finally`, so an approved-but-failed mutation still resolves its attempt;
 without that, `approved` would be indistinguishable from a crash.

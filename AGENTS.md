@@ -7,6 +7,7 @@ pi coding-agent extensions (TypeScript, run inside the pi process):
 | `subagent/` | Subagent tool — delegates tasks to specialized agents with isolated context (single, parallel, chain modes). See `subagent/README.md`. |
 | `ask-user-question/` | Structured question tool — single- and multi-question prompts with typed answers (tabbed per-question pages, `allowOther` "Type something" option). |
 | `index/` | Index tool — spawns the shared `idx` binary for maki-style file skeletons and directory listings. |
+| `notify/` | Desktop notifications — emits OSC 777/OSC 9 when the agent settles, errors, or waits on a prompt. See `notify/README.md`. |
 | `simplify/` | `/simplify` command — reviews changed code (unpushed + uncommitted by default) within changed line ranges. |
 | `smart-fold/` | Transcript compaction — folds thinking, hides collapsed `bash` output, keeps `read`/`write` previews, adds `+N -M` stats to write/edit rows. Vendored from `@clapecho233/pi-smart-fold` (MIT), config persistence stripped, collapsed-row behaviour retuned. |
 

@@ -215,6 +215,16 @@ export default function askUserQuestion(pi: ExtensionAPI) {
                 allowOther: q.allowOther !== false,
             }))
 
+            // Payload for the notify extension, which fires on ui_prompt_start.
+            // The dialog opens right after this, so the body must be known here.
+            const firstQuestion = questions[0]
+            const attentionBody = (
+                firstQuestion?.prompt ||
+                firstQuestion?.label ||
+                'Question'
+            ).split(/\r?\n/)[0]
+            pi.events.emit('notify:attention', { title: 'Question', body: attentionBody })
+
             const rc = rcRemote()
             if (rc && rc.askAvailable()) {
                 const answers =

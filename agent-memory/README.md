@@ -38,7 +38,7 @@ the exact text is always available from the command that makes it obsolete.
 | `memory_index(scope?)` | Lists keys in scope with the first line of each body; gated notes appear only as `gated: N hidden`. |
 | `memory_search(query, scope?, limit?)` | BM25 + vector search fused with RRF (default 10 results); gated notes are excluded in SQL. |
 | `memory_read(key, scope?, reason?)` | Reads one note's body (frontmatter stripped). Gated → confirm + log. |
-| `memory_write(key, body, scope?, access?, baseHash?, reason?)` | Creates or fully replaces a note; returns a unified diff and the new hash. |
+| `memory_write(key, body, scope?, access?, baseHash?, reason?)` | Creates or fully replaces a note; returns a unified diff. |
 | `memory_edit(key, oldText, newText, baseHash, scope?, reason?)` | Exact-text replacement. Rejected when `oldText` matches twice, touches frontmatter, or `baseHash` is stale. |
 | `memory_delete(key, scope?, reason?)` | Deletes the file and its index rows; git history keeps the content. |
 

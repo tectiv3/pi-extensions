@@ -182,7 +182,7 @@ export function registerMemoryTools(
         name: 'memory_write',
         label: 'Memory Write',
         description:
-            'Create a note or fully replace its body. Returns a unified diff and the new hash. A gated note asks the user first and needs `reason`; `access` is preserved unless passed.',
+            'Create a note or fully replace its body. Returns a unified diff. A gated note asks the user first and needs `reason`; `access` is preserved unless passed.',
         // Mutations serialize: two writes in one turn must not race on the repo lock.
         executionMode: 'sequential',
         parameters: params(
@@ -199,7 +199,7 @@ export function registerMemoryTools(
                 baseHash: {
                     type: 'string',
                     description:
-                        'Hash from a previous read/write. Supplied and stale → the write is rejected.',
+                        'Hash from a previous read. Supplied and stale → the write is rejected.',
                 },
                 reason: REASON,
             },

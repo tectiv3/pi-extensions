@@ -324,6 +324,7 @@ declare module 'typebox' {
         default?: unknown
         minimum?: number
         minItems?: number
+        additionalProperties?: boolean
     }
     interface TSchema {}
     export const Type: {

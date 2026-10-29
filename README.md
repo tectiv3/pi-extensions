@@ -3,7 +3,7 @@
 pi coding-agent extensions, TypeScript, loaded directly by pi (no build step).
 
 - **`subagent/`** — subagent tool: delegates tasks to specialized agents with isolated context
-  windows. Single, parallel, and chain modes; persistence and resume of interrupted runs;
+  windows. Single and chain modes; persistence and resume of interrupted runs;
   background runs with notifications; live attach and steering of running subagents.
 - **`ask-user-question/`** — structured question tool: single- and multi-question prompts with
   typed option pages, tabbed navigation for multiple questions, `allowOther` free-text option,
@@ -40,8 +40,8 @@ pi coding-agent extensions, TypeScript, loaded directly by pi (no build step).
 **`subagent/`** is a fork of the
 [subagent example](https://github.com/earendil-works/pi-mono/tree/main/packages/coding-agent/examples/extensions/subagent)
 from pi-mono, extended well beyond it. The example provides: isolated subprocess per
-subagent, streaming output, parallel streaming, markdown rendering, per-agent usage tracking,
-Ctrl+C abort propagation. Added here:
+subagent, streaming output, markdown rendering, per-agent usage tracking,
+Ctrl+C abort propagation (the parallel mode the example shipped was removed here). Added here:
 
 - **Persistence & resume** — interrupted or failed runs persist under `~/.pi/agent/subagents/`
   with a subagent id; `resume: "<id>"` continues a persisted run in the same conversation.

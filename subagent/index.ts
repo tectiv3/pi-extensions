@@ -4,9 +4,8 @@
  * Spawns a separate `pi` process for each subagent invocation,
  * giving it an isolated context window.
  *
- * Supports three modes:
+ * Supports two modes:
  *   - Single: { agent: "name", task: "..." }
- *   - Parallel: { tasks: [{ agent: "name", task: "..." }, ...] }
  *   - Chain: { chain: [{ agent: "name", task: "... {previous} ..." }, ...] }
  *
  * Runs children in RPC mode: stdout streams structured events while stdin
@@ -53,8 +52,6 @@ import {
     isCurrentSessionRun,
 } from './session-epoch.ts'
 
-const MAX_PARALLEL_TASKS = 8
-const MAX_CONCURRENCY = 4
 // A child turn is stdio-silent until the model emits its first token. Local
 // LLM providers can take >120s to reach that token on a large context or a
 // contended server, so the default is generous rather than "fast kill". Tune
@@ -784,7 +781,7 @@ interface SingleResult {
 }
 
 interface SubagentDetails {
-    mode: 'single' | 'parallel' | 'chain'
+    mode: 'single' | 'chain'
     agentScope: AgentScope
     projectAgentsDir: string | null
     results: SingleResult[]
@@ -839,18 +836,6 @@ function isFailedResult(result: SingleResult): boolean {
     )
 }
 
-function getResultOutput(result: SingleResult): string {
-    if (isFailedResult(result)) {
-        return (
-            result.errorMessage ||
-            result.stderr ||
-            getFinalOutput(result.messages) ||
-            '(no output)'
-        )
-    }
-    return getFinalOutput(result.messages) || '(no output)'
-}
-
 function sessionArtifactsPersisted(result: SingleResult): boolean {
     if (!result.subagentId) return false
     const { session, meta } = getSubagentFilePaths(result.subagentId)
@@ -883,17 +868,6 @@ function formatFailureReport(result: SingleResult): string {
     return lines.join('\n\n')
 }
 
-function truncateParallelOutput(output: string): string {
-    const byteLength = Buffer.byteLength(output, 'utf8')
-    if (byteLength <= PER_TASK_OUTPUT_CAP) return output
-
-    let truncated = output.slice(0, PER_TASK_OUTPUT_CAP)
-    while (Buffer.byteLength(truncated, 'utf8') > PER_TASK_OUTPUT_CAP) {
-        truncated = truncated.slice(0, -1)
-    }
-    return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, 'utf8')} bytes omitted. Full output preserved in tool details.]`
-}
-
 type DisplayItem =
     | { type: 'text'; text: string }
     | { type: 'toolCall'; name: string; args: Record<string, any> }
@@ -914,26 +888,6 @@ function getDisplayItems(messages: Message[]): DisplayItem[] {
         }
     }
     return items
-}
-
-async function mapWithConcurrencyLimit<TIn, TOut>(
-    items: TIn[],
-    concurrency: number,
-    fn: (item: TIn, index: number) => Promise<TOut>
-): Promise<TOut[]> {
-    if (items.length === 0) return []
-    const limit = Math.max(1, Math.min(concurrency, items.length))
-    const results: TOut[] = new Array(items.length)
-    let nextIndex = 0
-    const workers = new Array(limit).fill(null).map(async () => {
-        while (true) {
-            const current = nextIndex++
-            if (current >= items.length) return
-            results[current] = await fn(items[current], current)
-        }
-    })
-    await Promise.all(workers)
-    return results
 }
 
 async function writePromptToTempFile(
@@ -2043,7 +1997,7 @@ async function runSingleAgent(
     let model: string | undefined
     let thinkingLevel: ThinkingLevel | undefined
     let resumeNote: string | undefined
-    // Per-item tasks/chain models bypass the top-level guard, so normalize here to
+    // Per-item chain models bypass the top-level guard, so normalize here to
     // keep an empty string from winning the ?? chain or reaching spawnMeta/resumeNote.
     const override = overrideModel && overrideModel.trim() !== '' ? overrideModel : undefined
     if (resume) {
@@ -3382,26 +3336,8 @@ async function openSubagentInspectView(
     })
 }
 
-// The typebox stub exposes no Static<typeof Schema>, so the parallel dispatch loop
-// declares the item shape it receives from params.tasks.
-type DispatchItem = {
-    agent: string
-    task: string
-    cwd?: string
-    model?: string
-}
-
 const MODEL_OVERRIDE_DESCRIPTION =
     "Model override for this dispatch, 'provider/model-id'. Precedence: explicit > agent file pin > parent session default."
-
-const TaskItem = Type.Object({
-    agent: Type.String({ description: 'Name of the agent to invoke' }),
-    task: Type.String({ description: 'Task to delegate to the agent' }),
-    cwd: Type.Optional(
-        Type.String({ description: 'Working directory for the agent process' })
-    ),
-    model: Type.Optional(Type.String({ description: MODEL_OVERRIDE_DESCRIPTION })),
-})
 
 const ChainItem = Type.Object({
     agent: Type.String({ description: 'Name of the agent to invoke' }),
@@ -3420,52 +3356,52 @@ const AgentScopeSchema = StringEnum(['user', 'project', 'both'] as const, {
     default: 'user',
 })
 
-const SubagentParams = Type.Object({
-    agent: Type.Optional(
-        Type.String({
-            description: 'Name of the agent to invoke (for single mode)',
-        })
-    ),
-    task: Type.Optional(Type.String({ description: 'Task to delegate (for single mode)' })),
-    model: Type.Optional(Type.String({ description: MODEL_OVERRIDE_DESCRIPTION })),
-    resume: Type.Optional(
-        Type.String({
-            description:
-                'Id (exact or unique suffix) of a persisted subagent run to resume (single mode only)',
-        })
-    ),
-    background: Type.Optional(
-        Type.Boolean({
-            description:
-                'Single mode only. Return immediately; the child keeps running detached from parent Escape. ' +
-                'Completion arrives as a notification; fetch the result via subagent_collect { id }. ' +
-                'Do NOT wait for it: end your turn with a summary. Sleeping or polling only adds delay ' +
-                'on top of the notification, and subagent_collect on a running run returns immediately by design.',
-        })
-    ),
-    tasks: Type.Optional(
-        Type.Array(TaskItem, {
-            description: 'Array of {agent, task} for parallel execution',
-        })
-    ),
-    chain: Type.Optional(
-        Type.Array(ChainItem, {
-            description: 'Array of {agent, task} for sequential execution',
-        })
-    ),
-    agentScope: Type.Optional(AgentScopeSchema),
-    confirmProjectAgents: Type.Optional(
-        Type.Boolean({
-            description: 'Prompt before running project-local agents. Default: true.',
-            default: true,
-        })
-    ),
-    cwd: Type.Optional(
-        Type.String({
-            description: 'Working directory for the agent process (single mode)',
-        })
-    ),
-})
+const SubagentParams = Type.Object(
+    {
+        agent: Type.Optional(
+            Type.String({
+                description: 'Name of the agent to invoke (for single mode)',
+            })
+        ),
+        task: Type.Optional(
+            Type.String({ description: 'Task to delegate (for single mode)' })
+        ),
+        model: Type.Optional(Type.String({ description: MODEL_OVERRIDE_DESCRIPTION })),
+        resume: Type.Optional(
+            Type.String({
+                description:
+                    'Id (exact or unique suffix) of a persisted subagent run to resume (single mode only)',
+            })
+        ),
+        background: Type.Optional(
+            Type.Boolean({
+                description:
+                    'Single mode only. Return immediately; the child keeps running detached from parent Escape. ' +
+                    'Completion arrives as a notification; fetch the result via subagent_collect { id }. ' +
+                    'Do NOT wait for it: end your turn with a summary. Sleeping or polling only adds delay ' +
+                    'on top of the notification, and subagent_collect on a running run returns immediately by design.',
+            })
+        ),
+        chain: Type.Optional(
+            Type.Array(ChainItem, {
+                description: 'Array of {agent, task} for sequential execution',
+            })
+        ),
+        agentScope: Type.Optional(AgentScopeSchema),
+        confirmProjectAgents: Type.Optional(
+            Type.Boolean({
+                description: 'Prompt before running project-local agents. Default: true.',
+                default: true,
+            })
+        ),
+        cwd: Type.Optional(
+            Type.String({
+                description: 'Working directory for the agent process (single mode)',
+            })
+        ),
+    },
+    { additionalProperties: false }
+)
 
 const SubagentInspectParams = Type.Object({
     id: Type.String({
@@ -3523,13 +3459,13 @@ export default function (pi: ExtensionAPI) {
         label: 'Subagent',
         description: [
             'Delegate tasks to specialized subagents with isolated context.',
-            'Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).',
+            'Modes: single (agent + task), chain (sequential with {previous} placeholder).',
             'Resume: in single mode pass resume: <subagentId> to continue a persisted interrupted/failed run ' +
                 '(agent must match the original run).',
             `Default agent scope is "user" (from ${path.join(getAgentDir(), 'agents')}).`,
             `To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
             'Background: background: true (single mode only) returns immediately; the child keeps running and completion is reported via notification; fetch results with subagent_collect.',
-            'Model: model: "provider/model-id" overrides the agent file pin and the parent session default for that dispatch (single mode; per item in tasks/chain).',
+            'Model: model: "provider/model-id" overrides the agent file pin and the parent session default for that dispatch (single mode; per item in chain).',
         ].join(' '),
         parameters: SubagentParams,
 
@@ -3545,12 +3481,11 @@ export default function (pi: ExtensionAPI) {
             const confirmProjectAgents = params.confirmProjectAgents ?? true
 
             const hasChain = (params.chain?.length ?? 0) > 0
-            const hasTasks = (params.tasks?.length ?? 0) > 0
             const hasSingle = Boolean(params.agent && params.task)
-            const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle)
+            const modeCount = Number(hasChain) + Number(hasSingle)
 
             const makeDetails =
-                (mode: 'single' | 'parallel' | 'chain') =>
+                (mode: 'single' | 'chain') =>
                 (results: SingleResult[]): SubagentDetails => ({
                     mode,
                     agentScope,
@@ -3565,14 +3500,14 @@ export default function (pi: ExtensionAPI) {
                     content: [
                         {
                             type: 'text',
-                            text: `Invalid parameters. Provide exactly one mode.\nAvailable agents: ${available}`,
+                            text: `Invalid parameters. Provide exactly one mode: single (agent + task) or chain (chain array). The parallel mode (tasks) was removed.\nAvailable agents: ${available}`,
                         },
                     ],
                     details: makeDetails('single')([]),
                 }
             }
 
-            if (params.resume && (hasChain || hasTasks)) {
+            if (params.resume && hasChain) {
                 return {
                     content: [
                         {
@@ -3599,7 +3534,7 @@ export default function (pi: ExtensionAPI) {
                     isError: true,
                 }
             }
-            if (background && (hasChain || hasTasks)) {
+            if (background && hasChain) {
                 return {
                     content: [
                         {
@@ -3623,12 +3558,12 @@ export default function (pi: ExtensionAPI) {
                     isError: true,
                 }
             }
-            if (params.model !== undefined && (hasChain || hasTasks)) {
+            if (params.model !== undefined && hasChain) {
                 return {
                     content: [
                         {
                             type: 'text',
-                            text: 'model is single-mode only ({agent, task, model}); set model per item in tasks/chain.',
+                            text: 'model is single-mode only ({agent, task, model}); set model per item in the chain.',
                         },
                     ],
                     details: makeDetails('single')([]),
@@ -3645,8 +3580,6 @@ export default function (pi: ExtensionAPI) {
                 const requestedAgentNames = new Set<string>()
                 if (params.chain)
                     for (const step of params.chain) requestedAgentNames.add(step.agent)
-                if (params.tasks)
-                    for (const t of params.tasks) requestedAgentNames.add(t.agent)
                 if (params.agent) requestedAgentNames.add(params.agent)
 
                 const projectAgentsRequested = Array.from(requestedAgentNames)
@@ -3668,9 +3601,7 @@ export default function (pi: ExtensionAPI) {
                                     text: 'Canceled: project-local agents not approved.',
                                 },
                             ],
-                            details: makeDetails(
-                                hasChain ? 'chain' : hasTasks ? 'parallel' : 'single'
-                            )([]),
+                            details: makeDetails(hasChain ? 'chain' : 'single')([]),
                         }
                 }
             }
@@ -3746,122 +3677,6 @@ export default function (pi: ExtensionAPI) {
                         },
                     ],
                     details: makeDetails('chain')(results),
-                }
-            }
-
-            if (params.tasks && params.tasks.length > 0) {
-                if (params.tasks.length > MAX_PARALLEL_TASKS)
-                    return {
-                        content: [
-                            {
-                                type: 'text',
-                                text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
-                            },
-                        ],
-                        details: makeDetails('parallel')([]),
-                    }
-
-                // Track all results for streaming updates
-                const allResults: SingleResult[] = new Array(params.tasks.length)
-
-                // Initialize placeholder results
-                for (let i = 0; i < params.tasks.length; i++) {
-                    allResults[i] = {
-                        agent: params.tasks[i].agent,
-                        agentSource: 'unknown',
-                        task: params.tasks[i].task,
-                        subagentId: '',
-                        sessionPath: '',
-                        exitCode: -1, // -1 = still running
-                        messages: [],
-                        stderr: '',
-                        usage: {
-                            input: 0,
-                            output: 0,
-                            cacheRead: 0,
-                            cacheWrite: 0,
-                            cost: 0,
-                            contextTokens: 0,
-                            turns: 0,
-                        },
-                        cwd: params.tasks[i].cwd ?? ctx.cwd,
-                    }
-                }
-
-                const emitParallelUpdate = () => {
-                    if (onUpdate) {
-                        const running = allResults.filter(r => r.exitCode === -1).length
-                        const done = allResults.filter(r => r.exitCode !== -1).length
-                        onUpdate({
-                            content: [
-                                {
-                                    type: 'text',
-                                    text: `Parallel: ${done}/${allResults.length} done, ${running} running...`,
-                                },
-                            ],
-                            details: makeDetails('parallel')([...allResults]),
-                        })
-                    }
-                }
-
-                const results = await mapWithConcurrencyLimit(
-                    params.tasks,
-                    MAX_CONCURRENCY,
-                    async (t: DispatchItem, index) => {
-                        const result = await runSingleAgent(
-                            ctx.cwd,
-                            dispatchDefaults,
-                            agents,
-                            t.agent,
-                            t.task,
-                            t.cwd,
-                            undefined,
-                            signal,
-                            // Per-task update callback
-                            partial => {
-                                if (partial.details?.results[0]) {
-                                    allResults[index] = partial.details.results[0]
-                                    emitParallelUpdate()
-                                }
-                            },
-                            makeDetails('parallel'),
-                            undefined,
-                            undefined,
-                            relayUiRequest,
-                            toolCallId,
-                            false,
-                            false,
-                            t.model
-                        )
-                        allResults[index] = result
-                        emitParallelUpdate()
-                        return result
-                    }
-                )
-
-                const successCount = results.filter(r => !isFailedResult(r)).length
-                const abortedCount = results.filter(r => r.aborted === true).length
-                const headerText =
-                    `Parallel: ${successCount}/${results.length} succeeded` +
-                    (abortedCount > 0 ? `, ${abortedCount} aborted` : '')
-                const summaries = results.map(r => {
-                    const output = truncateParallelOutput(getResultOutput(r))
-                    const status = r.aborted
-                        ? 'aborted'
-                        : isFailedResult(r)
-                          ? `failed${r.stopReason && r.stopReason !== 'end' ? ` (${r.stopReason})` : ''}`
-                          : 'completed'
-                    const hint = isFailedResult(r) ? formatResumeHint(r) : null
-                    return `### [${r.agent}] ${status}\n\n${output}${hint ? `\n\n${hint}` : ''}`
-                })
-                return {
-                    content: [
-                        {
-                            type: 'text',
-                            text: `${headerText}\n\n${summaries.join('\n\n---\n\n')}`,
-                        },
-                    ],
-                    details: makeDetails('parallel')(results),
                 }
             }
 
@@ -4082,19 +3897,6 @@ export default function (pi: ExtensionAPI) {
                 }
                 if (args.chain.length > 3)
                     text += `\n  ${theme.fg('muted', `... +${args.chain.length - 3} more`)}`
-                return new Text(text, 0, 0)
-            }
-            if (args.tasks && args.tasks.length > 0) {
-                let text =
-                    theme.fg('toolTitle', theme.bold('subagent ')) +
-                    theme.fg('accent', `parallel (${args.tasks.length} tasks)`) +
-                    theme.fg('muted', ` [${scope}]`)
-                for (const t of args.tasks.slice(0, 3)) {
-                    const preview = t.task.length > 40 ? `${t.task.slice(0, 40)}...` : t.task
-                    text += `\n  ${theme.fg('accent', t.agent)}${theme.fg('dim', ` ${preview}`)}${t.model ? theme.fg('muted', ` model=${t.model}`) : ''}`
-                }
-                if (args.tasks.length > 3)
-                    text += `\n  ${theme.fg('muted', `... +${args.tasks.length - 3} more`)}`
                 return new Text(text, 0, 0)
             }
             const agentName = args.agent || '...'
@@ -4342,120 +4144,6 @@ export default function (pi: ExtensionAPI) {
                 return new Text(text, 0, 0)
             }
 
-            if (details.mode === 'parallel') {
-                const running = details.results.filter(r => r.exitCode === -1).length
-                const successCount = details.results.filter(
-                    r => r.exitCode !== -1 && !isFailedResult(r)
-                ).length
-                const failCount = details.results.filter(
-                    r => r.exitCode !== -1 && isFailedResult(r)
-                ).length
-                const isRunning = running > 0
-                const icon = isRunning
-                    ? theme.fg('warning', '⏳')
-                    : failCount > 0
-                      ? theme.fg('warning', '◐')
-                      : theme.fg('success', '✓')
-                const status = isRunning
-                    ? `${successCount + failCount}/${details.results.length} done, ${running} running`
-                    : `${successCount}/${details.results.length} tasks`
-
-                if (expanded && !isRunning) {
-                    const container = new Container()
-                    container.addChild(
-                        new Text(
-                            `${icon} ${theme.fg('toolTitle', theme.bold('parallel '))}${theme.fg('accent', status)}`,
-                            0,
-                            0
-                        )
-                    )
-
-                    for (const r of details.results) {
-                        const rIcon = isFailedResult(r)
-                            ? theme.fg('error', '✗')
-                            : theme.fg('success', '✓')
-                        const displayItems = getDisplayItems(r.messages)
-                        const finalOutput = getFinalOutput(r.messages)
-
-                        container.addChild(new Spacer(1))
-                        container.addChild(
-                            new Text(
-                                `${theme.fg('muted', '─── ') + theme.fg('accent', r.agent)} ${rIcon}`,
-                                0,
-                                0
-                            )
-                        )
-                        container.addChild(
-                            new Text(
-                                theme.fg('muted', 'Task: ') + theme.fg('dim', r.task),
-                                0,
-                                0
-                            )
-                        )
-
-                        // Show tool calls
-                        for (const item of displayItems) {
-                            if (item.type === 'toolCall') {
-                                container.addChild(
-                                    new Text(
-                                        theme.fg('muted', '→ ') +
-                                            formatToolCall(
-                                                item.name,
-                                                item.args,
-                                                theme.fg.bind(theme),
-                                                r.cwd
-                                            ),
-                                        0,
-                                        0
-                                    )
-                                )
-                            }
-                        }
-
-                        // Show final output as markdown
-                        if (finalOutput) {
-                            container.addChild(new Spacer(1))
-                            container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme))
-                        }
-
-                        const taskUsage = formatUsageStats(r.usage, r.model)
-                        if (taskUsage)
-                            container.addChild(new Text(theme.fg('dim', taskUsage), 0, 0))
-                    }
-
-                    const usageStr = formatUsageStats(aggregateUsage(details.results))
-                    if (usageStr) {
-                        container.addChild(new Spacer(1))
-                        container.addChild(
-                            new Text(theme.fg('dim', `Total: ${usageStr}`), 0, 0)
-                        )
-                    }
-                    return container
-                }
-
-                // Collapsed view (or still running)
-                let text = `${icon} ${theme.fg('toolTitle', theme.bold('parallel '))}${theme.fg('accent', status)}`
-                for (const r of details.results) {
-                    const rIcon =
-                        r.exitCode === -1
-                            ? theme.fg('warning', '⏳')
-                            : isFailedResult(r)
-                              ? theme.fg('error', '✗')
-                              : theme.fg('success', '✓')
-                    const displayItems = getDisplayItems(r.messages)
-                    text += `\n\n${theme.fg('muted', '─── ')}${theme.fg('accent', r.agent)} ${rIcon}`
-                    if (displayItems.length === 0)
-                        text += `\n${theme.fg('muted', r.exitCode === -1 ? '(running...)' : '(no output)')}`
-                    else text += `\n${renderDisplayItems(displayItems, 5, r.cwd)}`
-                }
-                if (!isRunning) {
-                    const usageStr = formatUsageStats(aggregateUsage(details.results))
-                    if (usageStr) text += `\n\n${theme.fg('dim', `Total: ${usageStr}`)}`
-                }
-                if (!expanded) text += `\n${theme.fg('muted', '(Ctrl+O to expand)')}`
-                return new Text(text, 0, 0)
-            }
-
             const text = result.content[0]
             return new Text(text?.type === 'text' ? text.text : '(no output)', 0, 0)
         },
@@ -4574,8 +4262,8 @@ export default function (pi: ExtensionAPI) {
             ]
             if (status === 'succeeded') {
                 let finalOutput = getFinalOutput(result.messages)
-                // Same byte-cap as parallel output, but collect has no separate
-                // details payload, so the cap note can't promise one.
+                // Collect has no separate details payload, so the truncation
+                // note cannot point at a complete result elsewhere.
                 const byteLength = Buffer.byteLength(finalOutput, 'utf8')
                 if (byteLength > PER_TASK_OUTPUT_CAP) {
                     let truncated = finalOutput.slice(0, PER_TASK_OUTPUT_CAP)

@@ -491,13 +491,12 @@ function writeResult(
     if (result.ok === true) {
         const header = `${verb} ${result.key} (${scopeLabel(result.scope, result.project)}, ${result.access})`
         return {
-            text: `${header}\nhash: ${result.hash}\n${result.diff === '' ? '(no change)' : result.diff}`,
+            text: `${header}\n${result.diff === '' ? '(no change)' : result.diff}`,
             details: {
                 key: result.key,
                 scope: result.scope,
                 project: result.project,
                 access: result.access,
-                hash: result.hash,
                 diff: result.diff,
             },
         }

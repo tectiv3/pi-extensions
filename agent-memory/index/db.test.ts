@@ -556,7 +556,8 @@ try {
         key: 'db/fts5',
         oldText: 'keyword',
         newText: 'bm25',
-        baseHash: wrote.details.hash,
+        // The tool layer no longer returns the hash, so the read is its only source.
+        baseHash: (await tools.memoryRead(deps, { key: 'db/fts5' })).details.hash,
     })
     out.editError = edited.isError ?? null
     out.deleteError = (await tools.memoryDelete(deps, { key: 'db/fts5' })).isError ?? null

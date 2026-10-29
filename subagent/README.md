@@ -7,7 +7,6 @@ Delegate tasks to specialized subagents with isolated context windows.
 - **Isolated context**: Each subagent runs in a separate `pi` process
 - **One delegation level**: Children are spawned with `--exclude-tools` for the subagent tools, so a subagent cannot delegate further
 - **Streaming output**: See tool calls and progress as they happen
-- **Parallel streaming**: All parallel tasks stream updates simultaneously
 - **Markdown rendering**: Final output rendered with proper formatting (expanded view)
 - **Usage tracking**: Shows turns, tokens, cost, and context usage per agent
 - **Persistence**: Interrupted or failed runs survive under `~/.pi/agent/subagents/` with a subagent id
@@ -76,11 +75,6 @@ When running interactively, the tool prompts for confirmation before running pro
 Use scout to find all authentication code
 ```
 
-### Parallel execution
-```
-Run 2 scouts in parallel: one to find models, one to find providers
-```
-
 ### Chained workflow
 ```
 Use a chain: first have scout find the read tool, then have planner suggest improvements
@@ -98,7 +92,6 @@ Use a chain: first have scout find the read tool, then have planner suggest impr
 | Mode | Parameter | Description |
 |------|-----------|-------------|
 | Single | `{ agent, task, resume? }` | One agent, one task; `resume` continues a persisted run |
-| Parallel | `{ tasks: [...] }` | Multiple agents run concurrently (max 8, 4 concurrent) |
 | Chain | `{ chain: [...] }` | Sequential with `{previous}` placeholder |
 | Background | `{ agent, task, background: true }` | Returns immediately; result delivered by notification, fetched via subagent_collect (single mode only) |
 
@@ -118,10 +111,6 @@ instead of one file per `(agent, model)` pair:
 
 ```
 subagent { agent: "scout", task: "find the auth code", model: "anthropic/claude-haiku-4-5" }
-subagent { tasks: [
-  { agent: "scout", task: "find models",  model: "anthropic/claude-haiku-4-5" },
-  { agent: "scout", task: "find routes" }
-] }
 subagent { chain: [
   { agent: "scout",   task: "find the read tool" },
   { agent: "planner", task: "review {previous}", model: "anthropic/claude-sonnet-4-5" }
@@ -133,14 +122,14 @@ Precedence, highest first:
 
 | Source | Scope | Applies when |
 |--------|-------|--------------|
-| dispatch `model` | this call (single) or this item (tasks/chain) | always wins |
+| dispatch `model` | this call (single) or this item (chain) | always wins |
 | agent frontmatter `model:` | every run of that agent file | no dispatch model |
 | parent session model | the default for all dispatches | neither of the above |
 
 A frontmatter pin is a **per-agent default**, not the agent's identity — an explicit
 dispatch model overrides it.
 
-**Single mode only at the top level.** `model` next to `tasks`/`chain` is rejected with an
+**Single mode only at the top level.** `model` next to `chain` is rejected with an
 error rather than silently ignored; set it per item instead. An empty or whitespace-only
 `model` is rejected too — it is not treated as "no override".
 
@@ -166,7 +155,7 @@ later, when a request is made.
 
 ## Persistence & Resume
 
-Every invocation (single task, chain step, or parallel task) gets a UUIDv7 subagent id and
+Every invocation (single task or chain step) gets a UUIDv7 subagent id and
 runs with `--session ~/.pi/agent/subagents/<id>.jsonl`, so the child's transcript survives
 the parent process.
 
@@ -196,8 +185,8 @@ files contain full tool output, potentially secrets):
   output up to the last `message_end`, the subagent id, and a resume hint.
 - **Ctrl+C does not abort subagents** (it clears the editor / exits the session instead).
 - Children that fail or are killed externally produce the same failure report. The behavior
-  is uniform across modes: chain stops at the failing step; parallel tasks each get their
-  own failure report and id.
+  is uniform across modes: a failed or aborted run reports its partial output, id, and a
+  resume hint; a chain stops at the failing step.
 
 ### Resuming
 
@@ -205,7 +194,7 @@ files contain full tool output, potentially secrets):
 subagent { agent: "scout", task: "<continuation instruction>", resume: "<id>" }
 ```
 
-- Single mode only — `resume` alongside `tasks`/`chain` is rejected.
+- Single mode only — `resume` alongside `chain` is rejected.
 - The id may be exact or a unique suffix (same semantics as `subagent_inspect`): an exact
   id resolves across sessions, a suffix is scoped to this pi session; ambiguous suffixes
   are refused with a list of candidates.
@@ -293,7 +282,7 @@ tool calls formatted like the parent TUI, tool output truncated (200 chars). Str
   (`agent_settled`) or its process exits (watchdog kill, crash, abort — the parent's abort
   path SIGTERMs the child, which fires the same process-exit detach).
 - Requires an interactive session (`attach` is unavailable in print mode).
-- **Single subagent only**: parallel/chain runs spawn through the same registry but
+- **Single subagent only**: chain runs spawn through the same registry but
   `attach` is designed for the single mode view for now.
 
 ## Background Runs
@@ -302,7 +291,7 @@ tool calls formatted like the parent TUI, tool output truncated (200 chars). Str
 tool call and returns immediately with the spawn text (short id, task preview, and the
 full id plus `subagent_collect` / `subagent_inspect` hints). The child keeps running.
 
-- **Single mode only** — `background` alongside `tasks`/`chain` is rejected. Rejected in
+- **Single mode only** — `background` alongside `chain` is rejected. Rejected in
   print mode too (no notification channel); use the blocking call there.
 - **Detached from the parent's abort** — Escape does not kill a background child. Kill it
   with `/subagents abort <id>` or the manager view's `x` key; a killed run settles as a
@@ -326,7 +315,7 @@ run (including a foreground `resume`) to a background run mid-flight: the awaiti
 collect/inspect hints as above), the child keeps running detached from the parent's
 abort (Escape no longer kills it), streaming stops, and settlement is delivered exactly
 like a spawn-time background run — completion notification plus `subagent_collect`.
-The manager row stays in RUNNING with a `bg` badge. Parallel tasks, chain steps,
+The manager row stays in RUNNING with a `bg` badge. Chain steps,
 `/subagents resume` spawns, and spawn-time background runs are not convertible (`b`
 refuses with a notice).
 
@@ -368,12 +357,7 @@ settled-but-uncollected results are surfaced by the completion notification, not
 - Full task text
 - All tool calls with formatted arguments
 - Final output rendered as Markdown
-- Per-task usage (for chain/parallel)
-
-**Parallel mode streaming**:
-- Shows all tasks with live status (⏳ running, ✓ done, ✗ failed)
-- Updates as each task makes progress
-- Shows "2/3 done, 1 running" status
+- Per-step usage (for chain)
 
 **Tool call formatting** (mimics built-in tools):
 - `$ command` for bash
@@ -432,8 +416,6 @@ resume hint:
 - **Pre-spawn failures** (e.g. unknown agent): error result without id or hint — nothing
   was spawned or persisted
 - **Chain mode**: Stops at the first failing step and reports which step failed
-- **Parallel mode**: The batch is not rejected; each failed task gets a per-task summary
-  with its own id and resume hint
 - **Swallowed persistence/parse failures**: none of these fail a run — artifact writes (dir
   setup, `.meta`, pidfile), artifact removals, tail-frame drops, unparsable child frames, and
   unreadable pid/session files. They are written to a file-only diagnostic log when
@@ -448,7 +430,6 @@ resume hint:
 
 - Output truncated to last 10 items in collapsed view (expand to see all)
 - Agents discovered fresh on each invocation (allows editing mid-session)
-- Parallel mode limited to 8 tasks, 4 concurrent
 - **L1 — resume inherits the original cwd**: pi reads the session's working directory from
   the JSONL header, so a resumed child runs in the original project's context even when
   resumed from a different parent cwd
@@ -462,7 +443,7 @@ resume hint:
 - **L5 — no true detach**: backgrounded runs do not survive the parent process or a session
   replacement (`/new`, `/resume`, `/fork`, `/reload`); live runs are SIGTERM'd on session
   teardown
-- **L6 — background is single-mode only**: no backgrounded parallel batches or chains;
+- **L6 — background is single-mode only**: no backgrounded chains;
   runtime conversion via the manager's `b` is single-mode too (foreground single tool-call runs)
 - **L7 — `subagent_collect` is process-scoped**: persisted runs from other sessions use
   `subagent_inspect` / `/subagents resume`

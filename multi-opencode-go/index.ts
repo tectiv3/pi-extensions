@@ -22,6 +22,8 @@ const AUTH_KEY = 'opencode-go-failover'
 const STATE_FILE = 'opencode-go-active.json'
 const LOG_FILE = 'multi-opencode-go.log'
 
+export const FAILOVER_GLYPH = '🐾'
+
 export interface FailoverAccount {
     label: string
     key: string
@@ -134,7 +136,10 @@ export default function multiOpencodeGo(pi: ExtensionAPI): void {
     function publishStatus(ctx: ExtensionContext): void {
         if (ctx.hasUI === false || ctx.mode === 'print') return
         try {
-            ctx.ui.setStatus?.('multi-opencode-go', failoverOn && failover ? '⇄' : undefined)
+            ctx.ui.setStatus?.(
+                'multi-opencode-go',
+                failoverOn && failover ? FAILOVER_GLYPH : undefined
+            )
         } catch {
             // Footer status is best-effort; never break session or command paths.
         }

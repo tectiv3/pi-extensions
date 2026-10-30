@@ -44,7 +44,7 @@ If failover was persisted on but the failover account is no longer configured at
 
 ## Footer status
 
-While failover is on, the pi footer shows the single glyph `⇄` under the `multi-opencode-go` status key. It is cleared when failover is turned off and on session shutdown. Print mode and no-UI hosts never get it.
+While failover is on, the pi footer shows the single glyph `🐾` under the `multi-opencode-go` status key. It is cleared when failover is turned off and on session shutdown. Print mode and no-UI hosts never get it.
 
 When failover is already on at `session_start`, a one-time info notice reports the active failover label: `opencode-go: failover active (<label>)`.
 

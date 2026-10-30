@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import test, { type TestContext } from 'node:test'
 import type { ExtensionAPI, ExtensionCommandContext } from '@earendil-works/pi-coding-agent'
 import multiOpencodeGo, {
+    FAILOVER_GLYPH,
     getLogFilePath,
     loadFailoverAccount,
     loadFailoverOn,
@@ -285,7 +286,7 @@ test('session_start publishes the failover glyph and a startup notice when on', 
     const statuses = new Map<string, string | undefined>()
     start(pi, makeCtx(pi.notices, undefined, statuses))
 
-    assert.equal(statuses.get('multi-opencode-go'), '⇄')
+    assert.equal(statuses.get('multi-opencode-go'), FAILOVER_GLYPH)
     assert.equal(pi.notices.length, 1)
     assert.equal(pi.notices[0][1], 'info')
     assert.match(pi.notices[0][0], /opencode-go: failover active \(second\)/)
@@ -297,7 +298,9 @@ test('session_start clears the status and stays quiet when failover is off', t =
 
     const pi = makePi()
     multiOpencodeGo(pi.api)
-    const statuses = new Map<string, string | undefined>([['multi-opencode-go', '⇄']])
+    const statuses = new Map<string, string | undefined>([
+        ['multi-opencode-go', FAILOVER_GLYPH],
+    ])
     start(pi, makeCtx(pi.notices, undefined, statuses))
 
     assert.ok(statuses.has('multi-opencode-go'))
@@ -317,7 +320,7 @@ test('/opencode-switch sets the glyph when on and clears it when off', async t =
     assert.ok(command)
 
     await command.handler('on', makeCtx(pi.notices, undefined, statuses))
-    assert.equal(statuses.get('multi-opencode-go'), '⇄')
+    assert.equal(statuses.get('multi-opencode-go'), FAILOVER_GLYPH)
 
     await command.handler('off', makeCtx(pi.notices, undefined, statuses))
     assert.equal(statuses.get('multi-opencode-go'), undefined)
@@ -341,7 +344,9 @@ test('print mode and no-UI contexts never call setStatus', t => {
 test('session_shutdown clears the footer status', () => {
     const pi = makePi()
     multiOpencodeGo(pi.api)
-    const statuses = new Map<string, string | undefined>([['multi-opencode-go', '⇄']])
+    const statuses = new Map<string, string | undefined>([
+        ['multi-opencode-go', FAILOVER_GLYPH],
+    ])
 
     pi.handlers.get('session_shutdown')?.({}, makeCtx(pi.notices, undefined, statuses))
     assert.equal(statuses.get('multi-opencode-go'), undefined)

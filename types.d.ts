@@ -126,6 +126,7 @@ declare module '@earendil-works/pi-coding-agent' {
                     render: (width: number) => string[]
                     invalidate: () => void
                     handleInput: (data: string) => void
+                    focused?: boolean
                     dispose?(): void
                 }
             ): Promise<T>
@@ -181,6 +182,8 @@ declare module '@earendil-works/pi-coding-agent' {
 }
 
 declare module '@earendil-works/pi-tui' {
+    export const CURSOR_MARKER: string
+    export function renderFakeCursor(text: string): string
     export interface Component {
         render(width: number): string[]
         invalidate?(): void

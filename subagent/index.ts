@@ -33,10 +33,12 @@ import {
 import {
     type Component,
     Container,
+    CURSOR_MARKER,
     decodeKittyPrintable,
     Key,
     Markdown,
     matchesKey,
+    renderFakeCursor,
     Spacer,
     Text,
     truncateToWidth,
@@ -104,9 +106,12 @@ const ATTACH_TOOL_OUTPUT_PREVIEW_CHARS = 200
 const ATTACH_STEER_PREVIEW_CHARS = 200
 const ATTACH_RESERVED_TERMINAL_ROWS = 6
 const ATTACH_MIN_VIEWPORT_LINES = 3
-// The always-visible steer input row (blank separator + input line) is fixed
-// height outside the scrolling transcript window.
-const ATTACH_STEER_ROW_HEIGHT = 2
+// The attach view's own chrome (3 header lines, a blank separator above the
+// transcript, the pending-steer lines, a blank separator below them, and the
+// steer input row) is deliberately NOT mirrored as a constant: the component
+// derives its transcript window from the lines render() actually emits, so the
+// window and the output cannot disagree. A duplicate count here is how the
+// steer row previously got cropped by the dock.
 
 // Registry of live subagent children, keyed by subagent id. Populated on
 // spawn, consumed by /subagents attach (live view + ring-buffer replay).
@@ -1298,6 +1303,9 @@ async function attachToSubagent(ctx: ExtensionContext, entry: ActiveSubagent): P
         let cachedWidth = -1
         let cachedLines: string[] | undefined
         let steerBuffer = ''
+        // Mirror of pi-tui's Focusable flag: the TUI assigns `component.focused`
+        // on focus change, and render() reads it through a closure local.
+        let focused = false
         // Still-queued steers: seeded from the registry snapshot (late
         // attach sees texts queued before the view opened), then replaced
         // wholesale on queue_update — the authoritative stream drops a text
@@ -1313,17 +1321,14 @@ async function attachToSubagent(ctx: ExtensionContext, entry: ActiveSubagent): P
         // engine's reach — a nested ScrollView cannot scroll there (no
         // bounded viewport, no scroll translation; verified against
         // pi-tui's layout walk). Scrolling is manual: render every
-        // transcript line, slice a window, and clamp the total height so the
-        // de-facto fullscreen view still leaves the dock chrome (status,
-        // footer) on screen.
-        const maxViewportLines = () =>
-            Math.max(
-                ATTACH_MIN_VIEWPORT_LINES,
-                tui.terminal.rows -
-                    ATTACH_RESERVED_TERMINAL_ROWS -
-                    ATTACH_STEER_ROW_HEIGHT -
-                    pendingSteers.length
-            )
+        // transcript line, slice a window, and keep the TOTAL rendered height
+        // (window + chrome) within this budget, so the dock never has to clip
+        // the bottom rows (the steer row).
+        const attachBudgetRows = () =>
+            Math.max(0, tui.terminal.rows - ATTACH_RESERVED_TERMINAL_ROWS)
+        // Window height settled on by the last render(); handleInput has no
+        // width and must scroll by exactly what is on screen.
+        let lastViewportHeight = ATTACH_MIN_VIEWPORT_LINES
 
         function rebuild(width: number): string[] {
             if (cachedLines && cachedWidth === width) return cachedLines
@@ -1388,12 +1393,6 @@ async function attachToSubagent(ctx: ExtensionContext, entry: ActiveSubagent): P
 
         function render(width: number): string[] {
             const lines = rebuild(width)
-            const viewportHeight = Math.min(lines.length, maxViewportLines())
-            const maxScrollTop = Math.max(0, lines.length - viewportHeight)
-            // followEnd pins the window to the newest output; scrolling up
-            // suspends the pin until the user jumps back with End.
-            scrollTop = followEnd ? maxScrollTop : Math.min(scrollTop, maxScrollTop)
-
             const header = [
                 theme.fg('toolTitle', theme.bold('attach ')) +
                     theme.fg('accent', entry.agent) +
@@ -1406,7 +1405,15 @@ async function attachToSubagent(ctx: ExtensionContext, entry: ActiveSubagent): P
             // Single-line input row: when the buffer outgrows the row, keep
             // its tail so the caret stays visible (terminal-input behavior).
             const prompt = '› '
-            const caret = '▌'
+            // The caret cell is the fake cursor, so it stays visible while
+            // this component is unfocused; while focused the hardware cursor
+            // is drawn there instead (pi-tui drops the fake cell then).
+            const caret = renderFakeCursor('▌')
+            // Only a focused component may claim the terminal cursor: pi-tui's
+            // focus protocol sets `focused`, and layout.ts shifts the dock's
+            // clip window to the CURSOR_MARKER row. Emitting it while another
+            // dialog owns the focus would steal the cursor.
+            const cursorMarker = focused ? CURSOR_MARKER : ''
             const budget = Math.max(0, width - visibleWidth(prompt) - visibleWidth(caret))
             const chars = Array.from(steerBuffer)
             let start = chars.length
@@ -1420,7 +1427,7 @@ async function attachToSubagent(ctx: ExtensionContext, entry: ActiveSubagent): P
             const steerRow =
                 theme.fg('dim', prompt) +
                 theme.fg('muted', chars.slice(start).join('')) +
-                theme.fg('dim', caret)
+                theme.fg('dim', cursorMarker + caret)
             // Pending steers render after the transcript window, before the
             // steer row — appended here, not in rebuild(), so queue updates
             // never invalidate the cached transcript lines.
@@ -1429,15 +1436,26 @@ async function attachToSubagent(ctx: ExtensionContext, entry: ActiveSubagent): P
                     theme.fg('dim', '‹pending› ') +
                     theme.fg('dim', previewText(text, ATTACH_STEER_PREVIEW_CHARS))
             )
+            // Chrome rows are taken from the arrays this render actually
+            // emits (header + separator, separator + steer row), so the
+            // transcript window shrinks by exactly what the chrome costs and
+            // the total never exceeds the dock budget.
+            const head = [...header, '']
+            const tail = [...pendingLines, '', steerRow]
+            const viewportHeight = Math.min(
+                lines.length,
+                Math.max(
+                    ATTACH_MIN_VIEWPORT_LINES,
+                    attachBudgetRows() - head.length - tail.length
+                )
+            )
+            lastViewportHeight = viewportHeight
+            const maxScrollTop = Math.max(0, lines.length - viewportHeight)
+            // followEnd pins the window to the newest output; scrolling up
+            // suspends the pin until the user jumps back with End.
+            scrollTop = followEnd ? maxScrollTop : Math.min(scrollTop, maxScrollTop)
             return clampLines(
-                [
-                    ...header,
-                    '',
-                    ...lines.slice(scrollTop, scrollTop + viewportHeight),
-                    ...pendingLines,
-                    '',
-                    steerRow,
-                ],
+                [...head, ...lines.slice(scrollTop, scrollTop + viewportHeight), ...tail],
                 width
             )
         }
@@ -1488,7 +1506,7 @@ async function attachToSubagent(ctx: ExtensionContext, entry: ActiveSubagent): P
                 return
             }
             if (!cachedLines) return
-            const viewportHeight = Math.min(cachedLines.length, maxViewportLines())
+            const viewportHeight = Math.min(cachedLines.length, lastViewportHeight)
             const maxScrollTop = Math.max(0, cachedLines.length - viewportHeight)
             if (matchesKey(data, Key.up)) {
                 scrollTop = Math.max(0, scrollTop - 1)
@@ -1519,6 +1537,14 @@ async function attachToSubagent(ctx: ExtensionContext, entry: ActiveSubagent): P
                 cachedLines = undefined
             },
             handleInput,
+            // pi-tui's Focusable contract: the TUI flips this on focus change.
+            // Accessors keep the render closure in sync with the flag.
+            get focused() {
+                return focused
+            },
+            set focused(value: boolean) {
+                focused = value
+            },
             dispose: () => finish(),
         }
     })
@@ -3240,16 +3266,14 @@ async function openSubagentInspectView(
         '\n'
     )
     const shortId = shortSubagentId(subagentId)
-    // Header + footer rows on top of the attach view's dock reservation.
-    const INSPECT_CHROME_ROWS = 2
 
     await ctx.ui.custom<void>((tui, theme, _kb, done) => {
         let finished = false
         let scrollTop = 0
         let cachedWidth = -1
         let cachedLines: string[] | undefined
-        // Scroll bounds from the last render; handleInput has no width.
-        let lastLineCount = 0
+        // The report window height settled on by the last render(); handleInput
+        // has no width and must scroll by exactly what is on screen.
         let lastViewportHeight = ATTACH_MIN_VIEWPORT_LINES
 
         const finish = () => {
@@ -3258,11 +3282,13 @@ async function openSubagentInspectView(
             done()
         }
 
-        const viewportLines = () =>
-            Math.max(
-                ATTACH_MIN_VIEWPORT_LINES,
-                tui.terminal.rows - ATTACH_RESERVED_TERMINAL_ROWS - INSPECT_CHROME_ROWS
-            )
+        // Same dock reservation as the attach view: the surrounding status line
+        // and footer must survive. The view's own chrome (header, blank
+        // separators, key hint) is NOT mirrored as a constant — render() derives
+        // the report window from the head/tail arrays it actually emits, so a
+        // stale chrome count cannot push the key hint past the dock's clip.
+        const inspectBudgetRows = () =>
+            Math.max(0, tui.terminal.rows - ATTACH_RESERVED_TERMINAL_ROWS)
 
         // Report lines may carry ANSI and wide glyphs; wrap on visible
         // columns so escape sequences are never split.
@@ -3278,20 +3304,26 @@ async function openSubagentInspectView(
 
         function render(width: number): string[] {
             const lines = wrapped(width)
-            lastLineCount = lines.length
-            const height = Math.min(lines.length, viewportLines())
-            lastViewportHeight = height
-            const maxScrollTop = Math.max(0, lines.length - height)
+            // Chrome rows come from the arrays below, so the report window
+            // shrinks by exactly what the chrome costs and the total never
+            // exceeds the dock budget.
+            const head = [
+                theme.fg('toolTitle', theme.bold('inspect ')) + theme.fg('accent', shortId),
+                '',
+            ]
+            const tail = ['', theme.fg('dim', '↑↓/jk PgUp/PgDn Home/End scroll · Esc/q close')]
+            const viewportHeight = Math.min(
+                lines.length,
+                Math.max(
+                    ATTACH_MIN_VIEWPORT_LINES,
+                    inspectBudgetRows() - head.length - tail.length
+                )
+            )
+            lastViewportHeight = viewportHeight
+            const maxScrollTop = Math.max(0, lines.length - viewportHeight)
             scrollTop = Math.min(scrollTop, maxScrollTop)
             return clampLines(
-                [
-                    theme.fg('toolTitle', theme.bold('inspect ')) +
-                        theme.fg('accent', shortId),
-                    '',
-                    ...lines.slice(scrollTop, scrollTop + height),
-                    '',
-                    theme.fg('dim', '↑↓/jk PgUp/PgDn Home/End scroll · Esc/q close'),
-                ],
+                [...head, ...lines.slice(scrollTop, scrollTop + viewportHeight), ...tail],
                 width
             )
         }
@@ -3306,15 +3338,19 @@ async function openSubagentInspectView(
                 finish()
                 return
             }
-            const maxScrollTop = Math.max(0, lastLineCount - lastViewportHeight)
+            if (!cachedLines) return
+            // Scroll by the window the last render actually emitted, so a page
+            // step matches what is on screen.
+            const viewportHeight = Math.min(cachedLines.length, lastViewportHeight)
+            const maxScrollTop = Math.max(0, cachedLines.length - viewportHeight)
             if (matchesKey(data, Key.up) || ch === 'k') {
                 scrollTop = Math.max(0, scrollTop - 1)
             } else if (matchesKey(data, Key.down) || ch === 'j') {
                 scrollTop = Math.min(maxScrollTop, scrollTop + 1)
             } else if (matchesKey(data, Key.pageUp)) {
-                scrollTop = Math.max(0, scrollTop - lastViewportHeight)
+                scrollTop = Math.max(0, scrollTop - viewportHeight)
             } else if (matchesKey(data, Key.pageDown)) {
-                scrollTop = Math.min(maxScrollTop, scrollTop + lastViewportHeight)
+                scrollTop = Math.min(maxScrollTop, scrollTop + viewportHeight)
             } else if (matchesKey(data, Key.home)) {
                 scrollTop = 0
             } else if (matchesKey(data, Key.end)) {

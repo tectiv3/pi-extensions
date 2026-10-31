@@ -58,6 +58,7 @@ export const MENTION_PREFIX = 'possibly relevant memories: '
  */
 export type MentionReason =
     | 'injected'
+    | 'disabled'
     | 'no-query'
     | 'no-match'
     | 'idf-clamp'
@@ -96,6 +97,25 @@ export interface MentionOptions {
     embed?: Embedder
 }
 
+/**
+ * The opt-in switch, and the only place the answer is computed. Off unless a store or
+ * the operator asks for it.
+ *
+ * The default changed after measurement, not taste: the hint fired on ~60% of turns,
+ * only ~5% of delivered key slots were ever followed up, and the appended line is the
+ * user's own message text — the model read it as something the user said and narrated
+ * relevance back. The session-start index and `memory_search` carry recall without it.
+ *
+ * `PI_MEMORY_MENTION` wins over the row: `1`/`true` on, `0`/`false`/`off` off. An
+ * unrecognised value is not a decision and falls through to the store.
+ */
+export function mentionsEnabled(store: Store): boolean {
+    const env = process.env.PI_MEMORY_MENTION?.trim().toLowerCase()
+    if (env === '1' || env === 'true') return true
+    if (env === '0' || env === 'false' || env === 'off') return false
+    return getMeta(store.db, 'mention_enabled') === '1'
+}
+
 // ---------------------------------------------------------------------------
 // detection
 // ---------------------------------------------------------------------------
@@ -105,6 +125,10 @@ export function detectMentions(
     userText: string,
     options: MentionOptions = {}
 ): MentionResult {
+    // Disabled means silent, not "skipped loudly": the caller's turn must be untouched
+    // and a default-off feature must not write one access-log line per turn.
+    if (!mentionsEnabled(store)) return skipped('disabled')
+
     const where: { scope?: Scope; project?: string } = {}
     const result = detect(store, userText, options, where)
     logDecision(store, where, result)

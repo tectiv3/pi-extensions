@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import test, { type TestContext } from 'node:test'
+import test, { afterEach, type TestContext } from 'node:test'
 
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 
@@ -32,7 +32,10 @@ import {
  * - `common` in sixteen of thirty-one, past the point where FTS5's IDF clamps and
  *   `bm25()` collapses to 1e-6 (measured: 15 of 30 → 1e-6, 1 of 30 → 2.98).
  */
-function seedCorpus(t: TestContext): { root: string; store: Store; cwd: string } {
+function seedCorpus(
+    t: TestContext,
+    options: { enableMentions?: boolean } = {}
+): { root: string; store: Store; cwd: string } {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-memory-mention-'))
     t.after(() => fs.rmSync(root, { recursive: true, force: true }))
     const saved = process.env.PI_MEMORY_DIR
@@ -69,6 +72,9 @@ function seedCorpus(t: TestContext): { root: string; store: Store; cwd: string }
     const store = openStore(cwd)
     t.after(() => store.close())
     assert.equal(store.reindex().updated, 31)
+    // These tests pin the rule, not the opt-in gate, so the fixture enables mentions
+    // unless a test is specifically exercising the default (`enableMentions: false`).
+    if (options.enableMentions !== false) setMeta(store.db, 'mention_enabled', '1')
     return { root, store, cwd }
 }
 
@@ -440,7 +446,11 @@ function makeRepo(t: TestContext): string {
 }
 
 /** A store whose root is fresh and whose note operations resolve against `cwd`. */
-function openStoreAt(t: TestContext, cwd: string): { store: Store; root: string } {
+function openStoreAt(
+    t: TestContext,
+    cwd: string,
+    options: { enableMentions?: boolean } = {}
+): { store: Store; root: string } {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-memory-mention-store-'))
     t.after(() => fs.rmSync(root, { recursive: true, force: true }))
     const saved = process.env.PI_MEMORY_DIR
@@ -451,6 +461,8 @@ function openStoreAt(t: TestContext, cwd: string): { store: Store; root: string 
     })
     const store = openStore(cwd)
     t.after(() => store.close())
+    // Same reason as `seedCorpus`: gate tests opt out explicitly.
+    if (options.enableMentions !== false) setMeta(store.db, 'mention_enabled', '1')
     return { store, root }
 }
 
@@ -523,4 +535,97 @@ test('the mention cache does not carry into a session in another project', async
     const before = structuredClone(second)
     pi.emit('context', { type: 'context', messages: second }, { cwd: repoB })
     assert.deepEqual(second, before, "the previous project's suggestion leaked")
+})
+
+// ---------------------------------------------------------------------------
+// the opt-in gate
+// ---------------------------------------------------------------------------
+
+// Env overrides are process-wide, so every test that sets one must leave the next with
+// a clean slate; a leaked `PI_MEMORY_MENTION=1` would silently un-disable the default.
+afterEach(() => {
+    delete process.env.PI_MEMORY_MENTION
+})
+
+test('mentions are off by default: no appended text and no mention line', t => {
+    const { root, store, cwd } = seedCorpus(t, { enableMentions: false })
+    const pi = fakePi()
+    installMentionHook(pi.api, store)
+
+    const messages = conversation('grafana shared widget')
+    const before = structuredClone(messages)
+    pi.emit('context', { type: 'context', messages }, { cwd })
+
+    assert.deepEqual(messages, before, 'a disabled mention must not touch the message')
+    assert.deepEqual(logEntries(root), [], 'a disabled mention must not log a decision')
+
+    // The gate is what stopped it, not a threshold: the same query injects once the
+    // row is set, and the reason says so without a search having run.
+    const result = detectMentions(store, 'grafana', { cwd })
+    assert.equal(result.reason, 'disabled')
+    assert.equal(result.injected, false)
+    assert.deepEqual(result.keys, [])
+    assert.deepEqual(logEntries(root), [], 'the disabled decision must stay silent')
+})
+
+test('meta.mention_enabled = 1 restores the pre-gate injection', t => {
+    const { root, store, cwd } = seedCorpus(t, { enableMentions: false })
+    setMeta(store.db, 'mention_enabled', '1')
+
+    const pi = fakePi()
+    installMentionHook(pi.api, store)
+    const messages = conversation('grafana shared widget')
+    const before = structuredClone(messages)
+    pi.emit('context', { type: 'context', messages }, { cwd })
+
+    assert.equal(
+        messages[2].content,
+        `${before[2].content}\n\n${MENTION_PREFIX}notes/topic07, notes/topic00, notes/topic01`
+    )
+    assert.equal(mentionLines(root).length, 1)
+    assert.equal(mentionLines(root)[0].decision, 'inject')
+})
+
+test('PI_MEMORY_MENTION=1 enables mentions with no meta row', t => {
+    const { root, store, cwd } = seedCorpus(t, { enableMentions: false })
+    process.env.PI_MEMORY_MENTION = '1'
+
+    const pi = fakePi()
+    installMentionHook(pi.api, store)
+    const messages = conversation('grafana shared widget')
+    const before = structuredClone(messages)
+    pi.emit('context', { type: 'context', messages }, { cwd })
+
+    assert.equal(
+        messages[2].content,
+        `${before[2].content}\n\n${MENTION_PREFIX}notes/topic07, notes/topic00, notes/topic01`
+    )
+    assert.equal(mentionLines(root).length, 1)
+})
+
+test('PI_MEMORY_MENTION=0 and off beat a meta row that enables mentions', t => {
+    // The fixture's meta row is '1', so only the env override can keep it off here.
+    const { root, store, cwd } = seedCorpus(t)
+
+    for (const value of ['0', 'off']) {
+        process.env.PI_MEMORY_MENTION = value
+        const pi = fakePi()
+        installMentionHook(pi.api, store)
+        const messages = conversation('grafana shared widget')
+        const before = structuredClone(messages)
+        pi.emit('context', { type: 'context', messages }, { cwd })
+
+        assert.deepEqual(
+            messages,
+            before,
+            `PI_MEMORY_MENTION=${value} still edited the message`
+        )
+        assert.equal(
+            detectMentions(store, 'grafana', { cwd }).reason,
+            'disabled',
+            `PI_MEMORY_MENTION=${value} still searched`
+        )
+    }
+
+    assert.deepEqual(logEntries(root), [], 'a disabled mention must stay silent')
 })

@@ -2,9 +2,9 @@
 
 A pi extension that gives the agent a durable, git-backed memory: markdown notes with frontmatter in
 `~/.pi/memory`, indexed in SQLite for keyword and vector search, injected as a key index at session
-start and as mention hints per turn. Notes are the authoritative artifact — one file per key, one
-commit per change — so the store can be read, diffed, and reverted with git alone. `index.db` is
-derived and disposable.
+start and as mention hints per turn (the latter opt-in, off by default). Notes are the authoritative
+artifact — one file per key, one commit per change — so the store can be read, diffed, and reverted
+with git alone. `index.db` is derived and disposable.
 
 ## Install
 
@@ -101,9 +101,15 @@ frontmatter, not from the index.
   machine. Any other host gets keyword-only search.
 - **BM25 fallback is a first-class mode, not an error.** With `bin/nle-embed` removed, or `sqlite-vec`
   absent (`vec_enabled='false'`), every tool and command still works; search loses the vector half.
+- **Mention hints are off by default.** Turn them on with `PI_MEMORY_MENTION=1` or the store row
+  `meta.mention_enabled = '1'`; `PI_MEMORY_MENTION=0`/`off` overrides the row. Disabled, the `context`
+  hook neither edits the user message nor writes a per-turn `mention` line to `access.log`. This default
+  is measured, not taste: the hint fired on ~60% of turns, ~5% of delivered key slots were ever followed
+  up, and the appended line reads as user text, so the model narrated relevance back. Do not re-enable
+  it without new uptake numbers — the injected index and `memory_search` carry recall on their own.
 - **`F = 2.5`** is the mention-detection floor (`meta.mention_floor`, default 2.5). It is a tuned
-  starting point for a mature store, not a constant: each decision logs `top1`, `m10`, `n`, and an
-  injected line, so retuning is a matter of reading `/memory log`.
+  starting point for a mature store, not a constant: each *enabled* decision logs `top1`, `m10`, `n`,
+  and an injected line, so retuning is a matter of reading `/memory log`.
 - **IDF clamp:** FTS5 gives a term that appears in at least half the corpus a score of ~1e-6, which is
   below the clamp threshold. In a store with fewer than ~5 notes a query term matches half the corpus,
   so mention detection effectively never fires — the injected index and `memory_search` are what carry
@@ -111,8 +117,8 @@ frontmatter, not from the index.
 - **Search is word-exact.** FTS5 uses its default `unicode61` tokenizer, which folds case but does
   not stem: `symlink` does not match `symlinks` (measured: a note containing "symlinks" is found by
   `symlinks` and missed by `symlink`). Search with a token the note actually contains.
-- **Mentions, not recall.** Per-turn hints are capped at three keys and only ever name open notes; a
-  gated key is never suggested.
+- **Mentions, not recall.** Per-turn hints are capped at three keys, only ever name open notes, and are
+  off unless enabled (see above); a gated key is never suggested.
 
 ## Troubleshooting
 

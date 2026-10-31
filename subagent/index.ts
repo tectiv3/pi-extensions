@@ -60,6 +60,9 @@ import {
 // via PI_SUBAGENT_STALL_TIMEOUT_MS (ms).
 const STALL_TIMEOUT_MS = Number(process.env.PI_SUBAGENT_STALL_TIMEOUT_MS ?? 300_000)
 const STALL_CHECK_INTERVAL_MS = 10_000
+// A child stuck inside a long tool call ignores SIGTERM until that call returns, so
+// every kill path escalates. Same 5s window the abort signal has always used.
+const CHILD_KILL_ESCALATION_MS = 5000
 const COLLAPSED_ITEM_COUNT = 10
 const PER_TASK_OUTPUT_CAP = 50 * 1024
 const SUBAGENTS_DIR_MODE = 0o700
@@ -82,7 +85,12 @@ function idMatches(requested: string, candidate: string): boolean {
 // Children inherit the parent's extensions, so this tool set is present in every
 // child regardless of its `tools:` frontmatter. Denying it unconditionally keeps
 // nesting hard-blocked at one level; `--exclude-tools` applies after `--tools`.
-const SUBAGENT_TOOL_NAMES = ['subagent', 'subagent_inspect', 'subagent_collect'] as const
+const SUBAGENT_TOOL_NAMES = [
+    'subagent',
+    'subagent_inspect',
+    'subagent_collect',
+    'subagent_steer',
+] as const
 // /subagents resume: instruction sent when the user provides none, and how
 // long the command waits for the spawned child to appear in the registry
 // before reporting failure (covers pre-spawn exits inside runSingleAgent).
@@ -328,9 +336,15 @@ interface ActiveSubagent {
     // Latest still-queued steer texts, replaced wholesale on every
     // queue_update frame; seeded empty at spawn, read by the attach view.
     pendingSteers: string[]
-    // Steer handle for a new LLM turn; wired at spawn so the attach view can
-    // reach it later.
-    steer: (message: string) => void
+    // Steer handle for a new LLM turn; wired at spawn so the attach view and
+    // subagent_steer can reach it later. Reports a failed stdin write instead
+    // of swallowing it.
+    steer: (message: string) => SteerOutcome
+    // The run's own abort source. Background runs have no parent signal, so
+    // without this their only kill path was a bare SIGTERM with no escalation.
+    abort: () => void
+    // 1-based chain item index; lets a steer name the item it landed on.
+    step?: number
     // Runtime backgrounding (docs/plans/subagent-runtime-background.md): the
     // manager view's `b` key converts a foreground single-mode tool-call run
     // mid-flight. Wired only for backgroundable runs.
@@ -339,6 +353,11 @@ interface ActiveSubagent {
     // "sent to background" result read it.
     runtimeBackgrounded?: boolean
 }
+
+// A steer is a queued message, not a redirect: the write is accepted here, the
+// child's acceptance and its effect are both asynchronous and unobserved.
+// `undefined` means the stdin write was accepted; a string is its failure reason.
+type SteerOutcome = string | undefined
 
 const activeSubagents = new Map<string, ActiveSubagent>()
 
@@ -1128,6 +1147,17 @@ function formatRunningSubagentsList(entries: ActiveSubagent[]): string[] {
                 LIST_TASK_PREVIEW_CHARS
             )}`
     )
+}
+
+// Honest steer receipt: the write was accepted, nothing more is known. Every line
+// here exists to stop the model reading "steer" as "corrected".
+function buildSteerResult(entry: ActiveSubagent): string {
+    const shortId = shortSubagentId(entry.id)
+    const target =
+        entry.step !== undefined
+            ? `${shortId} (chain step ${entry.step}, ${entry.agent})`
+            : shortId
+    return `Message queued for delivery to ${target} at its next tool round — not yet in effect.`
 }
 
 function resolveAttachTarget(id?: string): ActiveSubagent | string {
@@ -1957,6 +1987,29 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void
 
+// SIGTERM, then SIGKILL if the child is still alive after CHILD_KILL_ESCALATION_MS.
+// The escalation checks exitCode/signalCode rather than proc.killed: a successful
+// SIGTERM sets `killed` immediately, which made the old check dead code and left a
+// child that ignored the signal running forever.
+function killChildProc(proc: ChildProcess, debug: (msg: string) => void): void {
+    try {
+        proc.kill('SIGTERM')
+    } catch {
+        // Already dead — the close handler settles the registry.
+        return
+    }
+    const escalate = setTimeout(() => {
+        if (proc.exitCode !== null || proc.signalCode !== null) return
+        debug('child ignored SIGTERM, sending SIGKILL')
+        try {
+            proc.kill('SIGKILL')
+        } catch {
+            /* already dead */
+        }
+    }, CHILD_KILL_ESCALATION_MS)
+    escalate.unref()
+}
+
 interface DispatchDefaults {
     model?: string
     thinkingLevel?: ThinkingLevel
@@ -2063,6 +2116,10 @@ async function runSingleAgent(
     // (relay abort wiring, onUpdate streaming, the settlement sink) reads this
     // mutable copy, not the `background` param.
     let backgrounded = background
+    // Every run owns an abort source, background included: explicit aborts
+    // (subagent_steer-adjacent kills, /subagents abort, the manager's x key) all
+    // go through it, and the parent signal only bridges into it while attached.
+    const runAbort = new AbortController()
     // The --append-system-prompt tmp file is deleted when this invocation is
     // done with it — except on the runtime-backgrounded early return, where
     // the child may still be booting and has not read the file yet (pi reads
@@ -2227,18 +2284,18 @@ async function runSingleAgent(
             // rpc-mode children take newline-terminated JSON commands on stdin.
             // Writes return false when the kernel buffer is full — Node still
             // queues them, so a false return is logged, not treated as failure
-            // (steers are small/rare).
-            const writeChildStdin = (command: Record<string, unknown>) => {
+            // (steers are small/rare). Returns the failure message on a throw so
+            // callers that report to the model cannot claim a write that failed.
+            const writeChildStdin = (command: Record<string, unknown>): string | undefined => {
                 try {
                     const ok = proc.stdin.write(`${JSON.stringify(command)}\n`)
                     if (ok === false)
                         debug(`stdin backpressure after ${String(command.type)} write`)
+                    return undefined
                 } catch (err) {
-                    debug(
-                        `stdin write failed (${String(command.type)}): ${
-                            err instanceof Error ? err.message : String(err)
-                        }`
-                    )
+                    const message = err instanceof Error ? err.message : String(err)
+                    debug(`stdin write failed (${String(command.type)}): ${message}`)
+                    return message
                 }
             }
 
@@ -2255,8 +2312,10 @@ async function runSingleAgent(
                     relayPending = true
                     const controller = new AbortController()
                     let relayAbortCleanup: (() => void) | undefined
-                    // Foreground only: background runs have no abort source, so the
-                    // relay stays open until the user answers or dismisses (spec §1.1).
+                    // Bridged to the parent signal only, which a background run never
+                    // has: an explicit abort kills the child but does not retract this
+                    // dialog, so it stays open until the user answers or dismisses
+                    // (spec §1.1).
                     // `backgrounded` (mutable), not `background`: a
                     // runtime-backgrounded run stops wiring new relays mid-flight.
                     if (!backgrounded && signal) {
@@ -2360,9 +2419,10 @@ async function runSingleAgent(
             // A steer starts a new LLM turn that can be legitimately silent
             // for longer than the stall timeout during prefill; resetting the
             // activity timer keeps the watchdog from killing a healthy child.
-            const steerFn = (message: string) => {
-                writeChildStdin({ type: 'steer', message })
+            const steerFn = (message: string): SteerOutcome => {
+                const writeError = writeChildStdin({ type: 'steer', message })
                 lastActivityTime = Date.now()
+                return writeError
             }
 
             // rpc mode ignores positional CLI args, so the task travels as the
@@ -2383,6 +2443,8 @@ async function runSingleAgent(
                 events: [],
                 pendingSteers: [],
                 steer: steerFn,
+                abort: () => runAbort.abort(),
+                step,
             }
             registerActiveSubagent(entry)
             // Id supersession (spec 1.1): a re-running id reuses its id, so a stale
@@ -2470,7 +2532,7 @@ async function runSingleAgent(
                                 : error
                             currentResult.errorMessage = error
                             safeResolve(1, 'prompt-rejected')
-                            proc.kill('SIGTERM')
+                            killChildProc(proc, debug)
                         }
                     }
                     return
@@ -2643,36 +2705,29 @@ async function runSingleAgent(
                             `events=${eventCount}, last=${lastEventType}, killing child`
                     )
                     clearInterval(stallWatchdog)
-                    proc.kill('SIGTERM')
-                    setTimeout(() => {
-                        try {
-                            if (!proc.killed) proc.kill('SIGKILL')
-                        } catch {
-                            /* ignore */
-                        }
-                    }, 5000)
+                    killChildProc(proc, debug)
                 }
             }, STALL_CHECK_INTERVAL_MS)
             stallWatchdog.unref()
 
-            // Spawn-time decision only (the `background` param): foreground
-            // runs wire the parent's abort signal to kill. abortCleanup lets
-            // runtime backgrounding drop the listener afterwards; an already-
-            // aborted signal needs no listener and no cleanup.
+            // Spawn-time decision only (the `background` param): a foreground
+            // run bridges the parent's abort signal into the run's own abort
+            // source. abortCleanup lets runtime backgrounding drop the bridge
+            // afterwards so Escape no longer kills; the run's own source stays,
+            // which is what makes an explicit abort work on background runs too.
             let abortCleanup: (() => void) | undefined
-            if (!background && signal) {
-                const killProc = () => {
-                    wasAborted = true
-                    debug('abort signal received, killing child')
-                    proc.kill('SIGTERM')
-                    setTimeout(() => {
-                        if (!proc.killed) proc.kill('SIGKILL')
-                    }, 5000)
-                }
-                if (signal.aborted) killProc()
+            const killProc = () => {
+                wasAborted = true
+                debug('abort received, killing child')
+                killChildProc(proc, debug)
+            }
+            runAbort.signal.addEventListener('abort', killProc, { once: true })
+            if (signal) {
+                const onParentAbort = () => runAbort.abort()
+                if (signal.aborted) onParentAbort()
                 else {
-                    signal.addEventListener('abort', killProc, { once: true })
-                    abortCleanup = () => signal.removeEventListener('abort', killProc)
+                    signal.addEventListener('abort', onParentAbort, { once: true })
+                    abortCleanup = () => signal.removeEventListener('abort', onParentAbort)
                 }
             }
         })
@@ -3167,20 +3222,12 @@ async function openSubagentsManager(ctx: ExtensionContext): Promise<void> {
                     showNotice('abort applies to running rows only', true)
                     return
                 }
-                try {
-                    // SIGTERM through the same proc.kill path the abort signal
-                    // and watchdog use; registry cleanup and any pending
-                    // tool-call result settle through the existing handlers.
-                    row.entry.proc.kill('SIGTERM')
-                    showNotice(
-                        `Aborting ${shortSubagentId(row.id)} — SIGTERM sent; the row drops out when the child exits.`
-                    )
-                } catch {
-                    showNotice(
-                        `Abort failed: child of ${shortSubagentId(row.id)} is already dead`,
-                        true
-                    )
-                }
+                // Same abort path as a foreground Escape: SIGTERM now, SIGKILL
+                // after 5s if the child is stuck inside a tool call.
+                row.entry.abort()
+                showNotice(
+                    `Aborting ${shortSubagentId(row.id)} — SIGTERM sent (SIGKILL after 5s if ignored); the row drops out when the child exits.`
+                )
                 return
             }
             if (ch === 'b') {
@@ -3451,6 +3498,16 @@ const SubagentInspectParams = Type.Object({
     ),
 })
 
+const SubagentSteerParams = Type.Object({
+    id: Type.String({
+        description: 'Id of a running subagent (exact id or unique suffix)',
+    }),
+    message: Type.String({
+        description:
+            'Correction to queue for the child’s next turn boundary (not an interruption)',
+    }),
+})
+
 export default function (pi: ExtensionAPI) {
     eventBus = pi.events
     latestPi = pi
@@ -3481,11 +3538,9 @@ export default function (pi: ExtensionAPI) {
             // In-memory only; the reload drops it regardless.
         }
         for (const entry of activeSubagents.values()) {
-            try {
-                entry.proc.kill('SIGTERM')
-            } catch {
-                // Already dead.
-            }
+            // Same kill path as an explicit abort, so a child stuck in a tool call is
+            // still escalated to SIGKILL while the (surviving) parent process lives.
+            entry.abort()
         }
         activeSubagents.clear()
     })
@@ -3765,7 +3820,7 @@ export default function (pi: ExtensionAPI) {
                         params.task,
                         params.cwd,
                         undefined,
-                        undefined, // signal: background runs have NO abort source (spec §1.1)
+                        undefined, // signal: runAbort is this run's abort path; undefined so Escape cannot kill it (spec §1.1)
                         undefined, // onUpdate: tool returns immediately; nothing to stream to
                         makeDetails('single'),
                         resume,
@@ -3806,6 +3861,7 @@ export default function (pi: ExtensionAPI) {
                                         `Task: ${previewText(params.task, LIST_TASK_PREVIEW_CHARS)}`,
                                         `You'll be notified when it completes. Call subagent_collect { id: "${shortSubagentId(entry.id)}" } for the result;`,
                                         `subagent_inspect { id: "${shortSubagentId(entry.id)}" } for progress.`,
+                                        `subagent_steer { id: "${shortSubagentId(entry.id)}", message } to correct it mid-run — queued at its next turn boundary, not an interruption.`,
                                         'There is nothing to wait for: end your turn now. The ' +
                                             'completion notification starts your next turn; ' +
                                             'sleeping or polling delays it without bringing the ' +
@@ -4336,6 +4392,100 @@ export default function (pi: ExtensionAPI) {
         },
     })
 
+    pi.registerTool({
+        name: 'subagent_steer',
+        label: 'Subagent Steer',
+        description: [
+            'Queue a steering message for a running subagent (exact id or unique suffix): foreground or background.',
+            "Delivery happens at the child's next turn boundary — after the tool call it is running now,",
+            'before its next LLM request — so it does not interrupt a running tool call and does not undo a',
+            'committed edit. Its effect is unverified: prefer aborting and resuming with a corrected brief',
+            'when the run has already gone the wrong way.',
+        ].join(' '),
+        parameters: SubagentSteerParams,
+
+        async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+            capturePiSessionId(ctx)
+            // Same registry resolution (exact, then unique suffix) the collect tool
+            // uses: a steer target is a registry entry, not a persisted run.
+            const resolved = resolveCollectTarget(params.id)
+            if ('error' in resolved) {
+                return {
+                    content: [{ type: 'text', text: resolved.error }],
+                    details: undefined,
+                    isError: true,
+                }
+            }
+            const shortId = shortSubagentId(resolved.id)
+            if (resolved.kind === 'ready') {
+                return {
+                    content: [
+                        {
+                            type: 'text',
+                            text:
+                                `Refused: subagent ${shortId} has already settled — nothing is running to steer. ` +
+                                `Call subagent_collect { id: "${shortId}" } for its result, or start a new run ` +
+                                `(subagent { agent, task, resume: "${shortId}" } to continue it).`,
+                        },
+                    ],
+                    details: undefined,
+                    isError: true,
+                }
+            }
+            const entry = activeSubagents.get(resolved.id)
+            if (
+                !entry ||
+                entry.settled ||
+                entry.proc.exitCode !== null ||
+                entry.proc.signalCode !== null
+            ) {
+                // A settled child is on its way out of the registry: a steer would be
+                // written to a dying process and never reach a turn boundary.
+                return {
+                    content: [
+                        {
+                            type: 'text',
+                            text: `Refused: subagent ${shortId} is settling or already exited — its last turn boundary has passed. Call subagent_collect { id: "${shortId}" } for the result.`,
+                        },
+                    ],
+                    details: undefined,
+                    isError: true,
+                }
+            }
+            const writeError = entry.steer(params.message)
+            if (writeError !== undefined) {
+                return {
+                    content: [
+                        {
+                            type: 'text',
+                            text: `Steer FAILED for subagent ${shortId}: the stdin write to the child did not succeed (${writeError}). Nothing was queued; the child may be exiting. Abort it (/subagents abort ${shortId}) and resume with a corrected brief.`,
+                        },
+                    ],
+                    details: undefined,
+                    isError: true,
+                }
+            }
+            return {
+                content: [{ type: 'text', text: buildSteerResult(entry) }],
+                details: undefined,
+            }
+        },
+
+        renderCall(args, theme, _context) {
+            const preview = args.id.length > 40 ? `${args.id.slice(0, 40)}...` : args.id
+            const text =
+                theme.fg('toolTitle', theme.bold('subagent_steer ')) +
+                theme.fg('accent', preview) +
+                theme.fg('muted', `: ${previewText(args.message, LIST_TASK_PREVIEW_CHARS)}`)
+            return new Text(text, 0, 0)
+        },
+
+        renderResult(result, _options, _theme, _context) {
+            const text = result.content[0]
+            return new Text(text?.type === 'text' ? text.text : '(no output)', 0, 0)
+        },
+    })
+
     pi.registerCommand('subagents', {
         description:
             'Manage subagents: bare = interactive manager view (TUI) or session-scoped text report (print); ' +
@@ -4359,21 +4509,17 @@ export default function (pi: ExtensionAPI) {
             }
             if (sub === 'abort') {
                 // Registry-resolved like attach (exact/unique suffix/single-entry
-                // default); SIGTERMs the child and lets the existing close
-                // handlers settle the registry and any pending tool result.
+                // default) and killed through the run's own abort source, so a
+                // background run escalates to SIGKILL exactly like a foreground one.
                 const resolved = resolveAttachTarget(rest[0])
                 if (typeof resolved === 'string') {
                     emitCommandNotice(ctx, resolved, 'warning')
                     return
                 }
-                try {
-                    resolved.proc.kill('SIGTERM')
-                } catch {
-                    /* already dead — the close handler settles the registry */
-                }
+                resolved.abort()
                 emitCommandNotice(
                     ctx,
-                    `Aborting subagent ${shortSubagentId(resolved.id)} (SIGTERM sent).`,
+                    `Aborting subagent ${shortSubagentId(resolved.id)} (SIGTERM sent, SIGKILL after 5s if ignored).`,
                     'info'
                 )
                 return

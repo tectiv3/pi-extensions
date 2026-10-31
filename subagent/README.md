@@ -12,6 +12,7 @@ Delegate tasks to specialized subagents with isolated context windows.
 - **Persistence**: Interrupted or failed runs survive under `~/.pi/agent/subagents/` with a subagent id
 - **Resume**: Continue a persisted run in the same conversation (`resume: "<id or unique suffix>"`, single mode)
 - **Recoverable abort**: Interrupting the parent returns an error tool result with partial output, not an exception
+- **Steering**: `subagent_steer { id, message }` queues a correction for a running foreground or background run; it is delivered at the child's next turn boundary, never as an interruption (see [Steering a running run](#steering-a-running-run-subagent_steer))
 - **Background runs**: `background: true` returns immediately, leaving the child running; completion is delivered as a notification and fetched with `subagent_collect` (single mode); a running foreground single run can also be converted mid-flight from `/subagents` (`b`)
 - **Running-subagents footer**: the pi footer shows live running subagents (`⏳ <n>: <agent> <id> <elapsed> <turns>t ↓<output>`, elapsed refreshed every 10s, counters per turn)
 
@@ -95,14 +96,17 @@ Use a chain: first have scout find the read tool, then have planner suggest impr
 | Chain | `{ chain: [...] }` | Sequential with `{previous}` placeholder |
 | Background | `{ agent, task, background: true }` | Returns immediately; result delivered by notification, fetched via subagent_collect (single mode only) |
 
-The extension also registers the `subagent_inspect` and `subagent_collect` tools and the
-`/subagents` command — see [Persistence & Resume](#persistence--resume).
+The extension also registers the `subagent_inspect`, `subagent_collect`, and
+`subagent_steer` tools and the `/subagents` command — see
+[Persistence & Resume](#persistence--resume) and
+[Steering a running run](#steering-a-running-run-subagent_steer).
 
 **Delegation is one level deep.** Every child is spawned with `--exclude-tools`
-listing `subagent`, `subagent_inspect`, and `subagent_collect`, so subagents cannot
-themselves delegate. The denylist is applied after `--tools`, so it holds for agents
-without `tools:` frontmatter too — those would otherwise inherit the full default
-toolset. Nesting is hard-blocked, not merely discouraged by a prompt.
+listing `subagent`, `subagent_inspect`, `subagent_collect`, and `subagent_steer`, so
+subagents cannot themselves delegate or steer a sibling. The denylist is applied after
+`--tools`, so it holds for agents without `tools:` frontmatter too — those would
+otherwise inherit the full default toolset. Nesting is hard-blocked, not merely
+discouraged by a prompt.
 
 ## Per-dispatch model
 
@@ -183,6 +187,11 @@ files contain full tool output, potentially secrets):
 - **Escape** (`app.interrupt`) aborts the running subagent: the child process is killed and
   the tool returns a recoverable **error tool result** — not an exception — with the partial
   output up to the last `message_end`, the subagent id, and a resume hint.
+- **Every abort escalates**: each run owns an abort source, and the kill sequence is SIGTERM,
+  then SIGKILL if the child is still alive 5 seconds later. `/subagents abort <id>` and the
+  manager's `x` key abort a child the same way, foreground or background — a background run
+  has no parent abort signal, but it does have its own abort source, so it is not a special
+  case.
 - **Ctrl+C does not abort subagents** (it clears the editor / exits the session instead).
 - Children that fail or are killed externally produce the same failure report. The behavior
   is uniform across modes: a failed or aborted run reports its partial output, id, and a
@@ -248,6 +257,47 @@ that announces a settlement.
 
 Scope is the current process only (running runs, or settled results not yet collected).
 
+### Steering a running run: `subagent_steer`
+
+`subagent_steer { id, message }` writes a steering message to a running child's stdin
+(RPC `steer`). `id` is exact or a unique suffix, resolved against running runs first and
+settled background results second (ambiguous suffixes list the matches; an unknown id
+errors). It works on foreground and background runs.
+
+What the tool actually guarantees, and nothing beyond it:
+
+- **Queued, not applied**: the message is accepted by the transport and delivered at the
+  child's **next turn boundary** — after the tool call it is running now finishes, before
+  its next LLM request. A long `bash` call keeps running; nothing is preempted.
+- **It does not undo anything**: an edit the child already committed stays committed, and
+  the correction only affects what the child does next.
+- **The effect is unverified**: the result says "queued" because that is all the parent
+  observed. Whether the child reads it, obeys it, or finishes before the boundary arrives
+  is invisible to the caller — verify the outcome with `subagent_inspect` /
+  `subagent_collect` rather than assuming the correction landed.
+- **It is not a safety mechanism**: steering cannot stop a run from doing damage, cannot
+  cancel a tool call, and is not a substitute for a careful brief.
+- **Chain mode**: a chain item is steerable only while it is the live child; the result
+  names the chain step and agent it landed on. Between items there is no child to steer and
+  the call errors instead of queueing into the next step.
+- **Refusals**: a run that has settled or is settling is refused (its last turn boundary
+  has passed) with a hint to collect the result or resume; a failed stdin write is reported
+  as a tool error, never swallowed.
+- **Reachability**: a foreground `subagent` tool call blocks the parent's turn and a chain
+  is foreground-only, so in practice this tool reaches **background** runs (spawned detached
+  or runtime-backgrounded). A foreground run, including a live chain item, is steered by the
+  human through `/subagents attach` — same write, same turn-boundary semantics.
+- The watchdog is unaffected: a steer resets the activity timer, so a queued steer cannot
+  cause a silent kill, and it cannot keep a genuinely dead child alive.
+
+**Prefer abort + resume when the run is already wrong.** Steering is a forward-only nudge.
+If the child has committed the wrong edit, spent its budget on the wrong approach, or is
+stuck in a tool call, a queued message will not help: abort it (`/subagents abort <id>`, or
+Escape for a foreground run) and resume with a corrected brief —
+`subagent { agent, task, resume: "<id>" }` keeps the conversation and replaces the
+instruction. The same applies to a chain that has stopped: restart with a corrected plan
+rather than trying to steer a finished run.
+
 ### Listing runs: `/subagents`
 
 Opens the interactive manager view (TUI): RUNNING rows — short id (last 8 characters),
@@ -276,7 +326,8 @@ tool calls formatted like the parent TUI, tool output truncated (200 chars). Str
   turn); `Backspace` edits the line; pastes are supported (bracketed-paste markers are
   stripped and newlines/tabs flattened to spaces). The sent line shows up in the transcript
   as a muted `‹you› ...` marker once the child accepts it. Scroll keys are unaffected —
-  arrow keys still scroll, printable keys never do.
+  arrow keys still scroll, printable keys never do. This is the same write `subagent_steer`
+  performs, with the same semantics: queued for the next turn boundary, not applied.
 - **Detach**: `Esc` returns to the parent editor; the subagent keeps running.
 - **Auto-detach**: the view closes by itself when the subagent finishes
   (`agent_settled`) or its process exits (watchdog kill, crash, abort — the parent's abort
@@ -295,7 +346,9 @@ full id plus `subagent_collect` / `subagent_inspect` hints). The child keeps run
   print mode too (no notification channel); use the blocking call there.
 - **Detached from the parent's abort** — Escape does not kill a background child. Kill it
   with `/subagents abort <id>` or the manager view's `x` key; a killed run settles as a
-  failure notification.
+  failure notification. Both paths use the same kill sequence as a foreground abort:
+  SIGTERM, then SIGKILL if the child is still alive after 5 seconds — so a child stuck
+  inside a long tool call (the usual reason a steer did not help) still dies.
 - **Relayed questions** (`confirm`/`select`/`input`) still reach the parent TUI, but there
   is no abort source: the dialog stays until the user answers or dismisses it (the stall
   watchdog is paused while the relay is pending).
@@ -451,3 +504,10 @@ resume hint:
   question leaves the dialog open until answered or dismissed
 - **L9 — uncollected results have no UI**: they are visible only in the completion
   notification
+- **L10 — a steer is a queued message, not a correction**: it is delivered at the child's
+  next turn boundary, so it cannot interrupt a running tool call, undo a committed edit, or
+  stop a run that is already off the rails. Nothing in the parent observes whether the child
+  obeys it, so the tool result says only "not yet in effect"
+- **L11 — chain items are steerable only while live**: each chain step registers and
+  unregisters its own id, so a steer between items finds no child. Chains are foreground-only,
+  so the human's `/subagents attach` view is the realistic chain-steering entry point

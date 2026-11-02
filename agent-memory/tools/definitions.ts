@@ -137,12 +137,14 @@ export interface ScopeOverview {
     project: string
     /** Open notes only: a gated key is not reachable without a confirmation (§5.2). */
     open: NoteSummary[]
-    /** Counted, never named. */
+    /** Gated keys by name, in the same rank order as `open`; never a first line. */
+    gatedKeys: string[]
+    /** `gatedKeys.length`, for callers that only need the count. */
     gated: number
 }
 
 /**
- * One tier's listing: open keys, newest first, plus how many gated notes were withheld.
+ * One tier's listing: open keys, newest first, plus the names of the gated notes.
  *
  * `access` is re-checked against the file for every row that claims to be open, so a
  * note hand-gated mid-session drops out of the listing immediately instead of at the
@@ -155,28 +157,30 @@ function overviewFor(
 ): ScopeOverview {
     const rows = listNotes(deps.store.db, { scope, project })
     const open: NoteSummary[] = []
-    let gated = 0
+    const gatedKeys: string[] = []
     for (const row of rows) {
         if (resolveRowAccess(deps.store.root, row) === 'gated') {
-            gated++
+            // A name is enough to ask for the note; the body is never rendered (§5.2).
+            gatedKeys.push(row.key)
             continue
         }
         open.push({ key: row.key, firstLine: firstLine(row.body) })
     }
-    return { scope, project, open, gated }
+    return { scope, project, open, gatedKeys, gated: gatedKeys.length }
 }
 
 /**
  * Every tier a discovery path covers, in rank order (§5.1, F3): the project's notes
  * first, then the global ones, with the gated counts summed. An explicit `scope`
  * narrows this to exactly one entry, and a cwd outside a work tree yields global only.
+ * Gated keys stay per tier so a renderer can budget each tier separately.
  */
 export interface ScopesOverview {
     /** Per-tier listings, primary first. */
     overviews: ScopeOverview[]
     /** Open summaries from every tier, in the same order. */
     open: NoteSummary[]
-    /** Gated notes withheld across every tier. */
+    /** Gated notes named across every tier. */
     gated: number
 }
 
@@ -200,10 +204,11 @@ export function scopesLabel(overviews: readonly ScopeOverview[]): string {
 }
 
 /**
- * `memory_index`'s text: one header naming every tier searched, the keys in rank order,
- * and the summed gated count. With more than one tier each row also carries its own
- * label — ordering alone would make "which tier is this key in" a guess, and the caller
- * needs the answer to name a `scope` on a later mutation.
+ * `memory_index`'s text: one header naming every tier searched, the open keys in rank
+ * order with their first line, and the gated keys by name alone. With more than one
+ * tier each row also carries its own label — ordering alone would make "which tier is
+ * this key in" a guess, and the caller needs the answer to name a `scope` on a later
+ * mutation.
  */
 export function memoryIndex(deps: MemoryDeps, input: IndexInput = {}): ToolResult {
     let overview: ScopesOverview
@@ -220,13 +225,18 @@ export function memoryIndex(deps: MemoryDeps, input: IndexInput = {}): ToolResul
     }
     const multi = overview.overviews.length > 1
     for (const entry of overview.overviews) {
+        const label = scopeLabel(entry.scope, entry.project)
         for (const summary of entry.open) {
             const line =
                 summary.firstLine === '' ? summary.key : `${summary.key}: ${summary.firstLine}`
-            lines.push(multi ? `${line} (${scopeLabel(entry.scope, entry.project)})` : line)
+            lines.push(multi ? `${line} (${label})` : line)
+        }
+        // Name only: no first line, no body — the `gated` marker keeps the row from
+        // reading as an open note whose body starts blank.
+        for (const key of entry.gatedKeys) {
+            lines.push(multi ? `${key} (gated, ${label})` : `${key} (gated)`)
         }
     }
-    if (overview.gated > 0) lines.push(`gated: ${overview.gated} hidden`)
 
     return {
         text: lines.join('\n'),
@@ -239,6 +249,7 @@ export function memoryIndex(deps: MemoryDeps, input: IndexInput = {}): ToolResul
             })),
             keys: overview.open.map(summary => summary.key),
             gated: overview.gated,
+            gatedKeys: overview.overviews.flatMap(entry => entry.gatedKeys),
         },
     }
 }

@@ -269,19 +269,32 @@ test('the entry point registers six tools on session_start and caches the index 
     const handle = agentMemoryExtension(pi.api)
     assert.equal(handle.indexBlock(), '')
 
-    await pi.emit(
-        'session_start',
-        { reason: 'startup' },
-        toolContext(tempDir(t, 'pi-memory-ctx-'))
-    )
+    const ctx = toolContext(tempDir(t, 'pi-memory-ctx-'))
+    await pi.emit('session_start', { reason: 'startup' }, ctx)
 
     assert.deepEqual([...pi.tools.keys()].sort(), [...MEMORY_TOOL_NAMES].sort())
     const block = handle.indexBlock()
     assert.match(block, /^scope: global$/m)
     assert.match(block, /auth\/session/)
-    assert.match(block, /^gated: 1 hidden \(ask for one by name\)$/m)
-    assert.ok(!block.includes(SECRET_KEY), 'the injected block named a gated key')
-    assert.ok(!block.includes(SECRET_TOKEN))
+    assert.match(
+        block,
+        new RegExp(`^gated: ${SECRET_KEY} — names only, memory_read asks the user$`, 'm')
+    )
+    assert.ok(block.includes(SECRET_KEY), 'the injected block did not name the gated key')
+    assert.ok(!block.includes(SECRET_TOKEN), 'the injected block carried a gated body')
+
+    // The tool names the key too, and withholds the same body the block does.
+    const index = await call(pi, 'memory_index', {}, ctx)
+    assert.ok(index.content[0].text.includes(SECRET_KEY), 'memory_index hid the gated name')
+    assert.ok(!index.content[0].text.includes(SECRET_TOKEN), 'memory_index leaked a body')
+
+    // Discovery by name is not discovery by content: search still refuses to reach it.
+    const search = await call(pi, 'memory_search', { query: 'SWORDFISH' }, ctx)
+    assert.ok(
+        !search.content[0].text.includes(SECRET_KEY),
+        'memory_search returned a gated key'
+    )
+    assert.ok(!search.content[0].text.includes(SECRET_TOKEN), 'memory_search leaked a body')
 
     await pi.emit('session_shutdown', { reason: 'quit' })
     assert.equal(handle.indexBlock(), '')

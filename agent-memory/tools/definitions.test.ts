@@ -301,7 +301,7 @@ test('memory_read on a gated note without a reason does not reach the gate', asy
 // 3. memory_index
 // ---------------------------------------------------------------------------
 
-test('memory_index lists open keys and hides gated ones behind a count', async t => {
+test('memory_index lists open keys and names gated ones without their bodies', async t => {
     ensureNotSubagent(t)
     useStoreDir(t)
     const store = openSeededStore(t)
@@ -314,10 +314,11 @@ test('memory_index lists open keys and hides gated ones behind a count', async t
     assert.equal(result.isError, undefined)
     assert.match(result.text, /auth\/session: Tokens are refreshed on every request\./)
     assert.match(result.text, /build\/flake: nix build \.#default/)
-    assert.match(result.text, /^gated: 1 hidden$/m)
-    assert.ok(!result.text.includes(SECRET_KEY), 'a gated key was named')
+    // The name is discoverable; the first line and the body are not rendered.
+    assert.match(result.text, new RegExp(`^${SECRET_KEY} \\(gated\\)$`, 'm'))
     assert.ok(!result.text.includes(SECRET_TOKEN), 'a gated body leaked')
     assert.equal((result.details as { gated: number }).gated, 1)
+    assert.deepEqual((result.details as { gatedKeys: string[] }).gatedKeys, [SECRET_KEY])
 })
 
 test('memory_index with no notes says so and never fabricates a count', t => {
@@ -762,9 +763,12 @@ test('memory_index lists project keys first under one line naming both tiers', a
     // later mutation.
     assert.match(lines[projectAt], /^build\/flags: nix build with --impure \(project:\S+\)$/)
     assert.equal(lines[globalAt], 'editor/prefs: helix, never vim (global)')
-    assert.match(result.text, /^gated: 2 hidden$/m)
-    // Gated keys are counted across both tiers, never named.
-    assert.ok(!result.text.includes('secrets/'))
+    // Gated rows are named with the tier they live in and never carry a first line.
+    assert.match(result.text, /^secrets\/project \(gated, project:\S+\)$/m)
+    assert.match(result.text, /^secrets\/global \(gated, global\)$/m)
+    assert.ok(!result.text.includes('gated project body'), 'a gated body leaked')
+    assert.ok(!result.text.includes('gated global body'), 'a gated body leaked')
+    assert.equal((result.details as { gated: number }).gated, 2)
     assert.deepEqual((result.details as { scopes: unknown[] }).scopes.length, 2)
 })
 
@@ -852,8 +856,10 @@ test('a note hand-gated mid-session leaves search and the index without a reinde
     assert.ok(!searched.text.includes('zanzibar token body'))
 
     const indexed = memoryIndex(deps(t, store))
-    assert.ok(!indexed.text.includes('ops/secret'), 'a hand-gated key was listed')
-    assert.match(indexed.text, /^gated: 1 hidden$/m)
+    // The stale row is re-checked against the file, so the name moves to the gated area
+    // and the body it used to expose is gone even without a reindex.
+    assert.match(indexed.text, /^ops\/secret \(gated\)$/m)
+    assert.ok(!indexed.text.includes('zanzibar token body'), 'a hand-gated body leaked')
 })
 
 test('a read that fell back to global is gated by the global note it found', async t => {

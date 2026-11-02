@@ -8,6 +8,7 @@ import test, { type TestContext } from 'node:test'
 import { resolveProjectId } from '../store/project.ts'
 import { openStore, type Store } from '../store/store.ts'
 import {
+    GLOBAL_TIER_RESERVED_KEYS,
     MAX_INDEX_CHARS,
     MAX_INDEX_KEYS,
     buildIndexBlock,
@@ -65,6 +66,33 @@ function keysLine(block: string): string {
     return block.split('\n')[1] ?? ''
 }
 
+/** A git work tree inside the store's scope: the cwd decides project identity. */
+function repoStore(t: TestContext): { root: string; repo: string; store: Store } {
+    const root = useStoreDir(t)
+    const repo = tempDir(t, 'pi-memory-block-repo-')
+    const init = spawnSync('git', ['init', '--quiet', '-b', 'main'], {
+        cwd: repo,
+        encoding: 'utf8',
+        timeout: 10_000,
+    })
+    assert.equal(init.status, 0, `git init failed: ${init.stderr}`)
+    const store = openStore(repo)
+    t.after(() => store.close())
+    return { root, repo, store }
+}
+
+/** `count` short project notes, oldest first, so index 0 is the one a cap hides. */
+function seedProjectNotes(root: string, projectId: string, count: number, base: number): void {
+    const dir = path.join(root, `projects/${projectId}/bulk`)
+    fs.mkdirSync(dir, { recursive: true })
+    for (let index = 0; index < count; index++) {
+        const file = path.join(dir, `note_${String(index).padStart(3, '0')}.md`)
+        fs.writeFileSync(file, 'body')
+        const stamp = new Date(base + index * 1000)
+        fs.utimesSync(file, stamp, stamp)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // block content (§6.1)
 // ---------------------------------------------------------------------------
@@ -75,29 +103,32 @@ test('an empty store produces no block at all', t => {
     assert.equal(buildIndexBlock({ store, cwd }), '')
 })
 
-test('an all-gated store still reports the count, and names no key', t => {
+test('an all-gated store names every gated key and none of their bodies', t => {
     const { root, store } = openStoreFor(t)
-    seedFile(root, 'secrets/one', '---\naccess: gated\n---\nbody')
-    seedFile(root, 'secrets/two', '---\naccess: gated\n---\nbody')
+    const base = 1_700_000_000_000
+    seedFile(root, 'secrets/one', '---\naccess: gated\n---\nSWORDFISH-one', base)
+    seedFile(root, 'secrets/two', '---\naccess: gated\n---\nSWORDFISH-two', base + 5_000)
     store.reindex()
 
     const block = buildIndexBlock({ store, cwd: tempDir(t, 'pi-memory-block-cwd-') })
-    assert.equal(block, 'scope: global\ngated: 2 hidden (ask for one by name)')
-    assert.ok(!block.includes('secrets/one'))
+    assert.equal(
+        block,
+        'scope: global\ngated: secrets/two, secrets/one — names only, memory_read asks the user'
+    )
+    assert.ok(!block.includes('SWORDFISH'), 'a gated body was injected')
 })
 
-test('the block carries the scope, the keys and the gated count', t => {
+test('the block carries the scope, the open keys, and gated names without bodies', t => {
     const { root, store } = openStoreFor(t)
     seedFile(root, 'auth/session', 'tokens are refreshed on request')
-    seedFile(root, 'secrets/api_token', '---\naccess: gated\n---\nrotated by hand')
+    seedFile(root, 'secrets/api_token', '---\naccess: gated\n---\nSWORDFISH-rotated')
     store.reindex()
 
     const block = buildIndexBlock({ store, cwd: tempDir(t, 'pi-memory-block-cwd-') })
     assert.match(block, /^scope: global$/m)
     assert.match(block, /^auth\/session$/m)
-    assert.match(block, /^gated: 1 hidden \(ask for one by name\)$/m)
-    assert.ok(!block.includes('secrets/api_token'), 'a gated key was named')
-    assert.ok(!block.includes('rotated by hand'), 'a gated body was injected')
+    assert.match(block, /^gated: secrets\/api_token — names only, memory_read asks the user$/m)
+    assert.ok(!block.includes('SWORDFISH'), 'a gated body was injected')
 })
 
 test('keys are ordered mtime DESC then id DESC, and the cap keeps the newest', t => {
@@ -159,16 +190,7 @@ test('the character cap cuts before 4,800 characters of keys', t => {
 })
 
 test('inside a repository the block names and lists both tiers, project first', t => {
-    const root = useStoreDir(t)
-    const repo = tempDir(t, 'pi-memory-block-repo-')
-    const init = spawnSync('git', ['init', '--quiet', '-b', 'main'], {
-        cwd: repo,
-        encoding: 'utf8',
-        timeout: 10_000,
-    })
-    assert.equal(init.status, 0, `git init failed: ${init.stderr}`)
-    const store = openStore(repo)
-    t.after(() => store.close())
+    const { root, repo, store } = repoStore(t)
     const projectId = resolveProjectId(repo)?.id
     assert.ok(projectId !== undefined)
 
@@ -188,6 +210,109 @@ test('inside a repository the block names and lists both tiers, project first', 
     // Naming the tier is the whole point: a reader must be able to tell which one a
     // key came from, and the ordering is the only signal on the key line.
     assert.ok(!block.includes('gated:'))
+})
+
+test('a project over the key cap still leaves the global tier in the block', t => {
+    const { root, repo, store } = repoStore(t)
+    const projectId = resolveProjectId(repo)?.id
+    assert.ok(projectId !== undefined)
+
+    const base = 1_700_000_000_000
+    const overflow = 6
+    seedProjectNotes(root, projectId, MAX_INDEX_KEYS + overflow, base)
+    seedFile(root, 'editor/prefs', 'global editor prefs', base + 60_000)
+    assert.equal(store.reindex().updated, MAX_INDEX_KEYS + overflow + 1)
+
+    const block = buildIndexBlock({ store, cwd: repo })
+    const line = keysLine(block)
+    // Without the reservation the project's keys fill the line on their own and the
+    // global tier — appended after it — disappears.
+    assert.ok(line.includes('editor/prefs'), `the global tier was starved: ${line}`)
+    const projectCap = MAX_INDEX_KEYS - GLOBAL_TIER_RESERVED_KEYS
+    assert.match(
+        line,
+        new RegExp(
+            `\\+${MAX_INDEX_KEYS + overflow - projectCap} more \\(recent first, project\\)`
+        )
+    )
+    // project keys, the project marker (it contains a comma of its own), the global key
+    assert.equal(line.split(', ').length, projectCap + 3)
+    assert.ok(!line.includes('bulk/note_000'), 'the project cap kept the oldest note')
+})
+
+test('an empty global tier costs the project no reservation', t => {
+    const { root, repo, store } = repoStore(t)
+    const projectId = resolveProjectId(repo)?.id
+    assert.ok(projectId !== undefined)
+
+    const base = 1_700_000_000_000
+    const overflow = 6
+    seedProjectNotes(root, projectId, MAX_INDEX_KEYS + overflow, base)
+    assert.equal(store.reindex().updated, MAX_INDEX_KEYS + overflow)
+
+    const block = buildIndexBlock({ store, cwd: repo })
+    const line = keysLine(block)
+    // The global tier is empty, so it renders no text and must not tax the project: the
+    // whole key cap is available and only the true overflow is reported.
+    assert.match(line, /\+6 more \(recent first, project\)$/)
+    assert.match(block, /^scope: project:\S+ \+ global$/m)
+    assert.equal(block.split('\n').length, 2, `an empty tier rendered a line: ${block}`)
+    assert.equal(line.split('bulk/').length - 1, MAX_INDEX_KEYS)
+    assert.ok(line.includes('bulk/note_205'), 'the newest note is missing')
+    assert.ok(!line.includes('bulk/note_000'), 'the project cap kept the oldest note')
+})
+
+test('a trailing tier of gated names alone still keeps its reservation', t => {
+    const { root, repo, store } = repoStore(t)
+    const projectId = resolveProjectId(repo)?.id
+    assert.ok(projectId !== undefined)
+
+    const base = 1_700_000_000_000
+    const overflow = 6
+    seedProjectNotes(root, projectId, MAX_INDEX_KEYS + overflow, base)
+    seedFile(
+        root,
+        'secrets/api_token',
+        '---\naccess: gated\n---\nSWORDFISH-rotated',
+        base + 60_000
+    )
+    assert.equal(store.reindex().updated, MAX_INDEX_KEYS + overflow + 1)
+
+    const block = buildIndexBlock({ store, cwd: repo })
+    const line = keysLine(block)
+    // A gated name is something to render, so the tier is not empty and the project
+    // still leaves it room.
+    const projectCap = MAX_INDEX_KEYS - GLOBAL_TIER_RESERVED_KEYS
+    assert.match(
+        line,
+        new RegExp(
+            `\\+${MAX_INDEX_KEYS + overflow - projectCap} more \\(recent first, project\\)`
+        )
+    )
+    assert.equal(line.split('bulk/').length - 1, projectCap)
+    assert.match(block, /^gated: secrets\/api_token — names only, memory_read asks the user$/m)
+    assert.ok(!block.includes('SWORDFISH'), 'a gated body was injected')
+})
+
+test('a gated name that does not fit the spent budget is reported as a count', t => {
+    const { root, store } = openStoreFor(t)
+    // Long keys exhaust the character cap before the key cap, so the gated line is
+    // rendered with no room left for a name.
+    for (let index = 0; index < MAX_INDEX_KEYS; index++) {
+        const key = `long/${'a'.repeat(20)}_${String(index).padStart(3, '0')}/${'b'.repeat(12)}`
+        seedFile(root, key, 'body')
+    }
+    seedFile(root, 'secrets/api_token', '---\naccess: gated\n---\nSWORDFISH-rotated')
+    assert.equal(store.reindex().updated, MAX_INDEX_KEYS + 1)
+
+    const block = buildIndexBlock({ store, cwd: tempDir(t, 'pi-memory-block-cwd-') })
+    assert.match(block, /^gated: \+1 more — names only, memory_read asks the user$/m)
+    assert.ok(!block.includes('secrets/api_token'), 'a gated name overran the budget')
+    assert.ok(
+        keysLine(block).length <= MAX_INDEX_CHARS + 32,
+        `keys line is ${keysLine(block).length}`
+    )
+    assert.ok(!block.includes('SWORDFISH'), 'a gated body was injected')
 })
 
 // ---------------------------------------------------------------------------

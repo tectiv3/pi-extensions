@@ -35,7 +35,7 @@ the exact text is always available from the command that makes it obsolete.
 
 | Tool | What it does |
 |---|---|
-| `memory_index(scope?)` | Lists keys in scope with the first line of each body; gated notes appear only as `gated: N hidden`. |
+| `memory_index(scope?)` | Lists keys in scope with the first line of each body; gated notes are listed by key only (`key (gated)`), never by first line. |
 | `memory_search(query, scope?, limit?)` | BM25 + vector search fused with RRF (default 10 results); gated notes are excluded in SQL. |
 | `memory_read(key, scope?, reason?)` | Reads one note's body (frontmatter stripped). Gated → confirm + log. |
 | `memory_write(key, body, scope?, access?, baseHash?, reason?)` | Creates or fully replaces a note; returns a unified diff. |

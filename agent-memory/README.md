@@ -37,7 +37,7 @@ the exact text is always available from the command that makes it obsolete.
 |---|---|
 | `memory_index(scope?)` | Lists keys in scope with the first line of each body; gated notes are listed by key only (`key (gated)`), never by first line. |
 | `memory_search(query, scope?, limit?)` | BM25 + vector search fused with RRF (default 10 results); gated notes are excluded in SQL. |
-| `memory_read(key, scope?, reason?)` | Reads one note's body (frontmatter stripped). Gated → confirm + log. |
+| `memory_read(key, scope?, reason?)` | Reads one note's body (frontmatter stripped). Gated → confirmation + log; `reason` is optional and is the recorded justification. |
 | `memory_write(key, body, scope?, access?, baseHash?, reason?)` | Creates or fully replaces a note; returns a unified diff. |
 | `memory_edit(key, oldText, newText, baseHash, scope?, reason?)` | Exact-text replacement. Rejected when `oldText` matches twice, touches frontmatter, or `baseHash` is stale. |
 | `memory_delete(key, scope?, reason?)` | Deletes the file and its index rows; git history keeps the content. |
@@ -62,8 +62,9 @@ else global.
 A note is `gated` when its frontmatter says `access: gated`. The body is still plaintext in the git
 repo; what changes is the extension's own behaviour: `memory_index`, `memory_search`, the injected key
 index and mention detection never expose the body, and `memory_read`/`memory_write`/`memory_edit`/
-`memory_delete`/`/memory search`/`/memory diff` on that note need an explicit confirmation plus a
-`reason` that is written to `access.log`. A subagent (`PI_MEMORY_SUBAGENT=1`) is denied outright.
+`memory_delete`/`/memory search`/`/memory diff` on that note need an explicit confirmation, and a
+supplied `reason` is written to `access.log` as the justification (optional for a read, required to
+mutate). A subagent (`PI_MEMORY_SUBAGENT=1`) is denied outright.
 
 **It is advisory, not a boundary.** `bash` bypasses it completely — `cat ~/.pi/memory/global/x.md`,
 `grep -r`, `git show`, or pi's own `read` tool all reach a gated body with no confirmation and no log

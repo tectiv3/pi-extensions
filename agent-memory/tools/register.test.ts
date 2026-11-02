@@ -7,7 +7,7 @@ import test, { type TestContext } from 'node:test'
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent'
 
 import type { GateContext } from '../gate/gate.ts'
-import { buildIndexBlock } from '../inject/index-block.ts'
+import { GATED_HINT, buildIndexBlock } from '../inject/index-block.ts'
 import agentMemoryExtension from '../index.ts'
 import { openStore, type Store } from '../store/store.ts'
 import { MEMORY_TOOL_NAMES, registerMemoryTools } from './register.ts'
@@ -276,10 +276,7 @@ test('the entry point registers six tools on session_start and caches the index 
     const block = handle.indexBlock()
     assert.match(block, /^scope: global$/m)
     assert.match(block, /auth\/session/)
-    assert.match(
-        block,
-        new RegExp(`^gated: ${SECRET_KEY} — names only, memory_read asks the user$`, 'm')
-    )
+    assert.match(block, new RegExp(`^gated: ${SECRET_KEY} — ${GATED_HINT}$`, 'm'))
     assert.ok(block.includes(SECRET_KEY), 'the injected block did not name the gated key')
     assert.ok(!block.includes(SECRET_TOKEN), 'the injected block carried a gated body')
 

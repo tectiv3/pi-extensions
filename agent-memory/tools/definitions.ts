@@ -11,9 +11,11 @@
  * - **Nothing here throws.** A stale `baseHash`, a rejected key or a missing project
  *   scope becomes `{ isError: true, text }`: a tool result carries its message to the
  *   model, a thrown error carries a stack to nobody.
- * - **Gated work goes through the gate with a reason.** `write`/`edit`/`delete` are
- *   gated inside the store (they touch disk), so a missing reason surfaces as
- *   `ReasonRequiredError`'s message instead of an unattended prompt.
+ * - **A gated mutation needs a reason; a gated read does not.** `write`/`edit`/`delete`
+ *   are gated inside the store (they touch disk), so a missing reason surfaces as
+ *   `ReasonRequiredError`'s message instead of an unattended prompt. A read always
+ *   reaches the confirmation: the prompt is the consent, and the reason is only the
+ *   audit justification (§7.1), so its absence must not turn into an unlogged refusal.
  */
 
 import {
@@ -41,7 +43,6 @@ import { MIN_TOKEN_CHARS, toFtsQuery } from '../inject/fts-query.ts'
 import { message } from '../store/errors.ts'
 import type { Access } from '../store/frontmatter.ts'
 import {
-    ReasonRequiredError,
     type NoteSnapshot,
     resolveRowAccess,
     resolveScope,
@@ -383,11 +384,9 @@ export async function memoryRead(deps: MemoryDeps, input: ReadInput): Promise<To
     }
 
     if (snapshot.access === 'gated') {
-        // Subagent first: §5.3 wants a `blocked-subagent` line even when no reason was
-        // supplied, and the gate checks the env var before the UI anyway.
-        if (!isSubagent() && (input.reason ?? '').trim() === '') {
-            return fail(new ReasonRequiredError(snapshot.key))
-        }
+        // No reason precondition: an empty reason still gets a prompt, and the gate logs
+        // `reason: ""` for it. The subagent/`hasUI` refusals stay inside the gate so they
+        // are logged as the usual `pending` + resolver pair (§5.3, §7.1).
         const decision = await requestGatedAccess(deps.gate, {
             root: deps.store.root,
             op: 'read',

@@ -109,10 +109,16 @@ export function buildIndexBlock(source: IndexBlockSource, scope?: Scope): string
     const lines = [`scope: ${scopesLabel(overview.overviews)}`]
     if (keyParts.length > 0) lines.push(keyParts.join(', '))
     if (gatedParts.length > 0) {
-        lines.push(`gated: ${gatedParts.join(', ')} — names only, memory_read asks the user`)
+        lines.push(`gated: ${gatedParts.join(', ')} — ${GATED_HINT}`)
     }
     return lines.join('\n')
 }
+
+/**
+ * What the gated line says: the names are there to be asked for, and the `reason` is
+ * the audit trail rather than a precondition. Exported so the wording has one home.
+ */
+export const GATED_HINT = 'names only; memory_read asks the user by key and logs `reason`'
 
 /**
  * The rendered-text budget, shared by open keys and gated names across every tier.

@@ -10,6 +10,7 @@ import { accessLogLockPath, accessLogPath, accessLogRotatedPath } from '../store
 import {
     type GateContext,
     type GateRequest,
+    NO_REASON_PLACEHOLDER,
     failClosedMessage,
     isSubagent,
     logUserAccess,
@@ -140,6 +141,47 @@ test('approval writes pending only; the caller owns the single resolver', async 
     )
     assert.equal(resolved[1].attempt, pending.attempt)
     assert.equal(resolved[1].result, 'ok')
+})
+
+test('an empty reason renders a placeholder, never a dangling label or undefined', async t => {
+    const root = makeRoot(t)
+    const calls: ConfirmCall[] = []
+
+    const result = await requestGatedAccess(ctxWithUI(true, calls), {
+        ...gateRequest(root),
+        reason: '',
+    })
+
+    assert.equal(result.allowed, true)
+    assert.equal(calls.length, 1, 'an empty reason must not skip the confirmation')
+    const message = calls[0].message
+    assert.ok(message.includes(KEY))
+    assert.ok(message.includes(`project ${PROJECT}`))
+    assert.ok(
+        message.includes(NO_REASON_PLACEHOLDER),
+        'the prompt said nothing about the reason'
+    )
+    assert.ok(!/Reason:[ \t]*$/m.test(message), 'the prompt rendered a dangling reason label')
+    assert.ok(!message.includes('undefined'))
+
+    // The prompt is the human rendering; the log keeps the machine form of "no reason".
+    const [pending] = readLog(root)
+    assert.equal(pending.reason, '')
+    assert.match(rawLog(root), /"reason":""/)
+})
+
+test('a padded reason is trimmed once, for the prompt and the log alike', async t => {
+    const root = makeRoot(t)
+    const calls: ConfirmCall[] = []
+
+    await requestGatedAccess(ctxWithUI(true, calls), {
+        ...gateRequest(root),
+        reason: '  checking token refresh policy  ',
+    })
+
+    // The audit line is what was displayed, unpadded — not the raw parameter.
+    assert.equal(readLog(root)[0].reason, 'checking token refresh policy')
+    assert.match(calls[0].message, /^Reason: checking token refresh policy$/m)
 })
 
 test('decline writes pending then declined and leaks no body text', async t => {

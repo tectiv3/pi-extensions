@@ -5,7 +5,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import test, { type TestContext } from 'node:test'
 
-import { type GateContext, failClosedMessage } from '../gate/gate.ts'
+import { type GateContext, NO_REASON_PLACEHOLDER, failClosedMessage } from '../gate/gate.ts'
 import { readLog } from '../gate/log.ts'
 import { accessLogPath } from '../store/paths.ts'
 import { hasVecTable, writeVector } from '../index/notes.ts'
@@ -282,19 +282,133 @@ test('memory_read on a gated note with the gate approved returns the body only',
     assert.equal(added[1].attempt, added[0].attempt)
 })
 
-test('memory_read on a gated note without a reason does not reach the gate', async t => {
+test('memory_read on a gated note without a reason still confirms and logs the gap', async t => {
     ensureNotSubagent(t)
-    useStoreDir(t)
+    const root = useStoreDir(t)
     const store = openSeededStore(t)
     await seed(store, SECRET_KEY, SECRET_BODY, 'gated')
+    const before = readLog(root).length
 
     const calls: ConfirmCall[] = []
     const result = await memoryRead(deps(t, store, gate(true, calls)), { key: SECRET_KEY })
 
+    assert.equal(result.isError, undefined)
+    assert.equal(result.text, SECRET_BODY)
+    assert.equal(calls.length, 1, 'a gated read with no reason must still ask the user')
+    assert.ok(calls[0].message.includes(NO_REASON_PLACEHOLDER))
+    assert.ok(
+        !/Reason:[ \t]*$/m.test(calls[0].message),
+        'a dangling reason label was rendered'
+    )
+
+    // An empty reason is a recorded fact, not a reason to refuse: the pair is still
+    // `pending` + `approved`, and the empty justification is logged as "".
+    const added = readLog(root).slice(before)
+    assert.equal(added.length, 2, 'a gated read is two lines')
+    assert.deepEqual(
+        added.map(entry => entry.decision),
+        ['pending', 'approved']
+    )
+    assert.equal(added[0].reason, '')
+    assert.equal(added[0].key, SECRET_KEY)
+    assert.equal(added[1].result, 'ok')
+    assert.equal(added[1].attempt, added[0].attempt)
+    // Omitted would read as "unknown"; the audit line has to say "no justification".
+    assert.match(fs.readFileSync(accessLogPath(root), 'utf8'), /"reason":""/)
+})
+
+test('memory_read on a gated note without a reason and a decline is refused and logged', async t => {
+    ensureNotSubagent(t)
+    const root = useStoreDir(t)
+    const store = openSeededStore(t)
+    await seed(store, SECRET_KEY, SECRET_BODY, 'gated')
+    const before = readLog(root).length
+
+    const calls: ConfirmCall[] = []
+    const result = await memoryRead(deps(t, store, gate(false, calls)), { key: SECRET_KEY })
+
     assert.equal(result.isError, true)
-    assert.match(result.text, /requires a reason/)
-    assert.equal(calls.length, 0)
-    assert.ok(!result.text.includes(SECRET_TOKEN))
+    assert.equal(result.text, `gated note '${SECRET_KEY}'; access declined`)
+    assert.ok(!result.text.includes(SECRET_TOKEN), 'the body token leaked into the text')
+    assert.equal(result.details, undefined)
+    assert.equal(calls.length, 1)
+    assert.ok(calls[0].message.includes(NO_REASON_PLACEHOLDER))
+
+    const added = readLog(root).slice(before)
+    assert.equal(added.length, 2, 'a declined read is two lines')
+    assert.deepEqual(
+        added.map(entry => entry.decision),
+        ['pending', 'declined']
+    )
+    assert.equal(added[0].reason, '')
+})
+
+test('a supplied reason reaches both the prompt and the log', async t => {
+    ensureNotSubagent(t)
+    const root = useStoreDir(t)
+    const store = openSeededStore(t)
+    await seed(store, SECRET_KEY, SECRET_BODY, 'gated')
+    const before = readLog(root).length
+    const reason = 'checking rotation policy'
+
+    const calls: ConfirmCall[] = []
+    const result = await memoryRead(deps(t, store, gate(true, calls)), {
+        key: SECRET_KEY,
+        reason,
+    })
+
+    assert.equal(result.text, SECRET_BODY)
+    assert.ok(calls[0].message.includes(reason))
+    assert.ok(!calls[0].message.includes(NO_REASON_PLACEHOLDER))
+    const added = readLog(root).slice(before)
+    assert.equal(added.length, 2)
+    assert.equal(added[0].reason, reason)
+})
+
+test('a whitespace-only reason is logged empty and shown as no reason at all', async t => {
+    ensureNotSubagent(t)
+    const root = useStoreDir(t)
+    const store = openSeededStore(t)
+    await seed(store, SECRET_KEY, SECRET_BODY, 'gated')
+    const before = readLog(root).length
+
+    const calls: ConfirmCall[] = []
+    const result = await memoryRead(deps(t, store, gate(true, calls)), {
+        key: SECRET_KEY,
+        reason: '   ',
+    })
+
+    assert.equal(result.isError, undefined)
+    assert.equal(calls.length, 1)
+    assert.ok(
+        calls[0].message.includes(NO_REASON_PLACEHOLDER),
+        'the prompt hid the fact that only whitespace was supplied'
+    )
+    // The audit record has to say what the user was shown: blanks are not a reason.
+    const added = readLog(root).slice(before)
+    assert.equal(added[0].reason, '')
+    assert.match(fs.readFileSync(accessLogPath(root), 'utf8'), /"reason":""/)
+})
+
+test('a padded reason is displayed and logged without its padding', async t => {
+    ensureNotSubagent(t)
+    const root = useStoreDir(t)
+    const store = openSeededStore(t)
+    await seed(store, SECRET_KEY, SECRET_BODY, 'gated')
+    const before = readLog(root).length
+
+    const calls: ConfirmCall[] = []
+    await memoryRead(deps(t, store, gate(true, calls)), {
+        key: SECRET_KEY,
+        reason: '  why  ',
+    })
+
+    assert.equal(calls.length, 1)
+    assert.match(calls[0].message, /^Reason: why$/m)
+    assert.ok(!calls[0].message.includes(NO_REASON_PLACEHOLDER))
+    const added = readLog(root).slice(before)
+    assert.equal(added[0].reason, 'why')
+    assert.match(fs.readFileSync(accessLogPath(root), 'utf8'), /"reason":"why"/)
 })
 
 // ---------------------------------------------------------------------------

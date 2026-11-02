@@ -32,7 +32,11 @@ export interface GateRequest {
     scope?: Scope
     project?: string
     key: string
-    /** §5's required justification, logged (capped at 500 chars). */
+    /**
+     * The justification as the caller supplied it. `requestGatedAccess` trims it once and
+     * logs that same value (capped at 500 chars), so the audit line and the prompt can
+     * never disagree; an empty result means no justification was given.
+     */
     reason: string
     /**
      * The first ~200 chars of the body, shown in the confirmation and **never**
@@ -47,6 +51,11 @@ export type GateResult =
     { allowed: true; attempt: string } | { allowed: false; code: GateDenialCode }
 
 const PREVIEW_CHARS = 200
+/**
+ * Shown in place of an empty reason. The log keeps the bare `""`, so without this the
+ * prompt would render a `Reason:` label with nothing after it.
+ */
+export const NO_REASON_PLACEHOLDER = '(none given)'
 
 export function isSubagent(): boolean {
     return process.env.PI_MEMORY_SUBAGENT === '1'
@@ -78,6 +87,9 @@ export async function requestGatedAccess(
     req: GateRequest
 ): Promise<GateResult> {
     const attempt = newAttemptId()
+    // Normalised here because this is the one point the prompt and the audit line both
+    // consume: trimming per call site would let the two drift apart.
+    const reason = req.reason.trim()
     appendLog(req.root, {
         attempt,
         op: req.op,
@@ -87,7 +99,7 @@ export async function requestGatedAccess(
         project: req.project,
         key: req.key,
         session: ctx.sessionId,
-        reason: req.reason,
+        reason,
     })
 
     if (isSubagent()) return deny(req.root, attempt, 'blocked-subagent')
@@ -95,7 +107,7 @@ export async function requestGatedAccess(
 
     let approved: boolean
     try {
-        approved = await ctx.ui.confirm(confirmTitle(req), confirmMessage(req))
+        approved = await ctx.ui.confirm(confirmTitle(req), confirmMessage(req, reason))
     } catch {
         // A rejecting confirm is not a decline: `error` records that no decision
         // was made, which `declined` would misstate (§7.1).
@@ -163,7 +175,7 @@ function confirmTitle(req: GateRequest): string {
     return `memory: confirm ${req.op} of gated note '${req.key}'`
 }
 
-function confirmMessage(req: GateRequest): string {
+function confirmMessage(req: GateRequest, reason: string): string {
     const where =
         req.scope === 'project' && req.project !== undefined
             ? `project ${req.project}`
@@ -171,11 +183,16 @@ function confirmMessage(req: GateRequest): string {
     return [
         `Gated note: ${req.key} (${where})`,
         `Operation: ${req.op}`,
-        `Reason: ${req.reason}`,
+        `Reason: ${reasonText(reason)}`,
         '',
         `Preview (first ${PREVIEW_CHARS} chars):`,
         previewOf(req.preview),
     ].join('\n')
+}
+
+/** `reason` arrives trimmed; only emptiness is left to render as words. */
+function reasonText(reason: string): string {
+    return reason === '' ? NO_REASON_PLACEHOLDER : reason
 }
 
 function previewOf(body: string): string {

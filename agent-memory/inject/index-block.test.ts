@@ -8,6 +8,7 @@ import test, { type TestContext } from 'node:test'
 import { resolveProjectId } from '../store/project.ts'
 import { openStore, type Store } from '../store/store.ts'
 import {
+    GATED_HINT,
     GLOBAL_TIER_RESERVED_KEYS,
     MAX_INDEX_CHARS,
     MAX_INDEX_KEYS,
@@ -111,10 +112,7 @@ test('an all-gated store names every gated key and none of their bodies', t => {
     store.reindex()
 
     const block = buildIndexBlock({ store, cwd: tempDir(t, 'pi-memory-block-cwd-') })
-    assert.equal(
-        block,
-        'scope: global\ngated: secrets/two, secrets/one — names only, memory_read asks the user'
-    )
+    assert.equal(block, `scope: global\ngated: secrets/two, secrets/one — ${GATED_HINT}`)
     assert.ok(!block.includes('SWORDFISH'), 'a gated body was injected')
 })
 
@@ -127,7 +125,7 @@ test('the block carries the scope, the open keys, and gated names without bodies
     const block = buildIndexBlock({ store, cwd: tempDir(t, 'pi-memory-block-cwd-') })
     assert.match(block, /^scope: global$/m)
     assert.match(block, /^auth\/session$/m)
-    assert.match(block, /^gated: secrets\/api_token — names only, memory_read asks the user$/m)
+    assert.match(block, new RegExp(`^gated: secrets\\/api_token — ${GATED_HINT}$`, 'm'))
     assert.ok(!block.includes('SWORDFISH'), 'a gated body was injected')
 })
 
@@ -290,7 +288,7 @@ test('a trailing tier of gated names alone still keeps its reservation', t => {
         )
     )
     assert.equal(line.split('bulk/').length - 1, projectCap)
-    assert.match(block, /^gated: secrets\/api_token — names only, memory_read asks the user$/m)
+    assert.match(block, new RegExp(`^gated: secrets\\/api_token — ${GATED_HINT}$`, 'm'))
     assert.ok(!block.includes('SWORDFISH'), 'a gated body was injected')
 })
 
@@ -306,7 +304,7 @@ test('a gated name that does not fit the spent budget is reported as a count', t
     assert.equal(store.reindex().updated, MAX_INDEX_KEYS + 1)
 
     const block = buildIndexBlock({ store, cwd: tempDir(t, 'pi-memory-block-cwd-') })
-    assert.match(block, /^gated: \+1 more — names only, memory_read asks the user$/m)
+    assert.match(block, new RegExp(`^gated: \\+1 more — ${GATED_HINT}$`, 'm'))
     assert.ok(!block.includes('secrets/api_token'), 'a gated name overran the budget')
     assert.ok(
         keysLine(block).length <= MAX_INDEX_CHARS + 32,

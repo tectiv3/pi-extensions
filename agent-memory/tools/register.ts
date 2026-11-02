@@ -77,7 +77,7 @@ const SCOPE: JsonSchema = {
 const REASON: JsonSchema = {
     type: 'string',
     description:
-        'Required for any gated note: the justification shown in the confirmation and written to the access log (max 500 chars).',
+        'Optional for `memory_read`, required for a gated `memory_write`/`memory_edit`/`memory_delete`: the justification shown in the confirmation prompt and written to the access log (max 500 chars). Omitting it on a read records the access with no justification.',
 }
 
 const KEY: JsonSchema = {
@@ -164,7 +164,7 @@ export function registerMemoryTools(
         name: 'memory_read',
         label: 'Memory Read',
         description:
-            'Read one memory note by key (without frontmatter). With `scope` omitted a project note wins and a global note of the same key is the fallback. A gated note asks the user first and needs `reason`.',
+            'Read one memory note by key (without frontmatter). With `scope` omitted a project note wins and a global note of the same key is the fallback. A gated note asks the user to confirm; `reason` is optional and is recorded as the justification.',
         executionMode: 'parallel',
         parameters: params({ key: KEY, scope: SCOPE, reason: REASON }, ['key']),
         async execute(_toolCallId, params, _signal, _onUpdate, ctx) {

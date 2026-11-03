@@ -78,7 +78,13 @@ consolidating an earlier single-question tool into it. Added here:
   pending ask can be answered from the mobile companion; the TUI waits on the remote client
   answer instead of blocking on the terminal.
 - **Question relay** — a subagent's ask call is relayed to the parent (see above), so
-  children can ask the user questions too.
+  children can ask the user questions too. Relay honours rpc's `timeout` on a dialog, so a
+  timed-out child question closes its parent dialog instead of holding the relay mutex.
+- **Subagent question budget** — a question asked by a subagent auto-accepts the first
+  (recommended) option after 5 minutes; `PI_SUBAGENT_QUESTION_TIMEOUT_MS` overrides the
+  budget and `0`/garbage disables it. The result is tagged `autoAccepted` (per answer and
+  on `details`) so the child can tell it from a real answer. Root-agent questions are
+  untouched and still block indefinitely.
 
 ## Install
 

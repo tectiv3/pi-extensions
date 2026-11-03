@@ -350,8 +350,10 @@ full id plus `subagent_collect` / `subagent_inspect` hints). The child keeps run
   SIGTERM, then SIGKILL if the child is still alive after 5 seconds — so a child stuck
   inside a long tool call (the usual reason a steer did not help) still dies.
 - **Relayed questions** (`confirm`/`select`/`input`) still reach the parent TUI, but there
-  is no abort source: the dialog stays until the user answers or dismisses it (the stall
-  watchdog is paused while the relay is pending).
+  is no parent abort source: the dialog stays until the user answers or dismisses it (the
+  stall watchdog is paused while the relay is pending). A request that carries rpc's
+  `timeout` — `ask_user_question` in a child sets it to its remaining question budget —
+  closes the dialog at that deadline instead.
 - **Concurrency** is unchanged — there is no separate cap, and background and foreground
   runs coexist.
 - **Backgrounded resume** — `background: true` with `resume` re-runs a persisted run
@@ -500,8 +502,9 @@ resume hint:
   runtime conversion via the manager's `b` is single-mode too (foreground single tool-call runs)
 - **L7 — `subagent_collect` is process-scoped**: persisted runs from other sessions use
   `subagent_inspect` / `/subagents resume`
-- **L8 — no auto-cancel for relayed questions**: a backgrounded child blocked on a relayed
-  question leaves the dialog open until answered or dismissed
+- **L8 — no parent auto-cancel for relayed questions**: a backgrounded child blocked on a
+  relayed question without a `timeout` leaves the dialog open until answered or dismissed.
+  `ask_user_question` sends its subagent budget as `timeout`, so those dialogs do close.
 - **L9 — uncollected results have no UI**: they are visible only in the completion
   notification
 - **L10 — a steer is a queued message, not a correction**: it is delivered at the child's

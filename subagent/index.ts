@@ -2308,9 +2308,26 @@ async function runSingleAgent(
                     relayUiRequest &&
                     (method === 'select' || method === 'confirm' || method === 'input')
                 ) {
+                    const controller = new AbortController()
+                    // rpc-mode shows the dialog's own `timeout` on the request, and
+                    // honours it locally by resolving the child's promise. A relay
+                    // that ignores it leaves the parent dialog open past the child's
+                    // tool call and holds the relay mutex, so every later question
+                    // queues behind a dead prompt. The timer starts here, not after
+                    // the mutex: queue time counts against the same budget.
+                    const relayTimeoutMs =
+                        typeof event.timeout === 'number' &&
+                        Number.isFinite(event.timeout) &&
+                        event.timeout > 0
+                            ? event.timeout
+                            : undefined
+                    const relayTimer =
+                        relayTimeoutMs === undefined
+                            ? undefined
+                            : setTimeout(() => controller.abort(), relayTimeoutMs)
+
                     const release = await acquireRelayMutex()
                     relayPending = true
-                    const controller = new AbortController()
                     let relayAbortCleanup: (() => void) | undefined
                     // Bridged to the parent signal only, which a background run never
                     // has: an explicit abort kills the child but does not retract this
@@ -2326,6 +2343,13 @@ async function runSingleAgent(
                         pendingRelayAbortCleanup = relayAbortCleanup
                     }
                     try {
+                        if (controller.signal.aborted) {
+                            // The budget expired while this relay waited for the
+                            // mutex; the child already dropped the request id, so a
+                            // response would go nowhere. Do not show a dead dialog.
+                            debug(`extension_ui: ${method} → deadline passed before display`)
+                            return
+                        }
                         const response = await relayUiRequest(
                             event,
                             agentName,
@@ -2357,6 +2381,7 @@ async function runSingleAgent(
                         )
                     } finally {
                         relayPending = false
+                        if (relayTimer) clearTimeout(relayTimer)
                         lastActivityTime = Date.now()
                         pendingRelayAbortCleanup = undefined
                         relayAbortCleanup?.()

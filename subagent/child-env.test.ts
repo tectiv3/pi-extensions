@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import type { ChildProcess } from 'node:child_process'
 import test from 'node:test'
-import { childEnv, MEMORY_SUBAGENT_ENV, spawnChild } from './child-env.ts'
+import { childEnv, MEMORY_SUBAGENT_ENV, spawnChild, SUBAGENT_ENV } from './child-env.ts'
 
 /** The marker is process-global; a test that leaves it set changes later tests' gate. */
 function withoutMarker<T>(fn: () => T): T {
@@ -27,6 +27,7 @@ test('childEnv marks the child and copies the parent environment', () => {
     withoutMarker(() => {
         const env = childEnv()
         assert.equal(env[MEMORY_SUBAGENT_ENV], '1')
+        assert.equal(env[SUBAGENT_ENV], '1')
         for (const key of Object.keys(process.env)) assert.equal(env[key], process.env[key])
     })
 })
@@ -77,5 +78,21 @@ test('a marked parent produces a marked child, not a doubled marker', () => {
     } finally {
         if (saved === undefined) delete process.env[MEMORY_SUBAGENT_ENV]
         else process.env[MEMORY_SUBAGENT_ENV] = saved
+    }
+})
+
+test('spawnChild hands the generic subagent marker to a real child process', async () => {
+    const saved = process.env[SUBAGENT_ENV]
+    delete process.env[SUBAGENT_ENV]
+    try {
+        const script = `process.stdout.write(String(process.env.${SUBAGENT_ENV}))`
+        const { stdout, code } = await collected(
+            spawnChild(process.execPath, ['-e', script], process.cwd())
+        )
+        assert.equal(code, 0)
+        assert.equal(stdout, '1')
+    } finally {
+        if (saved === undefined) delete process.env[SUBAGENT_ENV]
+        else process.env[SUBAGENT_ENV] = saved
     }
 })

@@ -16,6 +16,13 @@ import {
     wrapTextWithAnsi,
 } from '@earendil-works/pi-tui'
 import { Type } from 'typebox'
+import {
+    askWithDeadline,
+    formatDuration,
+    startDeadline,
+    subagentQuestionTimeoutMs,
+    type PromptUi,
+} from './timeout.ts'
 
 // Types
 interface QuestionOption {
@@ -40,12 +47,18 @@ interface Answer {
     label: string
     wasCustom: boolean
     index?: number
+    /** Machine-readable twin of the "auto-accepted" marker in the result text. */
+    autoAccepted?: boolean
 }
 
 interface AskUserQuestionResult {
     questions: Question[]
     answers: Answer[]
     cancelled: boolean
+    /** True when the subagent budget ran out and at least one answer was filled. */
+    autoAccepted: boolean
+    /** The budget that produced the auto-accept; omitted for real answers. */
+    autoAcceptTimeoutMs?: number
 }
 
 // Schema
@@ -93,7 +106,42 @@ function errorResult(
 ): { content: { type: 'text'; text: string }[]; details: AskUserQuestionResult } {
     return {
         content: [{ type: 'text', text: message }],
-        details: { questions, answers: [], cancelled: true },
+        details: { questions, answers: [], cancelled: true, autoAccepted: false },
+    }
+}
+
+function answerResult(
+    questions: Question[],
+    answers: Answer[],
+    timeoutMs?: number
+): { content: { type: 'text'; text: string }[]; details: AskUserQuestionResult } {
+    const autoAccepted = answers.some(answer => answer.autoAccepted === true)
+    const lines = answers.map(answer => {
+        const qLabel =
+            questions.find(question => question.id === answer.id)?.label || answer.id
+        const base = answer.wasCustom
+            ? `${qLabel}: user wrote: ${answer.label}`
+            : // value may intentionally differ from label (the schema supports
+              // both); the model consumes this text, so surface the value when
+              // they differ.
+              `${qLabel}: user selected: ${answer.index}. ${answer.label}${
+                  answer.value !== answer.label ? ` (value: ${answer.value})` : ''
+              }`
+        if (!answer.autoAccepted) return base
+        const when = timeoutMs === undefined ? '' : ` after ${formatDuration(timeoutMs)}`
+        return `${base} [auto-accepted${when} — recommended option]`
+    })
+    return {
+        content: [{ type: 'text', text: lines.join('\n') }],
+        details: {
+            questions,
+            answers,
+            cancelled: false,
+            autoAccepted,
+            ...(autoAccepted && timeoutMs !== undefined
+                ? { autoAcceptTimeoutMs: timeoutMs }
+                : {}),
+        },
     }
 }
 
@@ -215,6 +263,10 @@ export default function askUserQuestion(pi: ExtensionAPI) {
                 allowOther: q.allowOther !== false,
             }))
 
+            // Undefined for the root agent and for a subagent with the feature
+            // switched off; then every prompt keeps blocking exactly as before.
+            const questionTimeoutMs = subagentQuestionTimeoutMs()
+
             // Payload for the notify extension, which fires on ui_prompt_start.
             // The dialog opens right after this, so the body must be known here.
             const firstQuestion = questions[0]
@@ -236,21 +288,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
                               signal: signal ?? undefined,
                           })
                 if (answers !== null && answers !== 'dismissed') {
-                    const answerLines = answers.map(a => {
-                        const qLabel = questions.find(q => q.id === a.id)?.label || a.id
-                        if (a.wasCustom) {
-                            return `${qLabel}: user wrote: ${a.label}`
-                        }
-                        // value may intentionally differ from label (the schema
-                        // supports both); the model consumes this text, so
-                        // surface the value when they differ.
-                        const suffix = a.value !== a.label ? ` (value: ${a.value})` : ''
-                        return `${qLabel}: user selected: ${a.index}. ${a.label}${suffix}`
-                    })
-                    return {
-                        content: [{ type: 'text', text: answerLines.join('\n') }],
-                        details: { questions, answers, cancelled: false },
-                    }
+                    return answerResult(questions, answers)
                 }
                 // Dismissed (wire abort) or a run abort: report the cancellation.
                 // Falling through to the local TUI prompt is wrong here — the run
@@ -271,75 +309,16 @@ export default function askUserQuestion(pi: ExtensionAPI) {
                 // rpc mode: relay questions to parent via ctx.ui.select/input.
                 // These methods exist at runtime (rpc-mode.ts emits extension_ui_request
                 // events on stdout) but are absent from the local type stubs.
-                const ui = ctx.ui as unknown as {
-                    select(
-                        title: string,
-                        options: string[],
-                        opts?: { signal?: AbortSignal }
-                    ): Promise<string | undefined>
-                    input(
-                        title: string,
-                        defaultValue?: string,
-                        opts?: { signal?: AbortSignal }
-                    ): Promise<string | undefined>
-                }
-
-                const answers: Answer[] = []
-                for (const question of questions) {
-                    const optionLabels = question.options.map(o => o.label)
-                    if (question.allowOther) {
-                        optionLabels.push('Type something...')
-                    }
-
-                    const selected = await ui.select(question.prompt, optionLabels, {
-                        signal: signal ?? undefined,
-                    })
-
-                    if (selected === undefined) {
-                        return errorResult('User cancelled the question', questions)
-                    }
-
-                    if (question.allowOther && selected === 'Type something...') {
-                        const typed = await ui.input(question.prompt, undefined, {
-                            signal: signal ?? undefined,
-                        })
-                        if (typed === undefined) {
-                            return errorResult('User cancelled the question', questions)
-                        }
-                        answers.push({
-                            id: question.id,
-                            value: typed,
-                            label: typed,
-                            wasCustom: true,
-                        })
-                    } else {
-                        const matchedOption = question.options.find(o => o.label === selected)
-                        const matchedIndex = question.options.findIndex(
-                            o => o.label === selected
-                        )
-                        answers.push({
-                            id: question.id,
-                            value: matchedOption?.value ?? selected,
-                            label: selected,
-                            wasCustom: false,
-                            index: matchedIndex >= 0 ? matchedIndex + 1 : undefined,
-                        })
-                    }
-                }
-
-                const answerLines = answers.map(a => {
-                    const qLabel = questions.find(q => q.id === a.id)?.label || a.id
-                    if (a.wasCustom) {
-                        return `${qLabel}: user wrote: ${a.label}`
-                    }
-                    const suffix = a.value !== a.label ? ` (value: ${a.value})` : ''
-                    return `${qLabel}: user selected: ${a.index}. ${a.label}${suffix}`
+                const outcome = await askWithDeadline({
+                    questions,
+                    ui: ctx.ui as unknown as PromptUi,
+                    timeoutMs: questionTimeoutMs,
+                    signal: signal ?? undefined,
                 })
-
-                return {
-                    content: [{ type: 'text', text: answerLines.join('\n') }],
-                    details: { questions, answers, cancelled: false },
+                if (outcome.kind === 'cancelled') {
+                    return errorResult('User cancelled the question', questions)
                 }
+                return answerResult(questions, outcome.answers, questionTimeoutMs)
             }
 
             const isMulti = questions.length > 1
@@ -368,6 +347,27 @@ export default function askUserQuestion(pi: ExtensionAPI) {
                     }
                     const editor = new Editor(tui, editorTheme)
 
+                    // Prompt-wide budget (subagent prompts only). The parent relay
+                    // sees one dialog at a time and cannot know which questions are
+                    // still unanswered, so the settle decision lives here.
+                    let settled = false
+                    const deadline = startDeadline(questionTimeoutMs, () => {
+                        for (const question of questions) {
+                            if (answers.has(question.id)) continue
+                            const first = question.options[0]
+                            if (!first) continue
+                            answers.set(question.id, {
+                                id: question.id,
+                                value: first.value,
+                                label: first.label,
+                                wasCustom: false,
+                                index: 1,
+                                autoAccepted: true,
+                            })
+                        }
+                        submit(false)
+                    })
+
                     // Helpers
                     function refresh() {
                         cachedLines = undefined
@@ -375,7 +375,25 @@ export default function askUserQuestion(pi: ExtensionAPI) {
                     }
 
                     function submit(cancelled: boolean) {
-                        done({ questions, answers: Array.from(answers.values()), cancelled })
+                        if (settled) return
+                        settled = true
+                        deadline?.clear()
+                        // Question order, not answer order: a user can answer the
+                        // tabs out of order and the model reads these in sequence.
+                        const answerList = questions.flatMap(q => {
+                            const answer = answers.get(q.id)
+                            return answer ? [answer] : []
+                        })
+                        const autoAccepted = answerList.some(a => a.autoAccepted === true)
+                        done({
+                            questions,
+                            answers: answerList,
+                            cancelled,
+                            autoAccepted,
+                            ...(autoAccepted && questionTimeoutMs !== undefined
+                                ? { autoAcceptTimeoutMs: questionTimeoutMs }
+                                : {}),
+                        })
                     }
 
                     function currentQuestion(): Question | undefined {
@@ -668,6 +686,9 @@ export default function askUserQuestion(pi: ExtensionAPI) {
                             cachedLines = undefined
                         },
                         handleInput,
+                        // Pi disposes the dialog on close and on UI teardown; a
+                        // budget that outlived the dialog must not fire into it.
+                        dispose: () => deadline?.clear(),
                     }
                 }
             )
@@ -679,22 +700,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
                 }
             }
 
-            const answerLines = result.answers.map(a => {
-                const qLabel = questions.find(q => q.id === a.id)?.label || a.id
-                if (a.wasCustom) {
-                    return `${qLabel}: user wrote: ${a.label}`
-                }
-                // value may intentionally differ from label (the schema
-                // supports both); the model consumes this text, so surface the
-                // value when they differ.
-                const suffix = a.value !== a.label ? ` (value: ${a.value})` : ''
-                return `${qLabel}: user selected: ${a.index}. ${a.label}${suffix}`
-            })
-
-            return {
-                content: [{ type: 'text', text: answerLines.join('\n') }],
-                details: result,
-            }
+            return answerResult(questions, result.answers, result.autoAcceptTimeoutMs)
         },
 
         renderCall(args, theme, _context) {
@@ -719,11 +725,26 @@ export default function askUserQuestion(pi: ExtensionAPI) {
                 return new Text(theme.fg('warning', 'Cancelled'), 0, 0)
             }
             const lines = details.answers.map(a => {
+                const marker =
+                    a.autoAccepted === true
+                        ? theme.fg(
+                              'warning',
+                              ` ⚠ auto-accepted${
+                                  details.autoAcceptTimeoutMs !== undefined
+                                      ? ` after ${formatDuration(details.autoAcceptTimeoutMs)}`
+                                      : ''
+                              } — recommended option`
+                          )
+                        : ''
+                const symbol = theme.fg(
+                    a.autoAccepted === true ? 'warning' : 'success',
+                    a.autoAccepted === true ? '⚠ ' : '✓ '
+                )
                 if (a.wasCustom) {
-                    return `${theme.fg('success', '✓ ')}${theme.fg('accent', a.id)}: ${theme.fg('muted', '(wrote) ')}${a.label}`
+                    return `${symbol}${theme.fg('accent', a.id)}: ${theme.fg('muted', '(wrote) ')}${a.label}${marker}`
                 }
                 const display = a.index ? `${a.index}. ${a.label}` : a.label
-                return `${theme.fg('success', '✓ ')}${theme.fg('accent', a.id)}: ${display}`
+                return `${symbol}${theme.fg('accent', a.id)}: ${display}${marker}`
             })
             return new Text(lines.join('\n'), 0, 0)
         },

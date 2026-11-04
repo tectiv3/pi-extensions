@@ -3326,6 +3326,21 @@ async function openSubagentsManager(ctx: ExtensionContext): Promise<void> {
     await openSubagentInspectView(ctx, action.id)
 }
 
+// Shared by /subagents (bare) and the alt+s shortcut so the two entry points
+// cannot drift.
+async function runSubagentsDefaultView(ctx: ExtensionContext): Promise<void> {
+    // TUI opens the manager view; print mode keeps the text report; other modes
+    // fall back to notify.
+    if (ctx.mode === 'tui') {
+        await openSubagentsManager(ctx)
+        return
+    }
+    const report = buildSubagentsListReport()
+    // ctx.ui.notify is a no-op without a UI (pi -p / --mode json); print mode writes to stdout instead.
+    if (ctx.mode === 'print') console.log(report)
+    else ctx.ui.notify(report, 'info')
+}
+
 // Manager inspect action (§11): buildSubagentInspectReport rendered in a
 // minimal scrollable text view using the attach view's manual scroll pattern
 // (the layout engine cannot scroll inside ui.custom). Esc closes; the
@@ -4554,16 +4569,7 @@ export default function (pi: ExtensionAPI) {
                 return
             }
             if (!sub) {
-                // Bare command (§11): TUI opens the manager view; print mode
-                // keeps the text report; other modes fall back to notify.
-                if (ctx.mode === 'tui') {
-                    await openSubagentsManager(ctx)
-                    return
-                }
-                const report = buildSubagentsListReport()
-                // ctx.ui.notify is a no-op without a UI (pi -p / --mode json); print mode writes to stdout instead.
-                if (ctx.mode === 'print') console.log(report)
-                else ctx.ui.notify(report, 'info')
+                await runSubagentsDefaultView(ctx)
                 return
             }
             emitCommandNotice(
@@ -4571,6 +4577,14 @@ export default function (pi: ExtensionAPI) {
                 `Unknown subcommand "${sub}". Usage: /subagents [attach [id] | resume [id] [instruction...] | abort [id]]`,
                 'warning'
             )
+        },
+    })
+
+    pi.registerShortcut('alt+s', {
+        description: 'Open the subagents manager view (same as /subagents)',
+        handler: async ctx => {
+            capturePiSessionId(ctx)
+            await runSubagentsDefaultView(ctx)
         },
     })
 }

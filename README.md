@@ -54,6 +54,7 @@ Ctrl+C abort propagation (the parallel mode the example shipped was removed here
   spawns plain child processes that can only be streamed and killed.
 - **Attach** — `/subagents` manager view with a live transcript per subagent (manual scroll
   window, ring-buffered stream events); resume respawns a persisted run and auto-attaches.
+  `Alt+S` opens the same view directly.
 - **Steering** — the attach view accepts steering input; steers queue as pending lines and
   are delivered to the running child mid-task.
 - **Per-subagent abort** — from the manager view.

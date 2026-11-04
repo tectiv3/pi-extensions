@@ -27,6 +27,13 @@ declare module '@earendil-works/pi-coding-agent' {
                 handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>
             }
         ): void
+        registerShortcut(
+            shortcut: string,
+            opts: {
+                description?: string
+                handler: (ctx: ExtensionContext) => Promise<void> | void
+            }
+        ): void
         on(event: string, handler: (event: any, ctx: any) => void): void
         registerMarkdownTransformer(
             transformer: (markdown: string, context: MarkdownTransformContext) => string

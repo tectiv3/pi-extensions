@@ -3,8 +3,8 @@
 pi coding-agent extensions, TypeScript, loaded directly by pi (no build step).
 
 - **`subagent/`** — subagent tool: delegates tasks to specialized agents with isolated context
-  windows. Single and chain modes; persistence and resume of interrupted runs;
-  background runs with notifications; live attach and steering of running subagents.
+  windows. Single mode; persistence and resume of interrupted runs; background and
+  foreground runs with notifications; inspect, collect and steering of running subagents.
 - **`ask-user-question/`** — structured question tool: single- and multi-question prompts with
   typed option pages, tabbed navigation for multiple questions, `allowOther` free-text option,
   and remote answer relay (answers can arrive from the mobile companion via the `rc` extension).

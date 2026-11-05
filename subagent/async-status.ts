@@ -49,7 +49,7 @@ export function asyncRunTranscriptPath(subagentsDir: string, runId: string): str
     return path.join(asyncRunDir(subagentsDir, runId), ASYNC_TRANSCRIPT_FILE)
 }
 
-/** The per-run session file used by foreground, chain, and runtime-backgrounded runs. */
+/** The per-run session file used by foreground and runtime-backgrounded runs. */
 export function legacyRunTranscriptPath(subagentsDir: string, runId: string): string {
     return path.join(subagentsDir, `${runId}.jsonl`)
 }

@@ -264,15 +264,26 @@ export async function askWithDeadline(
             }
 
             const matched = question.options.find(option => option.label === selected)
+            if (!matched) {
+                // A host that renders its own free-text field beside the options can
+                // return typed text through select, so this is the user's own answer.
+                answers.push({
+                    id: question.id,
+                    value: selected,
+                    label: selected,
+                    wasCustom: true,
+                })
+                continue
+            }
             const matchedIndex = question.options.findIndex(
                 option => option.label === selected
             )
             answers.push({
                 id: question.id,
-                value: matched?.value ?? selected,
+                value: matched.value,
                 label: selected,
                 wasCustom: false,
-                index: matchedIndex >= 0 ? matchedIndex + 1 : undefined,
+                index: matchedIndex + 1,
             })
         }
     } finally {

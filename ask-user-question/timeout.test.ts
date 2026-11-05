@@ -273,6 +273,35 @@ test('free text still works through the timeout-enabled loop', async () => {
     assert.ok(calls[0].options.includes(TYPE_SOMETHING_LABEL))
 })
 
+test("typed text returned through select is recorded as the user's own answer", async () => {
+    const { ui, calls } = fakeUi(() => 'something else')
+    const outcome = await askWithDeadline({
+        questions: [question('Q1', ['a', 'b'], true)],
+        ui,
+        timeoutMs: 60_000,
+    })
+    assert.equal(outcome.kind, 'answered')
+    assert.deepEqual(outcome.answers, [
+        { id: 'Q1', value: 'something else', label: 'something else', wasCustom: true },
+    ])
+    assert.equal(outcome.answers[0].index, undefined)
+    assert.equal(calls.length, 1, 'no second dialog is opened')
+})
+
+test('a matching label stays an option answer even with a host free-text field', async () => {
+    const { ui, calls } = fakeUi(() => 'b')
+    const outcome = await askWithDeadline({
+        questions: [question('Q1', ['a', 'b'], true)],
+        ui,
+        timeoutMs: 60_000,
+    })
+    assert.equal(outcome.kind, 'answered')
+    assert.deepEqual(outcome.answers, [
+        { id: 'Q1', value: 'b', label: 'b', wasCustom: false, index: 2 },
+    ])
+    assert.equal(calls.length, 1)
+})
+
 test('a user cancel before the deadline stays a cancel', async () => {
     const { ui } = fakeUi(() => undefined)
     const outcome = await askWithDeadline({

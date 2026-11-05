@@ -6,10 +6,12 @@ import {
     readdirSync,
     readFileSync,
     rmSync,
+    utimesSync,
     writeFileSync,
 } from 'node:fs'
 import { registerHooks } from 'node:module'
 import { tmpdir } from 'node:os'
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import test, { type TestContext } from 'node:test'
 import {
@@ -104,7 +106,13 @@ type Tool = {
     ) => Promise<ToolResult>
 }
 
-type Dispatch = { module: SubagentModule; subagent: Tool; entries: EntryRecord[] }
+type Dispatch = {
+    module: SubagentModule
+    subagent: Tool
+    tools: Map<string, Tool>
+    entries: EntryRecord[]
+    handlers: Map<string, (...args: unknown[]) => unknown>
+}
 
 let dispatch: Promise<Dispatch> | undefined
 
@@ -114,6 +122,7 @@ function loadDispatch(): Promise<Dispatch> {
         const module = (await import('./index.ts')) as unknown as SubagentModule
         const tools = new Map<string, Tool>()
         const entries: EntryRecord[] = []
+        const handlers = new Map<string, (...args: unknown[]) => unknown>()
         module.default({
             registerTool: (tool: Tool) => tools.set(tool.name, tool),
             registerCommand: () => {},
@@ -121,13 +130,14 @@ function loadDispatch(): Promise<Dispatch> {
             registerEntryRenderer: () => {},
             registerMarkdownTheme: () => {},
             registerToolRenderer: () => {},
-            on: () => {},
+            on: (event: string, handler: (...args: unknown[]) => unknown) =>
+                handlers.set(event, handler),
             appendEntry: (customType: string, data: unknown) =>
                 entries.push({ customType, data }),
         })
         const subagent = tools.get('subagent')
         assert.ok(subagent, 'the subagent tool was registered')
-        return { module, subagent, entries }
+        return { module, subagent, tools, entries, handlers }
     })()
     return dispatch
 }
@@ -531,4 +541,206 @@ test('a foreground spawn keeps the legacy path and deletes transcript and meta o
     assert.equal(existsFile(legacy), false)
     assert.equal(existsFile(join(agentDir, 'subagents', `${id}.meta`)), false)
     assert.equal(existsFile(join(agentDir, 'subagents', `${id}.async`)), false)
+})
+
+const PROMPT_HASH = createHash('sha256').update('System prompt.\n').digest('hex')
+const RESUME_ID = '0195f2c4-7b1e-7c3a-9f21-8d0e6a4b2c99'
+
+function seedFailedRun(agentDir: string, id: string): string {
+    const dir = join(agentDir, 'subagents')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(
+        join(dir, `${id}.meta`),
+        JSON.stringify({
+            agent: 'worker',
+            task: 'do it',
+            startedAt: new Date().toISOString(),
+            promptHash: PROMPT_HASH,
+            status: 'failed',
+        })
+    )
+    return dir
+}
+
+function statusOf(asyncDir: string): Record<string, any> | undefined {
+    try {
+        return JSON.parse(readFileSync(join(asyncDir, ASYNC_STATUS_FILE), 'utf-8'))
+    } catch {
+        return undefined
+    }
+}
+
+// A quit disposes the runtime and exits in the same turn, so the killed child's
+// close event never drives a settlement: the shutdown handler itself has to leave
+// the tracker a terminal state.
+test('session shutdown marks an in-flight background run stopped before any child event', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(agentDir)
+    const fake = useFakePi(t, agentDir, { waitForRelease: true })
+    const { subagent, handlers } = await loadDispatch()
+
+    const result = await subagent.execute(
+        'tool-call-1',
+        { agent: 'worker', task: 'do it' },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+    const asyncDir = (result.details as { asyncDir?: string }).asyncDir
+    assert.ok(asyncDir)
+    assert.equal(statusOf(asyncDir)?.state, 'running')
+
+    const shutdown = handlers.get('session_shutdown')
+    assert.ok(shutdown, 'the shutdown handler is registered')
+    shutdown()
+    const payload = statusOf(asyncDir)
+    assert.equal(payload?.state, 'stopped', 'written synchronously inside the handler')
+    assert.equal(payload?.endedAt, payload?.lastUpdate)
+    assert.ok(payload?.startedAt <= payload?.endedAt)
+    assert.equal(payload?.steps[0].sessionFile, join(asyncDir, 'transcript.jsonl'))
+
+    fake.release()
+    // The killed child's own settlement still lands, and stays terminal.
+    await waitFor(
+        () =>
+            existsFile(join(agentDir, 'subagents', 'stub0000-0000-4000-8000-000000000000.pid'))
+                ? undefined
+                : true,
+        'the child exit'
+    )
+    assert.notEqual(statusOf(asyncDir)?.state, 'running')
+})
+
+test('resume refuses a run whose transcript is gone', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(agentDir)
+    seedFailedRun(agentDir, RESUME_ID)
+    const { subagent } = await loadDispatch()
+
+    const result = await subagent.execute(
+        'tool-call-1',
+        { agent: 'worker', task: 'continue', resume: RESUME_ID, background: false },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+    const text = textOf(result)
+    assert.equal(result.isError, undefined)
+    assert.match(text, /^FAILED: Cannot resume ".+": no transcript was persisted/)
+})
+
+test('resume refuses a run the retention sweep deleted', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(agentDir)
+    const subagentsDir = seedFailedRun(agentDir, RESUME_ID)
+    const runDir = join(subagentsDir, `${RESUME_ID}${ASYNC_DIR_SUFFIX}`)
+    mkdirSync(runDir)
+    writeFileSync(join(runDir, 'transcript.jsonl'), '{}\n')
+    const old = Date.now() - ASYNC_RETENTION_MS - 60_000
+    writeFileSync(
+        join(runDir, ASYNC_STATUS_FILE),
+        JSON.stringify({ runId: RESUME_ID, state: 'failed', endedAt: old, lastUpdate: old })
+    )
+    for (const target of [
+        join(runDir, 'transcript.jsonl'),
+        join(runDir, ASYNC_STATUS_FILE),
+        join(subagentsDir, `${RESUME_ID}.meta`),
+        runDir,
+    ]) {
+        utimesSync(target, new Date(old), new Date(old))
+    }
+
+    assert.equal(sweepExpiredAsyncDirs(subagentsDir).deleted, 1)
+    assert.equal(existsFile(join(subagentsDir, `${RESUME_ID}.meta`)), false)
+
+    const { subagent } = await loadDispatch()
+    const result = await subagent.execute(
+        'tool-call-1',
+        { agent: 'worker', task: 'continue', resume: RESUME_ID, background: false },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+    assert.match(textOf(result), /^FAILED: .*No subagent found/)
+})
+
+test('a foreground resume of a background run keeps its transcript and refreshes its status', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(agentDir)
+    useFakePi(t, agentDir)
+    const subagentsDir = seedFailedRun(agentDir, RESUME_ID)
+    const runDir = join(subagentsDir, `${RESUME_ID}${ASYNC_DIR_SUFFIX}`)
+    const transcript = join(runDir, 'transcript.jsonl')
+    mkdirSync(runDir)
+    writeFileSync(transcript, JSON.stringify({ type: 'session', id: 'earlier' }) + '\n')
+    writeFileSync(
+        join(runDir, ASYNC_STATUS_FILE),
+        JSON.stringify({
+            runId: RESUME_ID,
+            mode: 'single',
+            state: 'failed',
+            startedAt: 1,
+            endedAt: 2,
+            lastUpdate: 2,
+            steps: [{ agent: 'worker', status: 'failed', sessionFile: transcript }],
+        })
+    )
+    const { subagent, tools } = await loadDispatch()
+
+    const result = await subagent.execute(
+        'tool-call-1',
+        { agent: 'worker', task: 'continue', resume: RESUME_ID, background: false },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+    assert.equal(result.isError, undefined, textOf(result))
+    assert.equal(existsFile(transcript), true, 'retention still owns the transcript')
+    assert.equal(existsFile(join(subagentsDir, `${RESUME_ID}.meta`)), false)
+    const payload = statusOf(runDir)
+    assert.equal(payload?.state, 'complete')
+    assert.equal(payload?.steps[0].sessionFile, transcript)
+
+    const inspect = tools.get('subagent_inspect')
+    assert.ok(inspect)
+    const report = textOf(
+        await inspect.execute(
+            'tool-call-2',
+            { id: RESUME_ID },
+            undefined,
+            undefined,
+            makeCtx(agentDir)
+        )
+    )
+    assert.match(report, /Status: succeeded/)
+    assert.match(report, /Agent: worker/)
+})
+
+test('a background resume of a legacy-transcript run advertises no sessionFile', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(agentDir)
+    const fake = useFakePi(t, agentDir, { waitForRelease: true })
+    const subagentsDir = seedFailedRun(agentDir, RESUME_ID)
+    const legacy = join(subagentsDir, `${RESUME_ID}.jsonl`)
+    writeFileSync(legacy, JSON.stringify({ type: 'session', id: 'earlier' }) + '\n')
+    const { subagent } = await loadDispatch()
+
+    const result = await subagent.execute(
+        'tool-call-1',
+        { agent: 'worker', task: 'continue', resume: RESUME_ID },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+    const asyncDir = (result.details as { asyncDir?: string }).asyncDir
+    assert.ok(asyncDir, textOf(result))
+    assert.equal(statusOf(asyncDir)?.state, 'running')
+    assert.equal(statusOf(asyncDir)?.steps[0].sessionFile, undefined)
+    assert.equal(await waitFor(() => spawnedSession(fake.spawnLog), 'the child spawn'), legacy)
+
+    fake.release()
+    const payload = await waitFor(() => terminalStatus(asyncDir), 'the terminal status')
+    assert.equal(payload.state, 'complete')
+    assert.equal(payload.steps[0].sessionFile, undefined)
+    assert.equal(existsFile(legacy), false, 'a legacy transcript keeps the success cleanup')
 })

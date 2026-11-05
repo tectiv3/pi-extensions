@@ -17,7 +17,8 @@
  * parent transcript. Both carry the same async directory as the correlation key.
  *
  * Payload is a superset of the subset the tracker validates, deliberately tiny
- * otherwise: nothing here is read back by pi itself except the retention sweep.
+ * otherwise: pi itself reads it back only in the retention sweep and as the
+ * status fallback for a run whose meta sidecar was removed on success.
  *
  * Nothing in this module imports a host package — the tests run it under
  * `node --test`, outside the pi process.
@@ -143,6 +144,12 @@ export interface AsyncSweepOptions {
     now?: number
     /** Run ids live in this process; never deleted however old their leftovers are. */
     protectedRunIds?: ReadonlySet<string>
+    /**
+     * Liveness probe for `<id>.pid`, overridable for tests. A run another pi
+     * process is resuming is not in this process's protectedRunIds, and its
+     * status file still carries the earlier terminal state.
+     */
+    isProcessAlive?: (pid: number) => boolean
     retentionMs?: number
     deletingMaxAgeMs?: number
 }
@@ -189,6 +196,8 @@ export function writeRunStatus(asyncDir: string, payload: RunStatusPayload): boo
 interface ParsedStatusFile {
     runId: string
     state: string
+    agent?: string
+    startedAt?: number
     endedAt?: number
     lastUpdate?: number
 }
@@ -202,13 +211,56 @@ function parseStatusFile(raw: string): ParsedStatusFile | undefined {
         return undefined
     }
     if (typeof value !== 'object' || value === null) return undefined
-    const status = value as Partial<ParsedStatusFile>
+    const status = value as Partial<ParsedStatusFile> & { steps?: unknown }
     if (typeof status.runId !== 'string' || typeof status.state !== 'string') return undefined
+    const [firstStep] = Array.isArray(status.steps) ? status.steps : []
+    const agent =
+        typeof firstStep === 'object' && firstStep !== null && 'agent' in firstStep
+            ? firstStep.agent
+            : undefined
     return {
         runId: status.runId,
         state: status.state,
+        agent: typeof agent === 'string' && agent !== '' ? agent : undefined,
+        startedAt: typeof status.startedAt === 'number' ? status.startedAt : undefined,
         endedAt: typeof status.endedAt === 'number' ? status.endedAt : undefined,
         lastUpdate: typeof status.lastUpdate === 'number' ? status.lastUpdate : undefined,
+    }
+}
+
+export interface RunStatusSnapshot {
+    state: string
+    agent?: string
+    startedAt?: number
+    endedAt?: number
+}
+
+/**
+ * The run's last written status, for readers that have nothing else: a
+ * successful run's meta sidecar is deleted while its retained transcript and
+ * status file stay. Undefined when absent, unparsable, or naming another run.
+ */
+export function readRunStatusFile(
+    subagentsDir: string,
+    runId: string
+): RunStatusSnapshot | undefined {
+    let status: ParsedStatusFile | undefined
+    try {
+        status = parseStatusFile(
+            fs.readFileSync(
+                path.join(asyncRunDir(subagentsDir, runId), ASYNC_STATUS_FILE),
+                'utf-8'
+            )
+        )
+    } catch {
+        return undefined
+    }
+    if (!status || status.runId !== runId) return undefined
+    return {
+        state: status.state,
+        agent: status.agent,
+        startedAt: status.startedAt,
+        endedAt: status.endedAt,
     }
 }
 
@@ -224,17 +276,41 @@ function isFiniteNumber(value: number | undefined): value is number {
     return typeof value === 'number' && Number.isFinite(value)
 }
 
-/** Last activity of a run: the newest of its own timestamps and its files' mtimes. */
+/**
+ * Last activity of a run: the newest of its own timestamps and its files'
+ * mtimes. The transcripts count because a resume appends to them without
+ * touching the status file or the directory.
+ */
 function effectiveAgeMs(
     status: ParsedStatusFile,
-    dirMtime: number | undefined,
-    statusMtime: number | undefined
+    fileMtimes: (number | undefined)[]
 ): number | undefined {
-    const candidates = [status.endedAt, status.lastUpdate, dirMtime, statusMtime].filter(
+    const candidates = [status.endedAt, status.lastUpdate, ...fileMtimes].filter(
         isFiniteNumber
     )
     if (candidates.length === 0) return undefined
     return Math.max(...candidates)
+}
+
+function defaultIsProcessAlive(pid: number): boolean {
+    try {
+        process.kill(pid, 0)
+        return true
+    } catch (error) {
+        // EPERM: the process exists but belongs to another user.
+        return (error as NodeJS.ErrnoException).code === 'EPERM'
+    }
+}
+
+function pidfileIsLive(pidPath: string, isAlive: (pid: number) => boolean): boolean {
+    let raw: string
+    try {
+        raw = fs.readFileSync(pidPath, 'utf-8').trim()
+    } catch {
+        return false
+    }
+    const pid = Number.parseInt(raw, 10)
+    return Number.isInteger(pid) && pid > 0 && isAlive(pid)
 }
 
 /** rename-then-rm, so a concurrent reader sees either the directory or nothing. */
@@ -255,10 +331,12 @@ function removeDir(dir: string): boolean {
  * Deletes terminal runs whose last activity is older than the retention window,
  * plus crash residue from an interrupted delete.
  *
- * Scope is exactly `<subagentsDir>/*.async` directories and `*.async.deleting-*`
- * residue; the same directory holds `<id>.pid` / `<id>.meta` / `<id>.jsonl`
- * siblings, which are never touched. Anything unreadable, non-terminal, live in
- * this process, or unrecognised is kept.
+ * Scope is `<subagentsDir>/*.async` directories and `*.async.deleting-*`
+ * residue. Deleting a run deletes all of it: once its directory is gone, the
+ * `<id>.meta` / `<id>.pid` / `<id>.jsonl` siblings go too, so no meta survives to
+ * list a run as resumable after its transcript was removed. Anything unreadable,
+ * non-terminal, live (in this process, or by a live `<id>.pid` in another), or
+ * unrecognised is kept.
  */
 export function sweepExpiredAsyncDirs(
     subagentsDir: string,
@@ -268,6 +346,7 @@ export function sweepExpiredAsyncDirs(
     const retentionMs = opts.retentionMs ?? ASYNC_RETENTION_MS
     const deletingMaxAgeMs = opts.deletingMaxAgeMs ?? ASYNC_DELETING_MAX_AGE_MS
     const protectedRunIds = opts.protectedRunIds
+    const isAlive = opts.isProcessAlive ?? defaultIsProcessAlive
     const counts: AsyncSweepCounts = { scanned: 0, deleted: 0, kept: 0, reaped: 0 }
 
     let entries: fs.Dirent[]
@@ -324,17 +403,39 @@ export function sweepExpiredAsyncDirs(
             counts.kept++
             continue
         }
-        const effective = effectiveAgeMs(
-            status,
+        const runId = status.runId
+        const pidPath = path.join(subagentsDir, `${runId}.pid`)
+        if (pidfileIsLive(pidPath, isAlive)) {
+            counts.kept++
+            continue
+        }
+        const legacyTranscript = legacyRunTranscriptPath(subagentsDir, runId)
+        const effective = effectiveAgeMs(status, [
             mtimeMs(dir),
-            mtimeMs(path.join(dir, ASYNC_STATUS_FILE))
-        )
+            mtimeMs(path.join(dir, ASYNC_STATUS_FILE)),
+            mtimeMs(path.join(dir, ASYNC_TRANSCRIPT_FILE)),
+            mtimeMs(legacyTranscript),
+        ])
         if (!isFiniteNumber(effective) || effective >= now - retentionMs) {
             counts.kept++
             continue
         }
-        if (removeDir(dir)) counts.deleted++
-        else counts.kept++
+        if (!removeDir(dir)) {
+            counts.kept++
+            continue
+        }
+        counts.deleted++
+        for (const sibling of [
+            path.join(subagentsDir, `${runId}.meta`),
+            legacyTranscript,
+            pidPath,
+        ]) {
+            try {
+                fs.rmSync(sibling, { force: true })
+            } catch {
+                // A leftover meta without a transcript is refused at resume time.
+            }
+        }
     }
 
     return counts

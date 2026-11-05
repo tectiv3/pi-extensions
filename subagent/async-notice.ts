@@ -20,7 +20,7 @@
  * so an entry is persisted for replay and never reaches the model.
  * Inspectability therefore comes from the renderer registered for
  * SUBAGENT_NOTIFY_CUSTOM_TYPE (see createTerminalNoticeRenderer), and the
- * `notification` field carries the parent's own notification so a host can show
+ * `notification` field carries this run's block of the parent's notification so a host can show
  * the settlement as a row rather than the user-role message that mirrors it.
  */
 
@@ -50,9 +50,12 @@ export interface SubagentTerminalNoticeData {
 }
 
 /**
- * The parent-facing half of a settlement. `text` is the notification verbatim, so
- * a host derives the row from the same words the model saw; the call-to-action
- * lines in it are the host's to drop. `shortId` is the id that notification
+ * The parent-facing half of a settlement. `text` is this run's notification
+ * block as built at settlement, so a host derives the row from the words the
+ * parent is sent; the call-to-action lines in it are the host's to drop. It is
+ * not a delivery receipt: the parent's notification batches blocks settled
+ * together, and drops one whose result was collected or superseded by a resume
+ * before the batch went out. `shortId` is the id that notification
  * names, and the only stable key between the two channels: the tracker text
  * carries the async directory, which is not the id the parent was shown.
  */

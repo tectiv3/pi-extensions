@@ -1,5 +1,9 @@
 # Subagent: runtime backgrounding
 
+> **Later changes.** Chain and parallel modes were removed from the tool. The exclusions
+> of parallel tasks and chain steps below are moot; they describe the tool as it was
+> when this was written.
+
 Spec for converting a **foreground single-mode** subagent run to a background run
 mid-flight, from the `/subagents` manager view (`b` key on a RUNNING row).
 Companion to [subagent-background-and-status.md](subagent-background-and-status.md)

@@ -1,5 +1,9 @@
 # Subagent: background runs + footer status
 
+> **Later changes.** Background is now the default (`background` omitted or `true`), and
+> chain and parallel modes were removed from the tool, so single mode is the only mode.
+> The chain/parallel guards below describe the tool as it was when this was written.
+
 Spec for two features in the `subagent` extension:
 
 1. **Background mode** — `subagent { agent, task, background: true }` returns immediately; the
@@ -20,9 +24,9 @@ cannot be settled from code are collected in §5 (verification checklist).
 - `background: true` is a new optional boolean on the existing `subagent` tool schema
   (`SubagentParams`). Same tool, same dispatch path, different wait policy. A separate
   `subagent_bg` tool was rejected (schema duplication, two near-identical tools for the model).
-- **Single mode only.** `background` alongside `chain` or `tasks` is rejected with a clear
+- **Single mode only.** `background` alongside `chain` or `tasks` was rejected with a clear
   error result (a backgrounded batch would need batch-level completion semantics — out of
-  scope).
+  scope). Both modes have since been removed, which makes the guard moot.
 - **Print mode rejected.** `background: true` with `ctx.mode === 'print'` returns an error
   result: the one-shot parent exits right after the reply, SIGTERMing the child, and there is
   no notification channel. The model should use the blocking foreground call instead.
@@ -287,8 +291,8 @@ subagent_collect { id: string }
 | Stall watchdog kill | close → sink, failure | failure (stall noted in stderr/diagnostics) |
 | Parent Escape | **no effect** (detached) | — |
 | `/subagents abort <id>` / manager `x` | close → sink, failure | failure (killed) |
-| Parent process exit | exit handler SIGTERM (unchanged) | lost with the process (documented) |
-| Session switch/fork/reload (`session_shutdown`) | SIGTERM live children + drop state | none (entry suppressed by the stale epoch; the run belonged to the old session), but `status.json` is still written terminal |
+| Parent process exit | exit handler marks published runs `stopped` in `status.json`, then SIGTERM | lost with the process (documented) |
+| Quit/switch/fork/reload (`session_shutdown`) | mark published runs `stopped` in `status.json`, then SIGTERM live children + drop state | none (entry suppressed by the stale epoch; the run belonged to the old session). A quit exits before the child settles, so the handler's `stopped` write is final; otherwise the settlement overwrites it terminal |
 | Resume of this id (tool or `/subagents resume`) | registration-time supersession | none for the stale entry; the resume path's own handling applies |
 
 ---
@@ -407,7 +411,8 @@ no `inspectReady` action, and no PERSISTED-duplicate hint are needed. Consequenc
 - Backgrounded runs do not survive the parent process or a session replacement (`/new`,
   `/resume`, `/fork`, `/reload`): live runs are SIGTERM'd on `session_shutdown` (no true
   detach).
-- Background is single-mode only; no backgrounded parallel batches or chains.
+- Background is single-mode only; no backgrounded parallel batches or chains (both modes
+  have since been removed from the tool).
 - `subagent_collect` covers runs of the current process (running or settled-uncollected);
   persisted runs from other sessions are out of its scope.
 - A backgrounded child blocked on a relayed question has no auto-cancel — the dialog stays
@@ -458,7 +463,8 @@ on the target box before the feature is declared done:
     `fork`/`reload`): the run is SIGTERM'd on `session_shutdown`, the footer slot is
     cleared, and no completion notification fires for it. Verify: `/new` with a run in
     flight → the child process is gone (`ps`), the footer is empty, no follow-up arrives,
-    and `<id>.async/status.json` reads a terminal `state` (not `running`).
+    and `<id>.async/status.json` reads a terminal `state` (not `running`). Repeat with a
+    quit (Ctrl+D): the status file must still read `stopped`.
 11. **Cross-child relay mutex hold:** with a backgrounded dialog open, a second child's
     relay queues behind it; the queued child's stall watchdog keeps running (its
     `relayPending` is set only after the mutex) — observe the queued behavior and that
@@ -505,6 +511,6 @@ Results from the manual verification pass on the target box:
 ## 6. Out of scope / future
 
 - True detach (survive parent exit, file-persisted result, orphan reaping in a later session).
-- Backgrounded parallel/chain batches.
+- Backgrounded parallel/chain batches (moot: both modes have since been removed).
 - A model-facing kill tool (users have `/subagents abort`; the model doesn't need one here).
 - Auto-collect heuristics (e.g. auto-deliver full output when under a size threshold).

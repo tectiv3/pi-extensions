@@ -15,6 +15,7 @@ import {
     resolveRunTranscriptPath,
     RUN_STATE_BY_OUTCOME,
     type RunStatusPayload,
+    readRunStatusFile,
     type RunStatusState,
     sweepExpiredAsyncDirs,
     writeRunStatus,
@@ -296,21 +297,90 @@ test(
 )
 
 test(
-    'sweep never touches the pid/meta/session siblings or unrelated entries',
+    'sweep deletes a run with its pid/meta/session siblings and nothing unrelated',
     withDir(async dir => {
-        for (const suffix of ['.pid', '.meta', '.jsonl']) {
-            await writeFile(path.join(dir, `${RUN_ID}${suffix}`), 'x')
+        for (const id of [RUN_ID, OTHER_ID]) {
+            for (const suffix of ['.pid', '.meta', '.jsonl']) {
+                const file = path.join(dir, `${id}${suffix}`)
+                await writeFile(file, 'x')
+                backdate(file, NOW - 40 * DAY)
+            }
         }
-        createRun(dir, RUN_ID, 'complete', NOW - 40 * DAY)
+        createRun(dir, RUN_ID, 'failed', NOW - 40 * DAY)
         await mkdir(path.join(dir, 'downloads'), { recursive: true })
-        const counts = sweepExpiredAsyncDirs(dir, { now: NOW })
+        const counts = sweepExpiredAsyncDirs(dir, { now: NOW, isProcessAlive: () => false })
         assert.equal(counts.deleted, 1)
         assert.deepEqual(await names(dir), [
-            `${RUN_ID}.jsonl`,
-            `${RUN_ID}.meta`,
-            `${RUN_ID}.pid`,
+            `${OTHER_ID}.jsonl`,
+            `${OTHER_ID}.meta`,
+            `${OTHER_ID}.pid`,
             'downloads',
         ])
+    })
+)
+
+test(
+    'a run whose pidfile names a live process is kept however old it looks',
+    withDir(async dir => {
+        createRun(dir, RUN_ID, 'failed', NOW - 40 * DAY)
+        const pidPath = path.join(dir, `${RUN_ID}.pid`)
+        await writeFile(pidPath, '4242\n')
+        backdate(pidPath, NOW - 40 * DAY)
+        const probed: number[] = []
+        const counts = sweepExpiredAsyncDirs(dir, {
+            now: NOW,
+            isProcessAlive: pid => {
+                probed.push(pid)
+                return true
+            },
+        })
+        assert.deepEqual(probed, [4242])
+        assert.equal(counts.deleted, 0)
+        assert.ok(await exists(asyncDirOf(dir, RUN_ID)))
+        assert.ok(await exists(pidPath))
+    })
+)
+
+test(
+    'a recent transcript append keeps an old terminal run',
+    withDir(async dir => {
+        const runDir = createRun(dir, RUN_ID, 'failed', NOW - 40 * DAY)
+        const transcript = path.join(runDir, ASYNC_TRANSCRIPT_FILE)
+        await writeFile(transcript, '{}\n')
+        backdate(transcript, NOW - DAY)
+        backdate(runDir, NOW - 40 * DAY)
+        const counts = sweepExpiredAsyncDirs(dir, { now: NOW, isProcessAlive: () => false })
+        assert.equal(counts.deleted, 0)
+        assert.ok(await exists(transcript))
+    })
+)
+
+test(
+    'a recent append to the legacy transcript keeps an old terminal run',
+    withDir(async dir => {
+        createRun(dir, RUN_ID, 'stopped', NOW - 40 * DAY)
+        const legacy = legacyRunTranscriptPath(dir, RUN_ID)
+        await writeFile(legacy, '{}\n')
+        backdate(legacy, NOW - DAY)
+        const counts = sweepExpiredAsyncDirs(dir, { now: NOW, isProcessAlive: () => false })
+        assert.equal(counts.deleted, 0)
+        assert.ok(await exists(legacy))
+    })
+)
+
+test(
+    'the status reader returns the run state and agent, and rejects a foreign file',
+    withDir(async dir => {
+        createRun(dir, RUN_ID, 'complete', NOW)
+        assert.deepEqual(readRunStatusFile(dir, RUN_ID), {
+            state: 'complete',
+            agent: 'scout',
+            startedAt: NOW - 1000,
+            endedAt: NOW,
+        })
+        assert.equal(readRunStatusFile(dir, OTHER_ID), undefined)
+        assert.ok(writeRunStatus(asyncDirOf(dir, OTHER_ID), runPayload(RUN_ID, 'failed', NOW)))
+        assert.equal(readRunStatusFile(dir, OTHER_ID), undefined)
     })
 )
 

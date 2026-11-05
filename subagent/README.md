@@ -184,8 +184,18 @@ formatting, or the session-header read.
   output already lives in the parent's tool result. A spawn-time background success
   deletes `.meta` and `.pid` but **keeps** `.async/transcript.jsonl`: the run directory
   owns it now, and the 30-day retention sweep deletes the directory and transcript
-  together. Aborted/failed/killed runs persist until resumed to completion or manually
-  deleted (`rm -r ~/.pi/agent/subagents/<id>.*`; `/subagents` lists what is there).
+  together. That holds for any success on the run-directory transcript, including a
+  foreground resume of a background run. Aborted/failed/killed runs persist until resumed
+  to completion or manually deleted (`rm -r ~/.pi/agent/subagents/<id>.*`; `/subagents`
+  lists what is there) — except runs that went to the background: those have a run
+  directory, so the sweep deletes them once they are 30 days idle, `.meta`, `.pid` and
+  any legacy `<id>.jsonl` included.
+- **Resume needs a transcript**: a run with a `.meta` but no transcript (it never wrote
+  one, or retention removed it) is refused with "nothing to continue" instead of
+  starting an empty session.
+- **Inspect after success**: a successful run on the run-directory transcript has no
+  `.meta`; `subagent_inspect` takes its status and agent from `status.json` and reports
+  task and model as unknown.
 - The directory sits outside the per-project sessions tree, so subagent runs never appear
   in the `/resume` picker.
 - **Recovery granularity**: pi creates the session file only at the child's first
@@ -420,6 +430,10 @@ Entry `data`:
 - `content` — the tracker text verbatim: first line
   `Background task (completed|failed|stopped): **<agent>**`, final line
   `Retention-managed async directory: <token>`.
+- `notification` (optional) — `{ shortId, text }`: this run's block of the parent's
+  completion notification as built at settlement. It is not a delivery receipt: the
+  parent's notification batches runs settled together and drops a run whose result was
+  already collected or superseded by a resume before the batch went out.
 
 A consumer reading the parent transcript must read the entry's `data.content`; the notice is
 no longer a `custom_message` entry and fires no `custom_message` event.
@@ -443,24 +457,32 @@ than read a transcript:
   directory — so a poller never reads a half-written payload. The settlement write is not
   session-scoped: it lands whatever the session epoch, since the directory it names
   belongs to the run, not to a transcript.
-- `sessionFile` is always the transcript the run actually wrote. A run runtime-backgrounded
-  mid-flight is the exception: it keeps the legacy `<id>.jsonl`, which no tracker followed
-  from spawn, so both its spawn and settlement payloads omit `sessionFile` rather than
-  naming a path nothing tails.
+- `sessionFile` is only ever the run-directory transcript. A run whose child writes the
+  legacy `<id>.jsonl` — runtime-backgrounded mid-flight, or a background resume of a run
+  that was spawned in the foreground — omits `sessionFile` from both payloads rather than
+  naming a path no tracker followed from spawn and that success cleanup deletes.
+- A foreground resume of a run that has a `status.json` rewrites it terminal at
+  settlement, so the file does not keep the earlier run's outcome.
 - Shape: `{ runId, mode: "single", state, startedAt, endedAt?, lastUpdate, steps: [{ agent,
   status?, sessionFile? }] }`, epoch milliseconds for the timestamps.
 - `state` is `running | complete | failed | stopped`; the internal outcome maps
   `succeeded → complete`, `failed → failed`, `aborted → stopped`.
-- A run that never reaches a terminal state (killed process, crash) leaves `running`
-  behind: the directory then stays until something overwrites or removes it.
-- Retention: one sweep per session, 60 s after the extension loads. It looks only at
-  `<agentDir>/subagents/*.async` directories, skips any run still live in this process,
-  keeps anything with a missing/unreadable `status.json` or a non-terminal state, and
-  deletes a terminal run (`complete | failed | stopped | rejected`) whose newest signal
-  (`endedAt`/`lastUpdate`, then the directory's and `status.json`'s mtime) is older
-  than 30 days — rename aside, then `rm -r`, with `*.async.deleting-*` crash
-  residue older than an hour reaped on the next pass. The transcript is deleted with its
-  directory; `<id>.pid` / `<id>.meta` / `<id>.jsonl` siblings are never touched.
+- Quitting pi (and `session_shutdown` generally, plus the process `exit` hook) marks every
+  run still published as `running` as `stopped` synchronously, before the children are
+  killed: a quit exits in the same turn, so the killed child's own settlement never runs.
+  Where the process survives (reload, new, fork) that settlement still lands and
+  overwrites it. Only a hard kill of pi (SIGKILL, power loss) leaves `running` behind; the
+  directory then stays until something overwrites or removes it.
+- Retention: one sweep per pi process, 60 s after the extension first loads (session
+  replacement does not re-evaluate the module). It looks only at
+  `<agentDir>/subagents/*.async` directories, skips any run still live in this process or
+  whose `<id>.pid` names a live process (another pi resuming it), keeps anything with a
+  missing/unreadable `status.json` or a non-terminal state, and deletes a terminal run
+  (`complete | failed | stopped | rejected`) whose newest signal (`endedAt`/`lastUpdate`,
+  then the mtimes of the directory, `status.json`, and both transcript locations) is older
+  than 30 days — rename aside, then `rm -r`, with `*.async.deleting-*` crash residue older
+  than an hour reaped on the next pass. The whole run goes: once the directory is removed,
+  its `<id>.meta` / `<id>.pid` / `<id>.jsonl` siblings are deleted too.
 
 The `subagent-notify` entry described above remains the **durable replay channel**, and
 it is what a tracker that started after the run finished has to read: the entry survives
@@ -472,7 +494,8 @@ Two behaviours a consumer must tolerate:
   the background mid-flight with the manager view's `b` key.
 - A settlement arriving after `session_shutdown` writes no `subagent-notify` entry (the
   run's session epoch is stale, so the entry — the only channel that lands in a transcript —
-  is suppressed). Its `status.json` **is** still written terminal: the file names a
+  is suppressed). Its `status.json` **is** still written terminal (and was already marked
+  `stopped` by the shutdown handler): the file names a
   run-scoped directory, not a transcript, so a tracker polling it settles instead of
   displaying the run as running, and the retention sweep still deletes the directory.
 
@@ -598,7 +621,8 @@ resume hint:
   next turn boundary, so it cannot interrupt a running tool call, undo a committed edit, or
   stop a run that is already off the rails. Nothing in the parent observes whether the child
   obeys it, so the tool result says only "not yet in effect"
-- **L11 — a hard kill leaks the run directory**: a SIGKILLed run never writes a terminal
+- **L11 — a hard kill leaks the run directory**: when pi itself is SIGKILLed (or loses
+  power) neither the shutdown handler nor the exit hook runs, so a background run never writes a terminal
   `status.json`, so its `running` directory and transcript stay on disk forever and are
   never swept. The sweep has no orphan reconciliation by design; remove it manually
   (`rm -r ~/.pi/agent/subagents/<id>.async`)

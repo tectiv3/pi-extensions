@@ -7,7 +7,6 @@ import {
     recommendedAnswers,
     startDeadline,
     subagentQuestionTimeoutMs,
-    TYPE_SOMETHING_LABEL,
     type PromptAnswer,
     type PromptQuestion,
     type PromptUi,
@@ -24,35 +23,21 @@ function question(id: string, labels: string[], allowOther = false): PromptQuest
 
 interface DialogCall {
     title: string
-    options: string[]
     signal?: AbortSignal
     timeout?: number
 }
 
-/** A ui whose dialogs resolve through the caller's `answer` callback. */
+/** A ui whose one dialog per question resolves through the caller's callback. */
 function fakeUi(
-    answer: (
-        call: DialogCall,
-        kind: 'select' | 'input'
-    ) => Promise<string | undefined> | string | undefined
+    answer: (call: DialogCall) => Promise<string | undefined> | string | undefined
 ): { ui: PromptUi; calls: DialogCall[] } {
     const calls: DialogCall[] = []
     return {
         ui: {
-            select: async (title, options, opts) => {
-                const call = { title, options, signal: opts?.signal, timeout: opts?.timeout }
-                calls.push(call)
-                return answer(call, 'select')
-            },
             input: async (title, _defaultValue, opts) => {
-                const call = {
-                    title,
-                    options: [],
-                    signal: opts?.signal,
-                    timeout: opts?.timeout,
-                }
+                const call = { title, signal: opts?.signal, timeout: opts?.timeout }
                 calls.push(call)
-                return answer(call, 'input')
+                return answer(call)
             },
         },
         calls,
@@ -154,7 +139,7 @@ test('recommended answers keep real answers and tag only the filled ones', () =>
 })
 
 test('without a budget the prompt loop behaves as before and passes no timeout', async () => {
-    const { ui, calls } = fakeUi(() => 'b')
+    const { ui, calls } = fakeUi(() => '2')
     const outcome = await askWithDeadline({
         questions: [question('Q1', ['a', 'b'])],
         ui,
@@ -169,7 +154,7 @@ test('without a budget the prompt loop behaves as before and passes no timeout',
 })
 
 test('the remaining budget is what each dialog is given', async () => {
-    const { ui, calls } = fakeUi(() => 'a')
+    const { ui, calls } = fakeUi(() => '1')
     await askWithDeadline({
         questions: [question('Q1', ['a', 'b']), question('Q2', ['c', 'd'])],
         ui,
@@ -188,7 +173,7 @@ test('a prompt-wide timeout fills the unanswered questions and aborts the dialog
     const answered: DialogCall[] = []
     const { ui } = fakeUi(call => {
         answered.push(call)
-        if (call.options.includes('more')) {
+        if (answered.length === 2) {
             // Second question hangs like an unanswered relayed dialog.
             return new Promise<string | undefined>(resolve => {
                 call.signal?.addEventListener('abort', () => resolve(undefined), {
@@ -196,7 +181,7 @@ test('a prompt-wide timeout fills the unanswered questions and aborts the dialog
                 })
             })
         }
-        return 'yes'
+        return '1'
     })
 
     const started = Date.now()
@@ -229,7 +214,7 @@ test('a prompt-wide timeout fills the unanswered questions and aborts the dialog
     assert.equal(answered[1].signal?.aborted, true)
 })
 
-test('an allowOther dialog that times out accepts the first option, not free text', async () => {
+test('a hanging dialog times out on the recommended option, not free text', async () => {
     const { ui } = fakeUi(
         call =>
             new Promise<string | undefined>(resolve => {
@@ -257,9 +242,7 @@ test('an allowOther dialog that times out accepts the first option, not free tex
 })
 
 test('free text still works through the timeout-enabled loop', async () => {
-    const { ui, calls } = fakeUi((_call, kind) =>
-        kind === 'select' ? TYPE_SOMETHING_LABEL : 'typed answer'
-    )
+    const { ui, calls } = fakeUi(() => 'typed answer')
     const outcome = await askWithDeadline({
         questions: [question('Q1', ['a'], true)],
         ui,
@@ -269,8 +252,102 @@ test('free text still works through the timeout-enabled loop', async () => {
     assert.deepEqual(outcome.answers, [
         { id: 'Q1', value: 'typed answer', label: 'typed answer', wasCustom: true },
     ])
-    assert.equal(calls.length, 2)
-    assert.ok(calls[0].options.includes(TYPE_SOMETHING_LABEL))
+    assert.equal(calls.length, 1)
+})
+
+test('a numbered reply selects that option and needs no second dialog', async () => {
+    const { ui, calls } = fakeUi(() => '2')
+    const outcome = await askWithDeadline({
+        questions: [question('Q1', ['Alpha', 'Beta'], true)],
+        ui,
+        timeoutMs: 60_000,
+    })
+    assert.equal(outcome.kind, 'answered')
+    assert.deepEqual(outcome.answers, [
+        { id: 'Q1', value: 'beta', label: 'Beta', wasCustom: false, index: 2 },
+    ])
+    assert.equal(calls.length, 1)
+})
+
+test('the title carries the prompt, the instruction and the numbered options', async () => {
+    const { ui, calls } = fakeUi(() => '1')
+    await askWithDeadline({
+        questions: [
+            {
+                id: 'Q1',
+                prompt: 'Which\napproach?',
+                options: [
+                    { value: 'fast', label: 'Alpha', description: 'cheap\nand quick' },
+                    { value: 'slow', label: 'Beta' },
+                ],
+                allowOther: true,
+            },
+        ],
+        ui,
+        timeoutMs: undefined,
+    })
+    assert.equal(calls.length, 1)
+    const lines = calls[0].title.split('\n')
+    assert.equal(lines[0], 'Which')
+    assert.ok(lines.includes('Reply with an option number, or type your own answer.'))
+    assert.deepEqual(lines.slice(-2), ['1. Alpha — cheap and quick', '2. Beta'])
+})
+
+test('a question that disallows other answers does not invite free text', async () => {
+    const { ui, calls } = fakeUi(() => 'a')
+    const outcome = await askWithDeadline({
+        questions: [question('Q1', ['Alpha', 'Beta'], false)],
+        ui,
+        timeoutMs: undefined,
+    })
+    assert.equal(outcome.kind, 'answered')
+    assert.equal(calls[0].title.includes('type your own answer'), false)
+    assert.deepEqual(outcome.answers, [{ id: 'Q1', value: 'a', label: 'a', wasCustom: true }])
+})
+
+test('an out-of-range number is taken as the answer text', async () => {
+    const { ui } = fakeUi(() => '7')
+    const outcome = await askWithDeadline({
+        questions: [question('Q1', ['Alpha', 'Beta'])],
+        ui,
+        timeoutMs: undefined,
+    })
+    assert.deepEqual(outcome.answers, [{ id: 'Q1', value: '7', label: '7', wasCustom: true }])
+})
+
+test('a comma-separated reply stays literal text: no question is multi-select', async () => {
+    const { ui } = fakeUi(() => '1, 2')
+    const outcome = await askWithDeadline({
+        questions: [question('Q1', ['Alpha', 'Beta'])],
+        ui,
+        timeoutMs: undefined,
+    })
+    assert.deepEqual(outcome.answers, [
+        { id: 'Q1', value: '1, 2', label: '1, 2', wasCustom: true },
+    ])
+})
+
+test('free text is trimmed before it becomes the custom answer', async () => {
+    const { ui } = fakeUi(() => '  maybe blue  ')
+    const outcome = await askWithDeadline({
+        questions: [question('Q1', ['Alpha'])],
+        ui,
+        timeoutMs: undefined,
+    })
+    assert.deepEqual(outcome.answers, [
+        { id: 'Q1', value: 'maybe blue', label: 'maybe blue', wasCustom: true },
+    ])
+})
+
+test('an empty reply cancels like a dismissed dialog', async () => {
+    const { ui } = fakeUi(() => '   ')
+    const outcome = await askWithDeadline({
+        questions: [question('Q1', ['Alpha'])],
+        ui,
+        timeoutMs: undefined,
+    })
+    assert.equal(outcome.kind, 'cancelled')
+    assert.deepEqual(outcome.answers, [])
 })
 
 test('a user cancel before the deadline stays a cancel', async () => {

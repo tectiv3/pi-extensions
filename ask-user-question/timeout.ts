@@ -16,10 +16,15 @@ export const TIMEOUT_ENV = 'PI_SUBAGENT_QUESTION_TIMEOUT_MS'
 
 export const DEFAULT_TIMEOUT_MS = 300_000
 
+/**
+ * The rpc path's `allowOther` row label. It is both displayed and matched against
+ * the answer, so it must be a single constant (the TUI uses its own internal row).
+ */
+export const TYPE_SOMETHING_LABEL = 'Type something...'
+
 export interface PromptOption {
     value: string
     label: string
-    description?: string
 }
 
 export interface PromptQuestion {
@@ -44,11 +49,12 @@ export interface PromptDialogOptions {
     timeout?: number
 }
 
-/**
- * Only `input` is driven: it is the one rpc dialog a user can type into (see the
- * note in `askWithDeadline`).
- */
 export interface PromptUi {
+    select(
+        title: string,
+        options: string[],
+        opts?: PromptDialogOptions
+    ): Promise<string | undefined>
     input(
         title: string,
         defaultValue?: string,
@@ -159,60 +165,6 @@ export function formatDuration(ms: number): string {
     return `${Math.round(ms)}ms`
 }
 
-/** Dialog text is one line per option, so an embedded newline would break the numbering. */
-function singleLine(text: string): string {
-    return text.replace(/\s+/g, ' ').trim()
-}
-
-function optionLine(position: number, option: PromptOption): string {
-    const label = singleLine(option.label)
-    const description = option.description === undefined ? '' : singleLine(option.description)
-    return description === ''
-        ? `${position}. ${label}`
-        : `${position}. ${label} — ${description}`
-}
-
-function replyInstruction(question: PromptQuestion): string {
-    return question.allowOther
-        ? 'Reply with an option number, or type your own answer.'
-        : 'Reply with an option number.'
-}
-
-/**
- * The rpc card has no body: the title is the whole dialog, so the prompt, the
- * answer instruction and the numbered option list all travel in it.
- */
-function questionDialogTitle(question: PromptQuestion): string {
-    return [
-        question.prompt.trim(),
-        '',
-        replyInstruction(question),
-        '',
-        ...question.options.map((option, index) => optionLine(index + 1, option)),
-    ].join('\n')
-}
-
-/** The reply as a 1-based option position, when it is exactly one existing number. */
-function optionPosition(reply: string, question: PromptQuestion): number | undefined {
-    if (!/^\d+$/.test(reply)) return undefined
-    const position = Number(reply)
-    return position >= 1 && position <= question.options.length ? position : undefined
-}
-
-/** A number picks an option; anything else is the user's own answer, verbatim. */
-function answerFromReply(question: PromptQuestion, reply: string): PromptAnswer {
-    const position = optionPosition(reply, question)
-    const option = position === undefined ? undefined : question.options[position - 1]
-    if (!option) return { id: question.id, value: reply, label: reply, wasCustom: true }
-    return {
-        id: question.id,
-        value: option.value,
-        label: option.label,
-        wasCustom: false,
-        index: position,
-    }
-}
-
 export interface AskWithDeadlineOptions {
     questions: readonly PromptQuestion[]
     ui: PromptUi
@@ -257,15 +209,15 @@ export async function askWithDeadline(
                 break
             }
 
-            // An rpc host paints `ui.select` as option chips with no text field and
-            // `ui.input` as a card that can be typed in, so typing a custom answer
-            // is only reachable through `input`; the numbers live in its title.
+            const optionLabels = question.options.map(option => option.label)
+            if (question.allowOther) optionLabels.push(TYPE_SOMETHING_LABEL)
+
             const controller = new AbortController()
             activeController = controller
             const detach = bridgeAbort(signal, controller)
-            let reply: string | undefined
+            let selected: string | undefined
             try {
-                reply = await ui.input(questionDialogTitle(question), undefined, {
+                selected = await ui.select(question.prompt, optionLabels, {
                     signal: controller.signal,
                     timeout: deadline?.remaining(),
                 })
@@ -279,11 +231,49 @@ export async function askWithDeadline(
                 timedOut = true
                 break
             }
-            if (reply === undefined) return { kind: 'cancelled', answers }
+            if (selected === undefined) return { kind: 'cancelled', answers }
 
-            const trimmed = reply.trim()
-            if (trimmed === '') return { kind: 'cancelled', answers }
-            answers.push(answerFromReply(question, trimmed))
+            if (question.allowOther && selected === TYPE_SOMETHING_LABEL) {
+                const inputController = new AbortController()
+                activeController = inputController
+                const detachInput = bridgeAbort(signal, inputController)
+                let typed: string | undefined
+                try {
+                    typed = await ui.input(question.prompt, undefined, {
+                        signal: inputController.signal,
+                        timeout: deadline?.remaining(),
+                    })
+                } finally {
+                    detachInput()
+                    if (activeController === inputController) activeController = undefined
+                }
+
+                if (signal?.aborted) return { kind: 'cancelled', answers }
+                if (deadline?.elapsed()) {
+                    timedOut = true
+                    break
+                }
+                if (typed === undefined) return { kind: 'cancelled', answers }
+                answers.push({
+                    id: question.id,
+                    value: typed,
+                    label: typed,
+                    wasCustom: true,
+                })
+                continue
+            }
+
+            const matched = question.options.find(option => option.label === selected)
+            const matchedIndex = question.options.findIndex(
+                option => option.label === selected
+            )
+            answers.push({
+                id: question.id,
+                value: matched?.value ?? selected,
+                label: selected,
+                wasCustom: false,
+                index: matchedIndex >= 0 ? matchedIndex + 1 : undefined,
+            })
         }
     } finally {
         deadline?.clear()

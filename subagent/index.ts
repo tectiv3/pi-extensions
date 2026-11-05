@@ -3721,12 +3721,6 @@ const SubagentParams = Type.Object(
             })
         ),
         agentScope: Type.Optional(AgentScopeSchema),
-        confirmProjectAgents: Type.Optional(
-            Type.Boolean({
-                description: 'Prompt before running project-local agents. Default: true.',
-                default: true,
-            })
-        ),
         cwd: Type.Optional(
             Type.String({
                 description: 'Working directory for the agent process',
@@ -3832,7 +3826,6 @@ export default function (pi: ExtensionAPI) {
             }
             const discovery = discoverAgents(ctx.cwd, agentScope)
             const agents = discovery.agents
-            const confirmProjectAgents = params.confirmProjectAgents ?? true
 
             const makeDetails = (results: SingleResult[]): SubagentDetails => ({
                 mode: 'single',
@@ -3878,7 +3871,6 @@ export default function (pi: ExtensionAPI) {
 
             if (
                 (agentScope === 'project' || agentScope === 'both') &&
-                confirmProjectAgents &&
                 ctx.hasUI &&
                 !ctx.isProjectTrusted()
             ) {

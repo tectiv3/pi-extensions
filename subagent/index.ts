@@ -4,9 +4,7 @@
  * Spawns a separate `pi` process for each subagent invocation,
  * giving it an isolated context window.
  *
- * Supports two modes:
- *   - Single: { agent: "name", task: "..." }
- *   - Chain: { chain: [{ agent: "name", task: "... {previous} ..." }, ...] }
+ * Invoked as { agent: "name", task: "..." }.
  *
  * Runs children in RPC mode: stdout streams structured events while stdin
  * accepts JSON-line commands (initial task, steer, abort).
@@ -366,8 +364,6 @@ interface ActiveSubagent {
     // The run's own abort source. Background runs have no parent signal, so
     // without this their only kill path was a bare SIGTERM with no escalation.
     abort: () => void
-    // 1-based chain item index; lets a steer name the item it landed on.
-    step?: number
     // Runtime backgrounding (docs/plans/subagent-runtime-background.md): the
     // manager view's `b` key converts a foreground single-mode tool-call run
     // mid-flight. Wired only for backgroundable runs.
@@ -936,7 +932,6 @@ interface SingleResult {
     aborted?: boolean
     resumeNote?: string
     errorMessage?: string
-    step?: number
     // Run cwd; display-only, lets the renderer drop a redundant `cd <cwd> &&`
     // from bash rows. Never feeds execution.
     cwd?: string
@@ -946,7 +941,7 @@ interface SingleResult {
 }
 
 interface SubagentDetails {
-    mode: 'single' | 'chain'
+    mode: 'single'
     agentScope: AgentScope
     projectAgentsDir: string | null
     results: SingleResult[]
@@ -1348,11 +1343,7 @@ function formatRunningSubagentsList(entries: ActiveSubagent[]): string[] {
 // here exists to stop the model reading "steer" as "corrected".
 function buildSteerResult(entry: ActiveSubagent): string {
     const shortId = shortSubagentId(entry.id)
-    const target =
-        entry.step !== undefined
-            ? `${shortId} (chain step ${entry.step}, ${entry.agent})`
-            : shortId
-    return `Message queued for delivery to ${target} at its next tool round — not yet in effect.`
+    return `Message queued for delivery to ${shortId} at its next tool round — not yet in effect.`
 }
 
 function resolveAttachTarget(id?: string): ActiveSubagent | string {
@@ -2219,7 +2210,6 @@ async function runSingleAgent(
     agentName: string,
     task: string,
     cwd: string | undefined,
-    step: number | undefined,
     signal: AbortSignal | undefined,
     onUpdate: OnUpdateCallback | undefined,
     makeDetails: (results: SingleResult[]) => SubagentDetails,
@@ -2270,7 +2260,6 @@ async function runSingleAgent(
                 contextTokens: 0,
                 turns: 0,
             },
-            step,
             cwd: resolvedCwd,
         }
     }
@@ -2282,8 +2271,8 @@ async function runSingleAgent(
     let model: string | undefined
     let thinkingLevel: ThinkingLevel | undefined
     let resumeNote: string | undefined
-    // Per-item chain models bypass the top-level guard, so normalize here to
-    // keep an empty string from winning the ?? chain or reaching spawnMeta/resumeNote.
+    // Normalize the override so an empty string cannot win a ?? fallback or
+    // reach spawnMeta/resumeNote.
     const override = overrideModel && overrideModel.trim() !== '' ? overrideModel : undefined
     if (resume) {
         model = override ?? resume.meta.model ?? dispatchDefaults.model
@@ -2365,7 +2354,6 @@ async function runSingleAgent(
             turns: 0,
         },
         model,
-        step,
         resumeNote,
         cwd: resolvedCwd,
     }
@@ -2693,7 +2681,6 @@ async function runSingleAgent(
                 pendingSteers: [],
                 steer: steerFn,
                 abort: () => runAbort.abort(),
-                step,
             }
             registerActiveSubagent(entry)
             // Id supersession (spec 1.1): a re-running id reuses its id, so a stale
@@ -2809,7 +2796,7 @@ async function runSingleAgent(
                 eventCount++
                 lastEventType = type
 
-                // Forward before the dispatch chain so events that also hit
+                // Forward before the dispatch path so events that also hit
                 // message_end / tool_result_end are forwarded too. The ring
                 // holds only renderable events (late-attach replay history):
                 // high-frequency streaming frames would evict real history
@@ -3209,7 +3196,6 @@ async function handleSubagentsResume(ctx: ExtensionContext, rest: string[]): Pro
         agents,
         resolved.meta.agent,
         instruction,
-        undefined,
         undefined,
         undefined,
         undefined,
@@ -3702,17 +3688,6 @@ async function openSubagentInspectView(
 const MODEL_OVERRIDE_DESCRIPTION =
     "Model override for this dispatch, 'provider/model-id'. Precedence: explicit > agent file pin > parent session default."
 
-const ChainItem = Type.Object({
-    agent: Type.String({ description: 'Name of the agent to invoke' }),
-    task: Type.String({
-        description: 'Task with optional {previous} placeholder for prior output',
-    }),
-    cwd: Type.Optional(
-        Type.String({ description: 'Working directory for the agent process' })
-    ),
-    model: Type.Optional(Type.String({ description: MODEL_OVERRIDE_DESCRIPTION })),
-})
-
 const AgentScopeSchema = StringEnum(['user', 'project', 'both'] as const, {
     description:
         'Which agent directories to use. Default: "user". Use "both" to include project-local agents.',
@@ -3723,17 +3698,15 @@ const SubagentParams = Type.Object(
     {
         agent: Type.Optional(
             Type.String({
-                description: 'Name of the agent to invoke (for single mode)',
+                description: 'Name of the agent to invoke',
             })
         ),
-        task: Type.Optional(
-            Type.String({ description: 'Task to delegate (for single mode)' })
-        ),
+        task: Type.Optional(Type.String({ description: 'Task to delegate' })),
         model: Type.Optional(Type.String({ description: MODEL_OVERRIDE_DESCRIPTION })),
         resume: Type.Optional(
             Type.String({
                 description:
-                    'Id (exact or unique suffix) of a persisted subagent run to resume (single mode only)',
+                    'Id (exact or unique suffix) of a persisted subagent run to resume',
             })
         ),
         background: Type.Optional(
@@ -3742,14 +3715,9 @@ const SubagentParams = Type.Object(
                     'Default: true. Returns immediately; the child keeps running detached from parent Escape. ' +
                     'Completion arrives as a notification; fetch the result via subagent_collect { id }. ' +
                     'background: false opts into a foreground run that waits for the result in this turn. ' +
-                    'Chain mode is always foreground; print mode always runs foreground. ' +
+                    'Print mode always runs foreground. ' +
                     'Do NOT wait for a background run: end your turn with a summary. Sleeping or polling only adds delay ' +
                     'on top of the notification, and subagent_collect on a running run returns immediately by design.',
-            })
-        ),
-        chain: Type.Optional(
-            Type.Array(ChainItem, {
-                description: 'Array of {agent, task} for sequential execution',
             })
         ),
         agentScope: Type.Optional(AgentScopeSchema),
@@ -3761,7 +3729,7 @@ const SubagentParams = Type.Object(
         ),
         cwd: Type.Optional(
             Type.String({
-                description: 'Working directory for the agent process (single mode)',
+                description: 'Working directory for the agent process',
             })
         ),
     },
@@ -3845,14 +3813,13 @@ export default function (pi: ExtensionAPI) {
         name: 'subagent',
         label: 'Subagent',
         description: [
-            'Delegate tasks to specialized subagents with isolated context.',
-            'Modes: single (agent + task), chain (sequential with {previous} placeholder).',
-            'Resume: in single mode pass resume: <subagentId> to continue a persisted interrupted/failed run ' +
+            'Delegate a task to a specialized subagent with isolated context.',
+            'Resume: pass resume: <subagentId> to continue a persisted interrupted/failed run ' +
                 '(agent must match the original run).',
             `Default agent scope is "user" (from ${path.join(getAgentDir(), 'agents')}).`,
             `To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
-            'Background: the default for single mode. A single-mode call with `background` omitted or true returns immediately; the child keeps running and completion is reported via notification; fetch results with subagent_collect. Pass background: false to wait for the result in this turn. Chain mode and print mode always run foreground. Do not wait or poll on a background run: end your turn, and the completion notification starts the next one.',
-            'Model: model: "provider/model-id" overrides the agent file pin and the parent session default for that dispatch (single mode; per item in chain).',
+            'Background: the default. A call with `background` omitted or true returns immediately; the child keeps running and completion is reported via notification; fetch results with subagent_collect. Pass background: false to wait for the result in this turn. Print mode always runs foreground. Do not wait or poll on a background run: end your turn, and the completion notification starts the next one.',
+            'Model: model: "provider/model-id" overrides the agent file pin and the parent session default for that dispatch.',
         ].join(' '),
         parameters: SubagentParams,
 
@@ -3867,20 +3834,14 @@ export default function (pi: ExtensionAPI) {
             const agents = discovery.agents
             const confirmProjectAgents = params.confirmProjectAgents ?? true
 
-            const hasChain = (params.chain?.length ?? 0) > 0
-            const hasSingle = Boolean(params.agent && params.task)
-            const modeCount = Number(hasChain) + Number(hasSingle)
+            const makeDetails = (results: SingleResult[]): SubagentDetails => ({
+                mode: 'single',
+                agentScope,
+                projectAgentsDir: discovery.projectAgentsDir,
+                results,
+            })
 
-            const makeDetails =
-                (mode: 'single' | 'chain') =>
-                (results: SingleResult[]): SubagentDetails => ({
-                    mode,
-                    agentScope,
-                    projectAgentsDir: discovery.projectAgentsDir,
-                    results,
-                })
-
-            if (modeCount !== 1) {
+            if (!params.agent || !params.task) {
                 const available =
                     agents.map(a => `${a.name} (${a.source})`).join(', ') || 'none'
                 return {
@@ -3888,35 +3849,18 @@ export default function (pi: ExtensionAPI) {
                         {
                             type: 'text',
                             text: recoverableMiss(
-                                'provide exactly one mode, single (agent + task) or chain (chain array); ' +
-                                    `the parallel mode (tasks) was removed. Available agents: ${available}`
+                                `agent and task are both required. Available agents: ${available}`
                             ),
                         },
                     ],
-                    details: makeDetails('single')([]),
-                }
-            }
-
-            if (params.resume && hasChain) {
-                return {
-                    content: [
-                        {
-                            type: 'text',
-                            text: recoverableMiss(
-                                '"resume" is single-mode only ({agent, task, resume}); ' +
-                                    'remove "resume" or restructure as a single delegation.'
-                            ),
-                        },
-                    ],
-                    details: makeDetails('single')([]),
+                    details: makeDetails([]),
                 }
             }
 
             // Background is the default; only an explicit `background: false` asks for a
-            // foreground run. Chain items are awaited one at a time inside the same tool
-            // call, and print mode exits the parent before a detached child could settle,
-            // so both force foreground rather than erroring on the param.
-            const background = params.background !== false && !hasChain && ctx.mode !== 'print'
+            // foreground run. Print mode exits the parent before a detached child could
+            // settle, so it forces foreground rather than erroring on the param.
+            const background = params.background !== false && ctx.mode !== 'print'
             if (params.model !== undefined && params.model.trim() === '') {
                 return {
                     content: [
@@ -3928,21 +3872,7 @@ export default function (pi: ExtensionAPI) {
                             ),
                         },
                     ],
-                    details: makeDetails('single')([]),
-                }
-            }
-            if (params.model !== undefined && hasChain) {
-                return {
-                    content: [
-                        {
-                            type: 'text',
-                            text: recoverableMiss(
-                                'model is single-mode only ({agent, task, model}); ' +
-                                    'set model per item in the chain.'
-                            ),
-                        },
-                    ],
-                    details: makeDetails('single')([]),
+                    details: makeDetails([]),
                 }
             }
 
@@ -3953,8 +3883,6 @@ export default function (pi: ExtensionAPI) {
                 !ctx.isProjectTrusted()
             ) {
                 const requestedAgentNames = new Set<string>()
-                if (params.chain)
-                    for (const step of params.chain) requestedAgentNames.add(step.agent)
                 if (params.agent) requestedAgentNames.add(params.agent)
 
                 const projectAgentsRequested = Array.from(requestedAgentNames)
@@ -3976,368 +3904,244 @@ export default function (pi: ExtensionAPI) {
                                     text: 'Canceled: project-local agents not approved.',
                                 },
                             ],
-                            details: makeDetails(hasChain ? 'chain' : 'single')([]),
+                            details: makeDetails([]),
                         }
                 }
             }
 
             const relayUiRequest = buildRelayUiRequest(ctx)
 
-            if (params.chain && params.chain.length > 0) {
-                const results: SingleResult[] = []
-                let previousOutput = ''
-
-                for (let i = 0; i < params.chain.length; i++) {
-                    const step = params.chain[i]
-                    const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput)
-
-                    // Create update callback that includes all previous results
-                    const chainUpdate: OnUpdateCallback | undefined = onUpdate
-                        ? partial => {
-                              // Combine completed results with current streaming result
-                              const currentResult = partial.details?.results[0]
-                              if (currentResult) {
-                                  const allResults = [...results, currentResult]
-                                  onUpdate({
-                                      content: partial.content,
-                                      details: makeDetails('chain')(allResults),
-                                  })
-                              }
-                          }
-                        : undefined
-
-                    const result = await runSingleAgent(
-                        ctx.cwd,
-                        dispatchDefaults,
-                        agents,
-                        step.agent,
-                        taskWithContext,
-                        step.cwd,
-                        i + 1,
-                        signal,
-                        chainUpdate,
-                        makeDetails('chain'),
-                        undefined,
-                        undefined,
-                        relayUiRequest,
-                        toolCallId,
-                        false,
-                        false,
-                        step.model
-                    )
-                    results.push(result)
-
-                    const isError = isFailedResult(result)
-                    if (isError) {
-                        const miss = preSpawnMissReason(
-                            result,
-                            `step ${i + 1} (${step.agent})`
-                        )
-                        if (miss)
-                            return {
-                                content: [{ type: 'text', text: recoverableMiss(miss) }],
-                                details: makeDetails('chain')(results),
-                            }
-                        return {
-                            content: [
-                                {
-                                    type: 'text',
-                                    text: `Chain stopped at step ${i + 1} (${step.agent}):\n\n${formatFailureReport(result)}`,
-                                },
-                            ],
-                            details: makeDetails('chain')(results),
-                            isError: true,
-                        }
-                    }
-                    previousOutput = getFinalOutput(result.messages)
-                }
-                return {
-                    content: [
-                        {
-                            type: 'text',
-                            text:
-                                getFinalOutput(results[results.length - 1].messages) ||
-                                '(no output)',
-                        },
-                    ],
-                    details: makeDetails('chain')(results),
-                }
-            }
-
-            if (params.agent && params.task) {
-                let resume: ResumeTarget | undefined
-                if (params.resume) {
-                    const resolved = resolveResumeTarget(params.resume, params.agent, agents)
-                    if (typeof resolved === 'string') {
-                        return {
-                            content: [{ type: 'text', text: recoverableMiss(resolved) }],
-                            details: makeDetails('single')([]),
-                        }
-                    }
-                    resume = resolved
-                }
-                if (background) {
-                    // Spawn bridge (mirrors handleSubagentsResume): settle on the
-                    // first of onSpawned, a pre-spawn failure of the floating run
-                    // promise, or the timeout. Spawn + registration are synchronous,
-                    // so the timeout is pure insurance.
-                    type SpawnBridge =
-                        | { kind: 'spawned'; entry: ActiveSubagent }
-                        | { kind: 'pre-spawn'; result: SingleResult }
-                        | { kind: 'timeout' }
-                        | { kind: 'not-started'; message: string }
-                    let settled: SpawnBridge | undefined
-                    let settleBridge: (v: SpawnBridge) => void
-                    const bridgePromise = new Promise<SpawnBridge>(resolve => {
-                        settleBridge = v => {
-                            if (!settled) {
-                                settled = v
-                                resolve(v)
-                            }
-                        }
-                    })
-                    const timer = setTimeout(() => settleBridge({ kind: 'timeout' }), 5000)
-                    timer.unref()
-                    const runPromise = runSingleAgent(
-                        ctx.cwd,
-                        dispatchDefaults,
-                        agents,
-                        params.agent,
-                        params.task,
-                        params.cwd,
-                        undefined,
-                        undefined, // signal: runAbort is this run's abort path; undefined so Escape cannot kill it (spec §1.1)
-                        undefined, // onUpdate: tool returns immediately; nothing to stream to
-                        makeDetails('single'),
-                        resume,
-                        entry => {
-                            clearTimeout(timer)
-                            settleBridge({ kind: 'spawned', entry })
-                        },
-                        relayUiRequest,
-                        toolCallId, // rc-server attach-by-toolCallId correlation
-                        true,
-                        false,
-                        params.model
-                    )
-                    runPromise.then(
-                        result => settleBridge({ kind: 'pre-spawn', result }),
-                        err => {
-                            if (settled)
-                                subagentDebugLog(
-                                    `[subagent:background] post-spawn run failure: ${err instanceof Error ? err.message : String(err)}`
-                                )
-                            else
-                                settleBridge({
-                                    kind: 'not-started',
-                                    message: err instanceof Error ? err.message : String(err),
-                                })
-                        }
-                    )
-                    const spawn = await bridgePromise
-                    clearTimeout(timer)
-                    if (spawn.kind === 'spawned') {
-                        const entry = spawn.entry
-                        // Before the result returns: the tracker starts polling as
-                        // soon as it has details.asyncDir, and a missing file is a
-                        // silent "keep running" there.
-                        writeRunStatusStart(entry.id, params.agent, entry.startedAt)
-                        return {
-                            content: [
-                                {
-                                    type: 'text',
-                                    text: [
-                                        `Background subagent ${shortSubagentId(entry.id)} started (agent: ${params.agent}).`,
-                                        `Task: ${previewText(params.task, LIST_TASK_PREVIEW_CHARS)}`,
-                                        `You'll be notified when it completes. Call subagent_collect { id: "${shortSubagentId(entry.id)}" } for the result;`,
-                                        `subagent_inspect { id: "${shortSubagentId(entry.id)}" } for progress.`,
-                                        `subagent_steer { id: "${shortSubagentId(entry.id)}", message } to correct it mid-run — queued at its next turn boundary, not an interruption.`,
-                                        'There is nothing to wait for: end your turn now. The ' +
-                                            'completion notification starts your next turn; ' +
-                                            'sleeping or polling delays it without bringing the ' +
-                                            'result any sooner.',
-                                    ].join('\n'),
-                                },
-                            ],
-                            // The async id/token let external trackers settle this
-                            // call from the completion notice instead of waiting on
-                            // a result that this run will never return here.
-                            details: {
-                                ...makeDetails('single')([]),
-                                asyncId: entry.id,
-                                asyncDir: backgroundRunAsyncToken(entry.id),
-                            },
-                        }
-                    }
-                    if (spawn.kind === 'pre-spawn') {
-                        const miss = preSpawnMissReason(spawn.result)
-                        if (miss)
-                            return {
-                                content: [{ type: 'text', text: recoverableMiss(miss) }],
-                                details: makeDetails('single')([spawn.result]),
-                            }
-                        return {
-                            content: [
-                                { type: 'text', text: formatFailureReport(spawn.result) },
-                            ],
-                            details: makeDetails('single')([spawn.result]),
-                            isError: true,
-                        }
-                    }
-                    if (spawn.kind === 'timeout')
-                        return {
-                            content: [
-                                {
-                                    type: 'text',
-                                    text: recoverableMiss(
-                                        'the spawn did not confirm within 5s, so the run may or may not ' +
-                                            'have started; check /subagents before re-dispatching.'
-                                    ),
-                                },
-                            ],
-                            details: makeDetails('single')([]),
-                        }
+            let resume: ResumeTarget | undefined
+            if (params.resume) {
+                const resolved = resolveResumeTarget(params.resume, params.agent, agents)
+                if (typeof resolved === 'string') {
                     return {
-                        content: [
-                            {
-                                type: 'text',
-                                text: recoverableMiss(
-                                    `the run did not start (${spawn.message}); check /subagents for ` +
-                                        'a live run, then re-dispatch.'
-                                ),
-                            },
-                        ],
-                        details: makeDetails('single')([]),
+                        content: [{ type: 'text', text: recoverableMiss(resolved) }],
+                        details: makeDetails([]),
                     }
                 }
-                const result = await runSingleAgent(
+                resume = resolved
+            }
+            if (background) {
+                // Spawn bridge (mirrors handleSubagentsResume): settle on the
+                // first of onSpawned, a pre-spawn failure of the floating run
+                // promise, or the timeout. Spawn + registration are synchronous,
+                // so the timeout is pure insurance.
+                type SpawnBridge =
+                    | { kind: 'spawned'; entry: ActiveSubagent }
+                    | { kind: 'pre-spawn'; result: SingleResult }
+                    | { kind: 'timeout' }
+                    | { kind: 'not-started'; message: string }
+                let settled: SpawnBridge | undefined
+                let settleBridge: (v: SpawnBridge) => void
+                const bridgePromise = new Promise<SpawnBridge>(resolve => {
+                    settleBridge = v => {
+                        if (!settled) {
+                            settled = v
+                            resolve(v)
+                        }
+                    }
+                })
+                const timer = setTimeout(() => settleBridge({ kind: 'timeout' }), 5000)
+                timer.unref()
+                const runPromise = runSingleAgent(
                     ctx.cwd,
                     dispatchDefaults,
                     agents,
                     params.agent,
                     params.task,
                     params.cwd,
-                    undefined,
-                    signal,
-                    onUpdate,
-                    makeDetails('single'),
+                    undefined, // signal: runAbort is this run's abort path; undefined so Escape cannot kill it (spec §1.1)
+                    undefined, // onUpdate: tool returns immediately; nothing to stream to
+                    makeDetails,
                     resume,
-                    undefined,
+                    entry => {
+                        clearTimeout(timer)
+                        settleBridge({ kind: 'spawned', entry })
+                    },
                     relayUiRequest,
-                    toolCallId,
-                    false,
-                    // Manager `b` may convert this awaiting call mid-flight
-                    // (foreground single tool-call runs, incl. resume, only).
+                    toolCallId, // rc-server attach-by-toolCallId correlation
                     true,
+                    false,
                     params.model
                 )
-                if (result.runtimeBackgrounded) {
-                    // Same contract as a spawn-time background run, but the run
-                    // started foreground: the tracker only learns the async
-                    // directory now, so the spawn payload is written here.
-                    writeRunStatusStart(
-                        result.subagentId,
-                        params.agent,
-                        activeSubagents.get(result.subagentId)?.startedAt ?? Date.now()
-                    )
+                runPromise.then(
+                    result => settleBridge({ kind: 'pre-spawn', result }),
+                    err => {
+                        if (settled)
+                            subagentDebugLog(
+                                `[subagent:background] post-spawn run failure: ${err instanceof Error ? err.message : String(err)}`
+                            )
+                        else
+                            settleBridge({
+                                kind: 'not-started',
+                                message: err instanceof Error ? err.message : String(err),
+                            })
+                    }
+                )
+                const spawn = await bridgePromise
+                clearTimeout(timer)
+                if (spawn.kind === 'spawned') {
+                    const entry = spawn.entry
+                    // Before the result returns: the tracker starts polling as
+                    // soon as it has details.asyncDir, and a missing file is a
+                    // silent "keep running" there.
+                    writeRunStatusStart(entry.id, params.agent, entry.startedAt)
                     return {
                         content: [
                             {
                                 type: 'text',
                                 text: [
-                                    `Subagent ${shortSubagentId(result.subagentId)} (agent: ${params.agent}) was sent to the background by the user; it keeps running.`,
+                                    `Background subagent ${shortSubagentId(entry.id)} started (agent: ${params.agent}).`,
                                     `Task: ${previewText(params.task, LIST_TASK_PREVIEW_CHARS)}`,
-                                    `You'll be notified when it completes. Call subagent_collect { id: "${shortSubagentId(result.subagentId)}" } for the result;`,
-                                    `subagent_inspect { id: "${shortSubagentId(result.subagentId)}" } for progress.`,
-                                    'End your turn — there is nothing to wait for; the ' +
-                                        'completion notification starts your next turn.',
+                                    `You'll be notified when it completes. Call subagent_collect { id: "${shortSubagentId(entry.id)}" } for the result;`,
+                                    `subagent_inspect { id: "${shortSubagentId(entry.id)}" } for progress.`,
+                                    `subagent_steer { id: "${shortSubagentId(entry.id)}", message } to correct it mid-run — queued at its next turn boundary, not an interruption.`,
+                                    'There is nothing to wait for: end your turn now. The ' +
+                                        'completion notification starts your next turn; ' +
+                                        'sleeping or polling delays it without bringing the ' +
+                                        'result any sooner.',
                                 ].join('\n'),
                             },
                         ],
-                        // Same contract as a spawn-time background run: the awaited
-                        // call returns no result, so the notice carries the outcome.
+                        // The async id/token let external trackers settle this
+                        // call from the completion notice instead of waiting on
+                        // a result that this run will never return here.
                         details: {
-                            ...makeDetails('single')([]),
-                            asyncId: result.subagentId,
-                            asyncDir: backgroundRunAsyncToken(result.subagentId),
+                            ...makeDetails([]),
+                            asyncId: entry.id,
+                            asyncDir: backgroundRunAsyncToken(entry.id),
                         },
                     }
                 }
-                const isError = isFailedResult(result)
-                if (isError) {
-                    const miss = preSpawnMissReason(result)
+                if (spawn.kind === 'pre-spawn') {
+                    const miss = preSpawnMissReason(spawn.result)
                     if (miss)
                         return {
                             content: [{ type: 'text', text: recoverableMiss(miss) }],
-                            details: makeDetails('single')([result]),
+                            details: makeDetails([spawn.result]),
                         }
+                    return {
+                        content: [{ type: 'text', text: formatFailureReport(spawn.result) }],
+                        details: makeDetails([spawn.result]),
+                        isError: true,
+                    }
+                }
+                if (spawn.kind === 'timeout')
                     return {
                         content: [
                             {
                                 type: 'text',
-                                text: result.resumeNote
-                                    ? `${formatFailureReport(result)}\n\n${result.resumeNote}`
-                                    : formatFailureReport(result),
+                                text: recoverableMiss(
+                                    'the spawn did not confirm within 5s, so the run may or may not ' +
+                                        'have started; check /subagents before re-dispatching.'
+                                ),
                             },
                         ],
-                        details: makeDetails('single')([result]),
-                        isError: true,
+                        details: makeDetails([]),
                     }
+                return {
+                    content: [
+                        {
+                            type: 'text',
+                            text: recoverableMiss(
+                                `the run did not start (${spawn.message}); check /subagents for ` +
+                                    'a live run, then re-dispatch.'
+                            ),
+                        },
+                    ],
+                    details: makeDetails([]),
                 }
-                const finalOutput = getFinalOutput(result.messages) || '(no output)'
+            }
+            const result = await runSingleAgent(
+                ctx.cwd,
+                dispatchDefaults,
+                agents,
+                params.agent,
+                params.task,
+                params.cwd,
+                signal,
+                onUpdate,
+                makeDetails,
+                resume,
+                undefined,
+                relayUiRequest,
+                toolCallId,
+                false,
+                // Manager `b` may convert this awaiting call mid-flight
+                // (foreground single tool-call runs, incl. resume, only).
+                true,
+                params.model
+            )
+            if (result.runtimeBackgrounded) {
+                // Same contract as a spawn-time background run, but the run
+                // started foreground: the tracker only learns the async
+                // directory now, so the spawn payload is written here.
+                writeRunStatusStart(
+                    result.subagentId,
+                    params.agent,
+                    activeSubagents.get(result.subagentId)?.startedAt ?? Date.now()
+                )
+                return {
+                    content: [
+                        {
+                            type: 'text',
+                            text: [
+                                `Subagent ${shortSubagentId(result.subagentId)} (agent: ${params.agent}) was sent to the background by the user; it keeps running.`,
+                                `Task: ${previewText(params.task, LIST_TASK_PREVIEW_CHARS)}`,
+                                `You'll be notified when it completes. Call subagent_collect { id: "${shortSubagentId(result.subagentId)}" } for the result;`,
+                                `subagent_inspect { id: "${shortSubagentId(result.subagentId)}" } for progress.`,
+                                'End your turn — there is nothing to wait for; the ' +
+                                    'completion notification starts your next turn.',
+                            ].join('\n'),
+                        },
+                    ],
+                    // Same contract as a spawn-time background run: the awaited
+                    // call returns no result, so the notice carries the outcome.
+                    details: {
+                        ...makeDetails([]),
+                        asyncId: result.subagentId,
+                        asyncDir: backgroundRunAsyncToken(result.subagentId),
+                    },
+                }
+            }
+            const isError = isFailedResult(result)
+            if (isError) {
+                const miss = preSpawnMissReason(result)
+                if (miss)
+                    return {
+                        content: [{ type: 'text', text: recoverableMiss(miss) }],
+                        details: makeDetails([result]),
+                    }
                 return {
                     content: [
                         {
                             type: 'text',
                             text: result.resumeNote
-                                ? `${finalOutput}\n\n${result.resumeNote}`
-                                : finalOutput,
+                                ? `${formatFailureReport(result)}\n\n${result.resumeNote}`
+                                : formatFailureReport(result),
                         },
                     ],
-                    details: makeDetails('single')([result]),
+                    details: makeDetails([result]),
+                    isError: true,
                 }
             }
-
-            const available = agents.map(a => `${a.name} (${a.source})`).join(', ') || 'none'
+            const finalOutput = getFinalOutput(result.messages) || '(no output)'
             return {
                 content: [
                     {
                         type: 'text',
-                        text: recoverableMiss(
-                            'provide single (agent + task) or chain (chain array); ' +
-                                `available agents: ${available}`
-                        ),
+                        text: result.resumeNote
+                            ? `${finalOutput}\n\n${result.resumeNote}`
+                            : finalOutput,
                     },
                 ],
-                details: makeDetails('single')([]),
+                details: makeDetails([result]),
             }
         },
 
         renderCall(args, theme, _context) {
             const scope: AgentScope = args.agentScope ?? 'user'
-            if (args.chain && args.chain.length > 0) {
-                let text =
-                    theme.fg('toolTitle', theme.bold('subagent ')) +
-                    theme.fg('accent', `chain (${args.chain.length} steps)`) +
-                    theme.fg('muted', ` [${scope}]`)
-                for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
-                    const step = args.chain[i]
-                    // Clean up {previous} placeholder for display
-                    const cleanTask = step.task.replace(/\{previous\}/g, '').trim()
-                    const preview =
-                        cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask
-                    text +=
-                        '\n  ' +
-                        theme.fg('muted', `${i + 1}.`) +
-                        ' ' +
-                        theme.fg('accent', step.agent) +
-                        theme.fg('dim', ` ${preview}`) +
-                        (step.model ? theme.fg('muted', ` model=${step.model}`) : '')
-                }
-                if (args.chain.length > 3)
-                    text += `\n  ${theme.fg('muted', `... +${args.chain.length - 3} more`)}`
-                return new Text(text, 0, 0)
-            }
             const agentName = args.agent || '...'
             const preview = args.task
                 ? args.task.length > 60
@@ -4384,7 +4188,7 @@ export default function (pi: ExtensionAPI) {
                 return text.trimEnd()
             }
 
-            if (details.mode === 'single' && details.results.length === 1) {
+            if (details.results.length === 1) {
                 const r = details.results[0]
                 const isError = isFailedResult(r)
                 const icon = isError ? theme.fg('error', '✗') : theme.fg('success', '✓')
@@ -4452,134 +4256,6 @@ export default function (pi: ExtensionAPI) {
                 }
                 const usageStr = formatUsageStats(r.usage, r.model)
                 if (usageStr) text += `\n${theme.fg('dim', usageStr)}`
-                return new Text(text, 0, 0)
-            }
-
-            const aggregateUsage = (results: SingleResult[]) => {
-                const total = {
-                    input: 0,
-                    output: 0,
-                    cacheRead: 0,
-                    cacheWrite: 0,
-                    cost: 0,
-                    turns: 0,
-                }
-                for (const r of results) {
-                    total.input += r.usage.input
-                    total.output += r.usage.output
-                    total.cacheRead += r.usage.cacheRead
-                    total.cacheWrite += r.usage.cacheWrite
-                    total.cost += r.usage.cost
-                    total.turns += r.usage.turns
-                }
-                return total
-            }
-
-            if (details.mode === 'chain') {
-                const successCount = details.results.filter(r => r.exitCode === 0).length
-                const icon =
-                    successCount === details.results.length
-                        ? theme.fg('success', '✓')
-                        : theme.fg('error', '✗')
-
-                if (expanded) {
-                    const container = new Container()
-                    container.addChild(
-                        new Text(
-                            icon +
-                                ' ' +
-                                theme.fg('toolTitle', theme.bold('chain ')) +
-                                theme.fg(
-                                    'accent',
-                                    `${successCount}/${details.results.length} steps`
-                                ),
-                            0,
-                            0
-                        )
-                    )
-
-                    for (const r of details.results) {
-                        const rIcon =
-                            r.exitCode === 0
-                                ? theme.fg('success', '✓')
-                                : theme.fg('error', '✗')
-                        const displayItems = getDisplayItems(r.messages)
-                        const finalOutput = getFinalOutput(r.messages)
-
-                        container.addChild(new Spacer(1))
-                        container.addChild(
-                            new Text(
-                                `${theme.fg('muted', `─── Step ${r.step}: `) + theme.fg('accent', r.agent)} ${rIcon}`,
-                                0,
-                                0
-                            )
-                        )
-                        container.addChild(
-                            new Text(
-                                theme.fg('muted', 'Task: ') + theme.fg('dim', r.task),
-                                0,
-                                0
-                            )
-                        )
-
-                        // Show tool calls
-                        for (const item of displayItems) {
-                            if (item.type === 'toolCall') {
-                                container.addChild(
-                                    new Text(
-                                        theme.fg('muted', '→ ') +
-                                            formatToolCall(
-                                                item.name,
-                                                item.args,
-                                                theme.fg.bind(theme),
-                                                r.cwd
-                                            ),
-                                        0,
-                                        0
-                                    )
-                                )
-                            }
-                        }
-
-                        // Show final output as markdown
-                        if (finalOutput) {
-                            container.addChild(new Spacer(1))
-                            container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme))
-                        }
-
-                        const stepUsage = formatUsageStats(r.usage, r.model)
-                        if (stepUsage)
-                            container.addChild(new Text(theme.fg('dim', stepUsage), 0, 0))
-                    }
-
-                    const usageStr = formatUsageStats(aggregateUsage(details.results))
-                    if (usageStr) {
-                        container.addChild(new Spacer(1))
-                        container.addChild(
-                            new Text(theme.fg('dim', `Total: ${usageStr}`), 0, 0)
-                        )
-                    }
-                    return container
-                }
-
-                // Collapsed view
-                let text =
-                    icon +
-                    ' ' +
-                    theme.fg('toolTitle', theme.bold('chain ')) +
-                    theme.fg('accent', `${successCount}/${details.results.length} steps`)
-                for (const r of details.results) {
-                    const rIcon =
-                        r.exitCode === 0 ? theme.fg('success', '✓') : theme.fg('error', '✗')
-                    const displayItems = getDisplayItems(r.messages)
-                    text += `\n\n${theme.fg('muted', `─── Step ${r.step}: `)}${theme.fg('accent', r.agent)} ${rIcon}`
-                    if (displayItems.length === 0)
-                        text += `\n${theme.fg('muted', '(no output)')}`
-                    else text += `\n${renderDisplayItems(displayItems, 5, r.cwd)}`
-                }
-                const usageStr = formatUsageStats(aggregateUsage(details.results))
-                if (usageStr) text += `\n\n${theme.fg('dim', `Total: ${usageStr}`)}`
-                text += `\n${theme.fg('muted', '(Ctrl+O to expand)')}`
                 return new Text(text, 0, 0)
             }
 

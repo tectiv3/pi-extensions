@@ -76,10 +76,13 @@ When running interactively, the tool prompts for confirmation before running pro
 Use scout to find all authentication code
 ```
 
-### Chained workflow
+### Sequential workflow
 ```
-Use a chain: first have scout find the read tool, then have planner suggest improvements
+First have scout find the read tool, then have planner suggest improvements using the scout result
 ```
+
+Each step is a separate `subagent` call: run one, then pass its result in the next call's
+`task`.
 
 ### Workflow prompts
 ```
@@ -93,7 +96,6 @@ Use a chain: first have scout find the read tool, then have planner suggest impr
 | Mode | Parameter | Description |
 |------|-----------|-------------|
 | Single | `{ agent, task, resume? }` | One agent, one task; `resume` continues a persisted run. Runs in the background by default |
-| Chain | `{ chain: [...] }` | Sequential with `{previous}` placeholder; always foreground |
 | Foreground single | `{ agent, task, background: false }` | Waits for the result; the tool call blocks until the child settles |
 | Background single | `{ agent, task }` or `background: true` | Returns immediately; result delivered by notification, fetched via subagent_collect |
 
@@ -116,10 +118,6 @@ instead of one file per `(agent, model)` pair:
 
 ```
 subagent { agent: "scout", task: "find the auth code", model: "anthropic/claude-haiku-4-5" }
-subagent { chain: [
-  { agent: "scout",   task: "find the read tool" },
-  { agent: "planner", task: "review {previous}", model: "anthropic/claude-sonnet-4-5" }
-] }
 ```
 
 `model` takes a `provider/model-id` string, the same form pi uses on the command line.
@@ -127,16 +125,14 @@ Precedence, highest first:
 
 | Source | Scope | Applies when |
 |--------|-------|--------------|
-| dispatch `model` | this call (single) or this item (chain) | always wins |
+| dispatch `model` | this call | always wins |
 | agent frontmatter `model:` | every run of that agent file | no dispatch model |
 | parent session model | the default for all dispatches | neither of the above |
 
 A frontmatter pin is a **per-agent default**, not the agent's identity — an explicit
 dispatch model overrides it.
 
-**Single mode only at the top level.** `model` next to `chain` is rejected with an
-error rather than silently ignored; set it per item instead. An empty or whitespace-only
-`model` is rejected too — it is not treated as "no override".
+An empty or whitespace-only `model` is rejected — it is not treated as "no override".
 
 **Thinking level.** The child inherits the parent's thinking level only when the resolved
 model equals the parent session model. A model chosen by dispatch override or by an agent
@@ -160,11 +156,11 @@ later, when a request is made.
 
 ## Persistence & Resume
 
-Every invocation (single task or chain step) gets a UUIDv7 subagent id. A spawn-time
+Every invocation gets a UUIDv7 subagent id. A spawn-time
 background run is spawned with
 `--session ~/.pi/agent/subagents/<id>.async/transcript.jsonl`, inside its
 retention-managed run directory, which exists before the child starts writing.
-Foreground and chain runs use `--session ~/.pi/agent/subagents/<id>.jsonl`; a run the user
+Foreground runs use `--session ~/.pi/agent/subagents/<id>.jsonl`; a run the user
 sends to the background mid-flight keeps that same legacy path, because its child already
 has the file open.
 
@@ -173,7 +169,7 @@ files contain full tool output, potentially secrets):
 
 | File | Contents |
 |------|----------|
-| `<id>.jsonl` | pi session file for foreground and chain runs, and for runs runtime-backgrounded mid-flight |
+| `<id>.jsonl` | pi session file for foreground runs, and for runs runtime-backgrounded mid-flight |
 | `<id>.async/transcript.jsonl` | pi session file for spawn-time background runs; lives in the retention-managed directory |
 | `<id>.async/status.json` | tracker payload written at spawn and settlement (see [Async settlement notice](#async-settlement-notice)) |
 | `<id>.meta` | JSON sidecar (mode `0600`): agent, task, model, thinking level, startedAt, sha256 `promptHash` of the agent system prompt, and the spawning `subagent` tool call id (absent for non-tool spawns such as `/subagents resume`); updated on close with status, stopReason, exitCode, and the session header id |
@@ -183,7 +179,7 @@ Readers resolve a run's transcript from its id: `<id>.async/transcript.jsonl` wh
 exists, else `<id>.jsonl`. No mode flag is threaded through inspect, resume, delete, size
 formatting, or the session-header read.
 
-- **Retention**: a foreground or chain success deletes its transcript and `.meta` — the
+- **Retention**: a foreground success deletes its transcript and `.meta` — the
   output already lives in the parent's tool result. A spawn-time background success
   deletes `.meta` and `.pid` but **keeps** `.async/transcript.jsonl`: the run directory
   owns it now, and the 30-day retention sweep deletes the directory and transcript
@@ -208,8 +204,8 @@ formatting, or the session-header read.
   case.
 - **Ctrl+C does not abort subagents** (it clears the editor / exits the session instead).
 - Children that fail or are killed externally produce the same failure report. The behavior
-  is uniform across modes: a failed or aborted run reports its partial output, id, and a
-  resume hint; a chain stops at the failing step.
+  is uniform across foreground and background runs: a failed or aborted run reports its
+  partial output, id, and a resume hint.
 
 ### Resuming
 
@@ -217,7 +213,6 @@ formatting, or the session-header read.
 subagent { agent: "scout", task: "<continuation instruction>", resume: "<id>" }
 ```
 
-- Single mode only — `resume` alongside `chain` is rejected.
 - The id may be exact or a unique suffix (same semantics as `subagent_inspect`): an exact
   id resolves across sessions, a suffix is scoped to this pi session; ambiguous suffixes
   are refused with a list of candidates.
@@ -291,16 +286,13 @@ What the tool actually guarantees, and nothing beyond it:
   `subagent_collect` rather than assuming the correction landed.
 - **It is not a safety mechanism**: steering cannot stop a run from doing damage, cannot
   cancel a tool call, and is not a substitute for a careful brief.
-- **Chain mode**: a chain item is steerable only while it is the live child; the result
-  names the chain step and agent it landed on. Between items there is no child to steer and
-  the call errors instead of queueing into the next step.
 - **Refusals**: a run that has settled or is settling is refused (its last turn boundary
   has passed) with a hint to collect the result or resume; a failed stdin write is reported
   as a tool error, never swallowed.
-- **Reachability**: a foreground `subagent` tool call blocks the parent's turn and a chain
-  is foreground-only, so in practice this tool reaches **background** runs (the default, or
-  runtime-backgrounded). A foreground run, including a live chain item, is steered by the
-  human through `/subagents attach` — same write, same turn-boundary semantics.
+- **Reachability**: a foreground `subagent` tool call blocks the parent's turn, so in
+  practice this tool reaches **background** runs (the default, or runtime-backgrounded).
+  A foreground run is steered by the human through `/subagents attach` — same write, same
+  turn-boundary semantics.
 - The watchdog is unaffected: a steer resets the activity timer, so a queued steer cannot
   cause a silent kill, and it cannot keep a genuinely dead child alive.
 
@@ -309,7 +301,7 @@ If the child has committed the wrong edit, spent its budget on the wrong approac
 stuck in a tool call, a queued message will not help: abort it (`/subagents abort <id>`, or
 Escape for a foreground run) and resume with a corrected brief —
 `subagent { agent, task, resume: "<id>" }` keeps the conversation and replaces the
-instruction. The same applies to a chain that has stopped: restart with a corrected plan
+instruction. The same applies to a run that has stopped: restart with a corrected plan
 rather than trying to steer a finished run.
 
 ### Listing runs: `/subagents`
@@ -347,8 +339,6 @@ tool calls formatted like the parent TUI, tool output truncated (200 chars). Str
   (`agent_settled`) or its process exits (watchdog kill, crash, abort — the parent's abort
   path SIGTERMs the child, which fires the same process-exit detach).
 - Requires an interactive session (`attach` is unavailable in print mode).
-- **Single subagent only**: chain runs spawn through the same registry but
-  `attach` is designed for the single mode view for now.
 
 ## Background Runs
 
@@ -358,8 +348,7 @@ id, task preview, and the full id plus `subagent_collect` / `subagent_inspect` h
 The child keeps running. This is the default for single mode; `background: false` opts
 into a foreground run that waits for the result.
 
-- **Chain and print mode are always foreground** — a `chain` call ignores `background`
-  (each step is awaited; no error), and `ctx.mode === 'print'` forces foreground because
+- **Print mode is always foreground** — `ctx.mode === 'print'` forces foreground because
   the parent exits before a detached child could settle. There is no notification
   channel in print mode, so the blocking call is the only working shape there.
 - **Detached from the parent's abort** — Escape does not kill a background child. Kill it
@@ -389,9 +378,8 @@ run (including a foreground `resume`) to a background run mid-flight: the awaiti
 collect/inspect hints as above), the child keeps running detached from the parent's
 abort (Escape no longer kills it), streaming stops, and settlement is delivered exactly
 like a spawn-time background run — completion notification plus `subagent_collect`.
-The manager row stays in RUNNING with a `bg` badge. Chain steps,
-`/subagents resume` spawns, and spawn-time background runs are not convertible (`b`
-refuses with a notice).
+The manager row stays in RUNNING with a `bg` badge. `/subagents resume` spawns and
+spawn-time background runs are not convertible (`b` refuses with a notice).
 
 ### Completion notifications
 
@@ -510,7 +498,6 @@ settled-but-uncollected results are surfaced by the completion notification, not
 - Full task text
 - All tool calls with formatted arguments
 - Final output rendered as Markdown
-- Per-step usage (for chain)
 
 **Tool call formatting** (mimics built-in tools):
 - `$ command` for bash
@@ -552,9 +539,9 @@ Project agents override user agents with the same name when `agentScope: "both"`
 
 | Prompt | Flow |
 |--------|------|
-| `/implement <query>` | scout → planner → worker |
-| `/scout-and-plan <query>` | scout → planner |
-| `/implement-and-review <query>` | worker → reviewer → worker |
+| `/implement <query>` | scout → planner → worker, one subagent call per step |
+| `/scout-and-plan <query>` | scout → planner, one subagent call per step |
+| `/implement-and-review <query>` | worker → reviewer → worker, one subagent call per step |
 
 ## Error Handling
 
@@ -568,7 +555,6 @@ resume hint:
   output up to the last `message_end`, or states that none was persisted
 - **Pre-spawn failures** (e.g. unknown agent): error result without id or hint — nothing
   was spawned or persisted
-- **Chain mode**: Stops at the first failing step and reports which step failed
 - **Swallowed persistence/parse failures**: none of these fail a run — artifact writes (dir
   setup, `.meta`, pidfile), artifact removals, tail-frame drops, unparsable child frames, and
   unreadable pid/session files. They are written to a file-only diagnostic log when
@@ -598,9 +584,8 @@ resume hint:
 - **L5 — no true detach**: backgrounded runs do not survive the parent process or a session
   replacement (`/new`, `/resume`, `/fork`, `/reload`); live runs are SIGTERM'd on session
   teardown
-- **L6 — background is single-mode only**: no backgrounded chains (a chain is always
-  foreground); runtime conversion via the manager's `b` is single-mode too (foreground
-  `background: false` tool-call runs)
+- **L6 — runtime backgrounding is foreground-only**: the manager's `b` key converts an
+  awaiting `background: false` single run, nothing else
 - **L7 — `subagent_collect` is process-scoped**: persisted runs from other sessions use
   `subagent_inspect` / `/subagents resume`
 - **L8 — no parent auto-cancel for relayed questions**: a backgrounded child blocked on a
@@ -612,10 +597,7 @@ resume hint:
   next turn boundary, so it cannot interrupt a running tool call, undo a committed edit, or
   stop a run that is already off the rails. Nothing in the parent observes whether the child
   obeys it, so the tool result says only "not yet in effect"
-- **L11 — chain items are steerable only while live**: each chain step registers and
-  unregisters its own id, so a steer between items finds no child. Chains are foreground-only,
-  so the human's `/subagents attach` view is the realistic chain-steering entry point
-- **L12 — a hard kill leaks the run directory**: a SIGKILLed run never writes a terminal
+- **L11 — a hard kill leaks the run directory**: a SIGKILLed run never writes a terminal
   `status.json`, so its `running` directory and transcript stay on disk forever and are
   never swept. The sweep has no orphan reconciliation by design; remove it manually
   (`rm -r ~/.pi/agent/subagents/<id>.async`)

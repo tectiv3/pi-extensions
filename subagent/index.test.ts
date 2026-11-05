@@ -232,30 +232,12 @@ test('an unknown agent in a foreground dispatch is content, not a failed call', 
     )
 })
 
-test('a chain step that never spawned is content, not a failed call', async t => {
-    const result = await execute(t, { chain: [{ agent: 'ghost', task: 'do it' }] })
-
-    assert.equal(result.isError, undefined)
-    assert.match(
-        textOf(result),
-        /^FAILED: step 1 \(ghost\) did not start: Unknown agent: "ghost"/
-    )
-})
-
 test('request validation misses are content, not failed calls', async t => {
     const cases: Array<[Record<string, unknown>, RegExp]> = [
-        [{}, /^FAILED: provide exactly one mode/],
+        [{}, /^FAILED: agent and task are both required/],
         [
             { agent: 'worker', task: 'do it', model: '  ' },
             /^FAILED: model must be a non-empty/,
-        ],
-        [
-            { chain: [{ agent: 'worker', task: 'do it' }], model: 'p/m' },
-            /^FAILED: model is single-mode only/,
-        ],
-        [
-            { chain: [{ agent: 'worker', task: 'do it' }], resume: '6d' },
-            /^FAILED: "resume" is single-mode only/,
         ],
     ]
     for (const [params, expected] of cases) {

@@ -398,17 +398,29 @@ action is needed.
 #### Async settlement notice
 
 Alongside that model-facing notification, every settled background run appends exactly one
-custom message to the parent transcript for external trackers (Paseo's `pi-subagents`
-adapter). A tracker driving runs from its own UI has no tool result to read — the spawn
-call returned at spawn time and this run settles later — so the notice is the only durable
-terminal marker it can clear the run on. It is `display: false`: bookkeeping, not something
-the user or the model reads.
+`subagent-notify` **session entry** (`pi.appendEntry`) to the parent transcript. A tracker
+driving runs from its own UI has no tool result to read — the spawn call returned at spawn
+time and this run settles later — so the notice is the only durable terminal marker it can
+clear the run on.
 
-Payload:
+Entries are the off-context channel, which is why the notice lives there: the host converts
+any custom *message* into a user-role LLM message on the next turn regardless of its
+`display` flag, while `sessionEntryToContextMessages` returns `[]` for `type: 'custom'`.
+The notice is therefore persisted for replay, is not a user-role message, and costs no
+context. It is visible in the TUI only through the renderer registered for the type
+(`createTerminalNoticeRenderer`): status + agent and the async token collapsed, the tracker
+payload verbatim on expand. A session running a pi build without that renderer shows
+nothing at all.
 
-- `customType: 'subagent-notify'`, `display: false`.
-- First line: `Background task (completed|failed|stopped): **<agent>**`.
-- Final line: `Retention-managed async directory: <token>`.
+Entry `data`:
+
+- `agent`, `status` (`succeeded` | `failed` | `aborted`), `asyncToken`.
+- `content` — the tracker text verbatim: first line
+  `Background task (completed|failed|stopped): **<agent>**`, final line
+  `Retention-managed async directory: <token>`.
+
+A consumer reading the parent transcript must read the entry's `data.content`; the notice is
+no longer a `custom_message` entry and fires no `custom_message` event.
 
 The token is `<agentDir>/subagents/<id>.async` — a synthetic correlation key that must be
 derivable from the run id alone (a replay rebuilds it from the transcript). **Nothing is
@@ -421,7 +433,8 @@ Two behaviours a consumer must tolerate:
 - The header always reads `Background task …`, even for a foreground run the user sent to
   the background mid-flight with the manager view's `b` key.
 - A settlement arriving after `session_shutdown` emits nothing (the run's session epoch is
-  stale), so a tracker holding such an entry keeps displaying it as running.
+  stale, so no entry is written), and a tracker holding such a run keeps displaying it as
+  running.
 
 ### Running-subagents footer
 

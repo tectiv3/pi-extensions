@@ -50,7 +50,10 @@ import { type AgentConfig, type AgentScope, discoverAgents } from './agents.ts'
 import {
     asyncRunToken,
     buildTerminalNotice,
+    createTerminalNoticeRenderer,
     emitTerminalNotice,
+    SUBAGENT_NOTIFY_CUSTOM_TYPE,
+    type TerminalNoticeSink,
     type TerminalRunStatus,
 } from './async-notice.ts'
 import { spawnChild } from './child-env.ts'
@@ -424,6 +427,11 @@ const backgroundResults = new Map<string, SingleResult>()
 // drain fires from a timer callback that has no other pi reference.
 let latestPi: ExtensionAPI | undefined
 
+// The ExtensionAPI the settlement entry renderer was registered on. Identity,
+// not a boolean: a session reload hands over a fresh API that needs its own
+// registration, while a reload of the same instance must not double-register.
+let entryRendererPi: ExtensionAPI | undefined
+
 // Coalesced completion notifications (spec 1.2.3): settlements enqueue a
 // per-id block; the drain clears the queue BEFORE sending so a block
 // enqueued mid-drain arms a fresh timer instead of merging late or dropping.
@@ -531,10 +539,17 @@ function emitBackgroundSettlement(
     runEpoch: number
 ): void {
     if (!isCurrentSessionRun(runEpoch)) return
+    const pi = latestPi
     emitTerminalNotice(
-        latestPi,
+        pi && entryOnlySink(pi),
         buildTerminalNotice({ agent, status, asyncToken: backgroundRunAsyncToken(id) })
     )
+}
+
+// Narrowed on purpose: the notice goes to the session as an off-context entry,
+// so giving this module the full API would keep sendMessage reachable.
+function entryOnlySink(pi: ExtensionAPI): TerminalNoticeSink {
+    return { appendEntry: (customType, data) => pi.appendEntry(customType, data) }
 }
 
 // One self-contained per-id block for the completion notification (spec
@@ -3594,6 +3609,15 @@ const SubagentSteerParams = Type.Object({
 export default function (pi: ExtensionAPI) {
     eventBus = pi.events
     latestPi = pi
+    if (entryRendererPi !== pi) {
+        // Text wraps the lines to the terminal width: the main screen throws on
+        // an over-wide line from a custom entry renderer.
+        pi.registerEntryRenderer(
+            SUBAGENT_NOTIFY_CUSTOM_TYPE,
+            createTerminalNoticeRenderer(lines => new Text(lines.join('\n'), 0, 0))
+        )
+        entryRendererPi = pi
+    }
 
     // pi caches the extension factory and does NOT re-evaluate this module on
     // session replacement, so this handler explicitly advances the epoch and

@@ -56,7 +56,13 @@ declare module '@earendil-works/pi-coding-agent' {
                   }
                 | undefined
         ): void
+        /** Persist a custom entry: session-stored, TUI-rendered, never in LLM context. */
         appendEntry<T = unknown>(customType: string, data?: T): void
+        /** Register the TUI renderer for entries written through appendEntry. */
+        registerEntryRenderer<T = unknown>(
+            customType: string,
+            renderer: EntryRenderer<T>
+        ): void
         sendMessage(
             message: {
                 customType: string
@@ -164,11 +170,34 @@ declare module '@earendil-works/pi-coding-agent' {
         readonly terminal: { readonly rows: number }
     }
 
-    interface Theme {
+    /** Structural subset of the host's Theme class (pi's renderer-facing surface). */
+    export interface Theme {
         fg(color: string, text: string): string
         bg(color: string, text: string): string
         bold(text: string): string
     }
+
+    export interface CustomEntry<T = unknown> {
+        type: 'custom'
+        customType: string
+        data?: T
+        id: string
+        parentId: string | null
+        timestamp: string
+    }
+
+    /** Keybinding hints the host passes to a renderer; `Keybinding` ids are plain strings here. */
+    export interface EntryRenderOptions {
+        expanded: boolean
+        keyText(keybinding: string): string
+        keyHint(keybinding: string, description: string): string
+    }
+
+    export type EntryRenderer<T = unknown> = (
+        entry: CustomEntry<T>,
+        options: EntryRenderOptions,
+        theme: Theme
+    ) => import('@earendil-works/pi-tui').Component | undefined
 
     interface ToolDefinition {
         name: string

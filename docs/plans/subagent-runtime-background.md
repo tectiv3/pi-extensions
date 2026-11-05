@@ -15,7 +15,8 @@ semantics this feature reuses at runtime.
   - the pending `subagent` tool call resolves immediately with a "sent to the
     background" tool result (non-error) mirroring the spawn-time background text
     style — short id + agent, task preview, and the `subagent_collect` /
-    `subagent_inspect` hints;
+    `subagent_inspect` hints — and carries `details.asyncId` / `details.asyncDir`,
+    the correlation pair the settlement notice reports;
   - the child process keeps running untouched;
   - the run detaches from the parent's abort signal (Escape no longer kills it):
     the spawn-time kill listener is removed, and a pending relayed question's
@@ -25,7 +26,9 @@ semantics this feature reuses at runtime.
   - `onUpdate` streaming stops (the tool call has returned);
   - when the child exits, the existing background settlement path runs
     (`settleBackgroundRun`: store in `backgroundResults`, coalesced completion
-    notification, footer refresh) and `subagent_collect` delivers the result.
+    notification, footer refresh; plus the `subagent-notify` settlement entry
+    `finalizeExit` persists before cleanup), and `subagent_collect` delivers the
+    result.
 - **Eligibility: foreground single-mode tool-call runs only**, including
   foreground `resume` runs (same dispatch call site). NOT parallel tasks, NOT
   chain steps, NOT `/subagents resume` handler spawns (no awaiting tool call),
@@ -45,7 +48,8 @@ semantics this feature reuses at runtime.
   same moment the user presses `b` settles through the normal exit path.
 - **finalizeExit exactly once, never inline for the backgrounded path.** The
   post-exit bookkeeping (exitCode/wasAborted assignment, status computation,
-  pid removal, success-cleanup vs meta rewrite, `backgrounded → settleBackgroundRun`,
+  pid removal, success-cleanup vs meta rewrite, `backgrounded → emitBackgroundSettlement`
+  (the off-context `subagent-notify` entry) and `backgrounded → settleBackgroundRun`,
   the `returning:` debug log) is factored into a local `finalizeExit(exitCode)`.
   The runtime-backgrounded branch returns the marker result
   (`{ …currentResult, runtimeBackgrounded: true }`) immediately and runs
@@ -94,8 +98,10 @@ semantics this feature reuses at runtime.
    row shows the `bg` badge and stays in RUNNING.
 3. Escape after the conversion does NOT kill the child (footer keeps it);
    manager `x` still kills it, and it settles as a failure notification.
-4. Child exit after the conversion → coalesced completion notification fires;
-   `subagent_collect` returns the full result and clears the entry.
+4. Child exit after the conversion → coalesced completion notification fires and
+   exactly one `subagent-notify` settlement entry is appended (visible via its entry
+   renderer, absent from model context); `subagent_collect` returns the full result and
+   clears the entry.
 5. `b` on a parallel task, chain step, `/subagents resume` spawn, or
    spawn-time background row → refusal notice.
 6. `b` twice on the same row → "already backgrounded"; `b` on a row whose child

@@ -263,10 +263,17 @@ export async function askWithDeadline(
                 continue
             }
 
-            const matched = question.options.find(option => option.label === selected)
-            if (!matched) {
+            const matchedIndex = question.options.findIndex(
+                option => option.label === selected
+            )
+            if (matchedIndex < 0) {
                 // A host that renders its own free-text field beside the options can
-                // return typed text through select, so this is the user's own answer.
+                // return typed text through select. That is the user's own answer only
+                // where the question admits one; an empty reply or free text on a
+                // closed question is not an answer to it.
+                if (!question.allowOther || selected.trim() === '') {
+                    return { kind: 'cancelled', answers }
+                }
                 answers.push({
                     id: question.id,
                     value: selected,
@@ -275,12 +282,9 @@ export async function askWithDeadline(
                 })
                 continue
             }
-            const matchedIndex = question.options.findIndex(
-                option => option.label === selected
-            )
             answers.push({
                 id: question.id,
-                value: matched.value,
+                value: question.options[matchedIndex].value,
                 label: selected,
                 wasCustom: false,
                 index: matchedIndex + 1,

@@ -288,6 +288,28 @@ test("typed text returned through select is recorded as the user's own answer", 
     assert.equal(calls.length, 1, 'no second dialog is opened')
 })
 
+test('typed text returned through select cancels a question that forbids free text', async () => {
+    const { ui } = fakeUi(() => 'something else')
+    const outcome = await askWithDeadline({
+        questions: [question('Q1', ['a', 'b'])],
+        ui,
+        timeoutMs: 60_000,
+    })
+    assert.equal(outcome.kind, 'cancelled')
+    assert.deepEqual(outcome.answers, [])
+})
+
+test('an empty reply returned through select is not recorded as an answer', async () => {
+    const { ui } = fakeUi(() => '  ')
+    const outcome = await askWithDeadline({
+        questions: [question('Q1', ['a', 'b'], true)],
+        ui,
+        timeoutMs: 60_000,
+    })
+    assert.equal(outcome.kind, 'cancelled')
+    assert.deepEqual(outcome.answers, [])
+})
+
 test('a matching label stays an option answer even with a host free-text field', async () => {
     const { ui, calls } = fakeUi(() => 'b')
     const outcome = await askWithDeadline({

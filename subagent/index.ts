@@ -939,6 +939,31 @@ function formatFailureReport(result: SingleResult): string {
     return lines.join('\n\n')
 }
 
+// A recoverable miss is returned as tool CONTENT, never as a failed call: the host
+// renders a failed subagent call as a failed subagent row, and a call that never
+// spawned a child leaves that row behind as a permanent phantom failure. The text is
+// the only channel left, so every miss is one line: FAILED: reason + next step.
+export function recoverableMiss(reason: string): string {
+    // First line only: the resume misses append a persisted-run listing written for
+    // humans, and the model only acts on the reason and the next step.
+    const [firstLine = ''] = reason.split('\n')
+    return `FAILED: ${firstLine.trim()}`
+}
+
+// The meta sidecar is written before the child is spawned, so artifacts exist for
+// every run that got that far. Their absence means no child ever started: there is
+// nothing to inspect, resume, or report as a delegation failure.
+export function preSpawnMissReason(
+    result: SingleResult,
+    subject?: string
+): string | undefined {
+    if (!isFailedResult(result) || sessionArtifactsPersisted(result)) return undefined
+    const diagnostic = (result.errorMessage || result.stderr.trim()).split('\n')[0].trim()
+    return `${subject ?? `agent "${result.agent}"`} did not start: ${
+        diagnostic || 'no diagnostic was captured'
+    }`
+}
+
 type DisplayItem =
     | { type: 'text'; text: string }
     | { type: 'toolCall'; name: string; args: Record<string, any> }
@@ -1128,17 +1153,21 @@ function formatPersistedSubagentsList(entries: PersistedSubagentEntry[]): string
 }
 
 function formatAvailableSubagentsError(resumeId: string): string {
+    // Headline first, on one line: the tool surfaces only that line as its FAILED:
+    // reason, so the next step has to live there, not in the listing below.
+    const headline =
+        `No subagent found with id "${resumeId}" (completed runs are cleaned up); ` +
+        're-dispatch with subagent {agent, task} instead of resuming.'
     const entries = listSessionPersistedSubagents()
     if (entries.length === 0) {
         return (
-            `No subagent found with id "${resumeId}" (completed runs are cleaned up). ` +
-            `No persisted subagent runs from this session in ${getSubagentsDir()} ` +
+            `${headline} No persisted subagent runs from this session in ${getSubagentsDir()} ` +
             '(runs from other pi sessions are hidden — reference one by its full id).'
         )
     }
     return [
-        `No subagent found with id "${resumeId}" (completed runs are cleaned up). ` +
-            'Persisted runs from this session:',
+        headline,
+        'Persisted runs from this session:',
         ...formatPersistedSubagentsList(entries),
         'Runs from other pi sessions are hidden; reference one by its full id.',
     ].join('\n')
@@ -1790,7 +1819,7 @@ function resolvePersistedResumeTarget(requestedId: string): PersistedResumeResol
     if (matches.length > 1) {
         return {
             error: [
-                `Ambiguous subagent id "${requestedId}" matches ${matches.length} persisted runs from this session:`,
+                `Ambiguous subagent id "${requestedId}" matches ${matches.length} persisted runs from this session; resume with the full id.`,
                 ...formatPersistedSubagentsList(matches),
             ].join('\n'),
         }
@@ -3698,7 +3727,10 @@ export default function (pi: ExtensionAPI) {
                     content: [
                         {
                             type: 'text',
-                            text: `Invalid parameters. Provide exactly one mode: single (agent + task) or chain (chain array). The parallel mode (tasks) was removed.\nAvailable agents: ${available}`,
+                            text: recoverableMiss(
+                                'provide exactly one mode, single (agent + task) or chain (chain array); ' +
+                                    `the parallel mode (tasks) was removed. Available agents: ${available}`
+                            ),
                         },
                     ],
                     details: makeDetails('single')([]),
@@ -3710,9 +3742,10 @@ export default function (pi: ExtensionAPI) {
                     content: [
                         {
                             type: 'text',
-                            text:
-                                'Invalid parameters: "resume" is single-mode only ({agent, task, resume}). ' +
-                                'Remove "resume" or restructure as a single delegation.',
+                            text: recoverableMiss(
+                                '"resume" is single-mode only ({agent, task, resume}); ' +
+                                    'remove "resume" or restructure as a single delegation.'
+                            ),
                         },
                     ],
                     details: makeDetails('single')([]),
@@ -3729,11 +3762,13 @@ export default function (pi: ExtensionAPI) {
                     content: [
                         {
                             type: 'text',
-                            text: 'model must be a non-empty "provider/model-id" string.',
+                            text: recoverableMiss(
+                                'model must be a non-empty "provider/model-id" string; ' +
+                                    "omit it to use the agent's default model."
+                            ),
                         },
                     ],
                     details: makeDetails('single')([]),
-                    isError: true,
                 }
             }
             if (params.model !== undefined && hasChain) {
@@ -3741,11 +3776,13 @@ export default function (pi: ExtensionAPI) {
                     content: [
                         {
                             type: 'text',
-                            text: 'model is single-mode only ({agent, task, model}); set model per item in the chain.',
+                            text: recoverableMiss(
+                                'model is single-mode only ({agent, task, model}); ' +
+                                    'set model per item in the chain.'
+                            ),
                         },
                     ],
                     details: makeDetails('single')([]),
-                    isError: true,
                 }
             }
 
@@ -3832,6 +3869,15 @@ export default function (pi: ExtensionAPI) {
 
                     const isError = isFailedResult(result)
                     if (isError) {
+                        const miss = preSpawnMissReason(
+                            result,
+                            `step ${i + 1} (${step.agent})`
+                        )
+                        if (miss)
+                            return {
+                                content: [{ type: 'text', text: recoverableMiss(miss) }],
+                                details: makeDetails('chain')(results),
+                            }
                         return {
                             content: [
                                 {
@@ -3864,9 +3910,8 @@ export default function (pi: ExtensionAPI) {
                     const resolved = resolveResumeTarget(params.resume, params.agent, agents)
                     if (typeof resolved === 'string') {
                         return {
-                            content: [{ type: 'text', text: resolved }],
+                            content: [{ type: 'text', text: recoverableMiss(resolved) }],
                             details: makeDetails('single')([]),
-                            isError: true,
                         }
                     }
                     resume = resolved
@@ -3879,7 +3924,8 @@ export default function (pi: ExtensionAPI) {
                     type SpawnBridge =
                         | { kind: 'spawned'; entry: ActiveSubagent }
                         | { kind: 'pre-spawn'; result: SingleResult }
-                        | { kind: 'error'; message: string }
+                        | { kind: 'timeout' }
+                        | { kind: 'not-started'; message: string }
                     let settled: SpawnBridge | undefined
                     let settleBridge: (v: SpawnBridge) => void
                     const bridgePromise = new Promise<SpawnBridge>(resolve => {
@@ -3890,14 +3936,7 @@ export default function (pi: ExtensionAPI) {
                             }
                         }
                     })
-                    const timer = setTimeout(
-                        () =>
-                            settleBridge({
-                                kind: 'error',
-                                message: 'spawn did not confirm within 5s',
-                            }),
-                        5000
-                    )
+                    const timer = setTimeout(() => settleBridge({ kind: 'timeout' }), 5000)
                     timer.unref()
                     const runPromise = runSingleAgent(
                         ctx.cwd,
@@ -3930,7 +3969,7 @@ export default function (pi: ExtensionAPI) {
                                 )
                             else
                                 settleBridge({
-                                    kind: 'error',
+                                    kind: 'not-started',
                                     message: err instanceof Error ? err.message : String(err),
                                 })
                         }
@@ -3966,7 +4005,13 @@ export default function (pi: ExtensionAPI) {
                             },
                         }
                     }
-                    if (spawn.kind === 'pre-spawn')
+                    if (spawn.kind === 'pre-spawn') {
+                        const miss = preSpawnMissReason(spawn.result)
+                        if (miss)
+                            return {
+                                content: [{ type: 'text', text: recoverableMiss(miss) }],
+                                details: makeDetails('single')([spawn.result]),
+                            }
                         return {
                             content: [
                                 { type: 'text', text: formatFailureReport(spawn.result) },
@@ -3974,10 +4019,31 @@ export default function (pi: ExtensionAPI) {
                             details: makeDetails('single')([spawn.result]),
                             isError: true,
                         }
+                    }
+                    if (spawn.kind === 'timeout')
+                        return {
+                            content: [
+                                {
+                                    type: 'text',
+                                    text: recoverableMiss(
+                                        'the spawn did not confirm within 5s, so the run may or may not ' +
+                                            'have started; check /subagents before re-dispatching.'
+                                    ),
+                                },
+                            ],
+                            details: makeDetails('single')([]),
+                        }
                     return {
-                        content: [{ type: 'text', text: spawn.message }],
+                        content: [
+                            {
+                                type: 'text',
+                                text: recoverableMiss(
+                                    `the run did not start (${spawn.message}); check /subagents for ` +
+                                        'a live run, then re-dispatch.'
+                                ),
+                            },
+                        ],
                         details: makeDetails('single')([]),
-                        isError: true,
                     }
                 }
                 const result = await runSingleAgent(
@@ -4027,6 +4093,12 @@ export default function (pi: ExtensionAPI) {
                 }
                 const isError = isFailedResult(result)
                 if (isError) {
+                    const miss = preSpawnMissReason(result)
+                    if (miss)
+                        return {
+                            content: [{ type: 'text', text: recoverableMiss(miss) }],
+                            details: makeDetails('single')([result]),
+                        }
                     return {
                         content: [
                             {
@@ -4059,7 +4131,10 @@ export default function (pi: ExtensionAPI) {
                 content: [
                     {
                         type: 'text',
-                        text: `Invalid parameters. Available agents: ${available}`,
+                        text: recoverableMiss(
+                            'provide single (agent + task) or chain (chain array); ' +
+                                `available agents: ${available}`
+                        ),
                     },
                 ],
                 details: makeDetails('single')([]),

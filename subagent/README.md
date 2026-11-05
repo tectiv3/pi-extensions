@@ -395,6 +395,34 @@ every id; settlements further apart arrive as separate turns. No notice is sent 
 result is collected or superseded; a late notice for an already-collected result says no
 action is needed.
 
+#### Async settlement notice
+
+Alongside that model-facing notification, every settled background run appends exactly one
+custom message to the parent transcript for external trackers (Paseo's `pi-subagents`
+adapter). A tracker driving runs from its own UI has no tool result to read — the spawn
+call returned at spawn time and this run settles later — so the notice is the only durable
+terminal marker it can clear the run on. It is `display: false`: bookkeeping, not something
+the user or the model reads.
+
+Payload:
+
+- `customType: 'subagent-notify'`, `display: false`.
+- First line: `Background task (completed|failed|stopped): **<agent>**`.
+- Final line: `Retention-managed async directory: <token>`.
+
+The token is `<agentDir>/subagents/<id>.async` — a synthetic correlation key that must be
+derivable from the run id alone (a replay rebuilds it from the transcript). **Nothing is
+written at that path**; it is not a directory. The spawn side reports the same string on
+the tool result's `details.asyncDir`, next to `details.asyncId` (the full run id); a
+tracker keys the two together, so a drift in either half strands the run with no error.
+
+Two behaviours a consumer must tolerate:
+
+- The header always reads `Background task …`, even for a foreground run the user sent to
+  the background mid-flight with the manager view's `b` key.
+- A settlement arriving after `session_shutdown` emits nothing (the run's session epoch is
+  stale), so a tracker holding such an entry keeps displaying it as running.
+
 ### Running-subagents footer
 
 While subagents run, the pi footer shows

@@ -109,6 +109,9 @@ subagent_inspect { id: "<shortId>" } for progress.
 
 `details` reuses `SubagentDetails` with mode `'single'` and an empty `results` array — the
 same shape the existing invalid-params paths already return, so renderers are unaffected.
+It additionally carries `asyncId` (the full run id) and `asyncDir`
+(`<agentDir>/subagents/<id>.async`) so an external tracker can correlate the spawn call
+with the settlement notice that ends it; both are absent for foreground runs.
 
 **Spawn-bridge (pinned).** The background branch of `execute()` cannot await
 `runSingleAgent` (that would block until child exit — the point of the feature is that it

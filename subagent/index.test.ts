@@ -210,10 +210,10 @@ function failedResult(overrides: Record<string, unknown> = {}): SingleResult {
     } as SingleResult
 }
 
-test('an unresolvable resume id is content, not a failed call', async t => {
+test('an unresolvable resume id is a failed call', async t => {
     const result = await execute(t, { agent: 'worker', task: 'continue', resume: '6d' })
 
-    assert.equal(result.isError, undefined, 'the call did not fail')
+    assert.equal(result.isError, true, 'the call settled with no run behind it')
     const text = textOf(result)
     assert.ok(text.startsWith('FAILED: '), text)
     assert.match(text, /No subagent found with id "6d"/)
@@ -221,30 +221,38 @@ test('an unresolvable resume id is content, not a failed call', async t => {
     // A single line: the persisted-run listing stays in /subagents for humans.
     assert.equal(text.includes('\n'), false, text)
     assert.deepEqual(result.details?.results, [])
+
+    // Same miss without an explicit agent: an unknown id is a resolution failure,
+    // not the argument error about a missing agent.
+    const withoutAgent = await execute(t, { task: 'continue', resume: '6d' })
+    assert.equal(withoutAgent.isError, true)
+    assert.match(textOf(withoutAgent), /^FAILED: .*No subagent found with id "6d"/)
 })
 
-test('an unknown agent in a background dispatch is content, not a failed call', async t => {
+test('an unknown agent in a background dispatch is a failed call', async t => {
     const result = await execute(t, { agent: 'ghost', task: 'do it' })
 
-    assert.equal(result.isError, undefined)
+    assert.equal(result.isError, true)
     const text = textOf(result)
     assert.ok(text.startsWith('FAILED: '), text)
     assert.match(text, /^FAILED: agent "ghost" did not start: Unknown agent: "ghost"/)
 })
 
-test('an unknown agent in a foreground dispatch is content, not a failed call', async t => {
+test('an unknown agent in a foreground dispatch is a failed call', async t => {
     const result = await execute(t, { agent: 'ghost', task: 'do it', background: false })
 
-    assert.equal(result.isError, undefined)
+    assert.equal(result.isError, true)
     assert.match(
         textOf(result),
         /^FAILED: agent "ghost" did not start: Unknown agent: "ghost"/
     )
 })
 
-test('request validation misses are content, not failed calls', async t => {
+test('request validation misses are failed calls', async t => {
     const cases: Array<[Record<string, unknown>, RegExp]> = [
-        [{}, /^FAILED: agent and task are both required/],
+        [{}, /^FAILED: task is required, and agent is required unless resume names/],
+        // A task alone still needs an agent: resume is the only source of one.
+        [{ task: 'do it' }, /^FAILED: task is required, and agent is required unless resume/],
         [
             { agent: 'worker', task: 'do it', model: '  ' },
             /^FAILED: model must be a non-empty/,
@@ -252,7 +260,7 @@ test('request validation misses are content, not failed calls', async t => {
     ]
     for (const [params, expected] of cases) {
         const result = await execute(t, params)
-        assert.equal(result.isError, undefined, JSON.stringify(params))
+        assert.equal(result.isError, true, JSON.stringify(params))
         const text = textOf(result)
         assert.ok(text.startsWith('FAILED: '), text)
         assert.match(text, expected, JSON.stringify(params))
@@ -625,7 +633,7 @@ test('resume refuses a run whose transcript is gone', async t => {
         makeCtx(agentDir)
     )
     const text = textOf(result)
-    assert.equal(result.isError, undefined)
+    assert.equal(result.isError, true)
     assert.match(text, /^FAILED: Cannot resume ".+": no transcript was persisted/)
 })
 
@@ -662,6 +670,7 @@ test('resume refuses a run the retention sweep deleted', async t => {
         makeCtx(agentDir)
     )
     assert.match(textOf(result), /^FAILED: .*No subagent found/)
+    assert.equal(result.isError, true)
 })
 
 test('a foreground resume of a background run keeps its transcript and refreshes its status', async t => {
@@ -743,4 +752,34 @@ test('a background resume of a legacy-transcript run advertises no sessionFile',
     assert.equal(payload.state, 'complete')
     assert.equal(payload.steps[0].sessionFile, undefined)
     assert.equal(existsFile(legacy), false, 'a legacy transcript keeps the success cleanup')
+})
+
+test('a resume without an agent continues as the agent the run recorded', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(agentDir)
+    const fake = useFakePi(t, agentDir, { waitForRelease: true })
+    const subagentsDir = seedFailedRun(agentDir, RESUME_ID)
+    const legacy = join(subagentsDir, `${RESUME_ID}.jsonl`)
+    writeFileSync(legacy, JSON.stringify({ type: 'session', id: 'earlier' }) + '\n')
+    const { subagent } = await loadDispatch()
+
+    const result = await subagent.execute(
+        'tool-call-1',
+        { task: 'continue', resume: RESUME_ID },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+    const asyncDir = (result.details as { asyncDir?: string }).asyncDir
+    assert.ok(asyncDir, textOf(result))
+    assert.equal(result.isError, undefined, textOf(result))
+    // The meta sidecar supplied the agent: the spawn payload names it, and the
+    // child was started on the run's own transcript.
+    assert.equal(statusOf(asyncDir)?.steps[0].agent, 'worker')
+    assert.equal(await waitFor(() => spawnedSession(fake.spawnLog), 'the child spawn'), legacy)
+
+    fake.release()
+    const payload = await waitFor(() => terminalStatus(asyncDir), 'the terminal status')
+    assert.equal(payload.state, 'complete')
+    assert.equal(payload.steps[0].agent, 'worker')
 })

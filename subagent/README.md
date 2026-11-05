@@ -96,7 +96,7 @@ Each step is a separate `subagent` call: run one, then pass its result in the ne
 
 | Mode | Parameter | Description |
 |------|-----------|-------------|
-| Single | `{ agent, task, resume? }` | One agent, one task; `resume` continues a persisted run. Runs in the background by default |
+| Single | `{ agent, task, resume? }` | One agent, one task; `resume` continues a persisted run, and there `agent` is optional (the run's recorded agent is used). Runs in the background by default |
 | Foreground single | `{ agent, task, background: false }` | Waits for the result; the tool call blocks until the child settles |
 | Background single | `{ agent, task }` or `background: true` | Returns immediately; result delivered by notification, fetched via subagent_collect |
 
@@ -241,8 +241,8 @@ subagent { agent: "scout", task: "<continuation instruction>", resume: "<id>" }
      (completed runs are cleaned up).
   2. The pidfile must not belong to a live process — a stale pidfile (parent crashed before
      cleanup) is auto-removed and the run is treated as interrupted.
-  3. `agent` must match the original run — a different agent means a different system
-     prompt and toolset.
+  3. `agent` is optional and defaults to the run's recorded agent; a given one must match
+     it — a different agent means a different system prompt and toolset.
   4. The agent definition's `promptHash` must match — a changed agent file is refused with
      a suggestion to start a fresh delegation.
 - Each resume increments `resumedCount` in the sidecar (shown by `subagent_inspect`).

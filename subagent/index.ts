@@ -1023,6 +1023,8 @@ interface SubagentMeta {
 interface ResumeTarget {
     id: string
     meta: SubagentMeta
+    /** The agent this resume runs as: explicit, or the one the run recorded. */
+    agent: string
 }
 
 function getFinalOutput(messages: Message[]): string {
@@ -1078,10 +1080,10 @@ function formatFailureReport(result: SingleResult): string {
     return lines.join('\n\n')
 }
 
-// A recoverable miss is returned as tool CONTENT, never as a failed call: the host
-// renders a failed subagent call as a failed subagent row, and a call that never
-// spawned a child leaves that row behind as a permanent phantom failure. The text is
-// the only channel left, so every miss is one line: FAILED: reason + next step.
+// A miss is text plus `isError: true`. The text keeps the diagnosis in one line
+// (FAILED: reason + next step); the error flag is what tells external trackers that
+// this call settled with no run behind it — a non-error result carrying no result
+// list, async id, or completion notice leaves their `running` row orphaned forever.
 export function recoverableMiss(reason: string): string {
     // First line only: the resume misses append a persisted-run listing written for
     // humans, and the model only acts on the reason and the next step.
@@ -1818,7 +1820,8 @@ async function attachToSubagent(ctx: ExtensionContext, entry: ActiveSubagent): P
 
 function resolveResumeTarget(
     resumeId: string,
-    agentName: string,
+    /** Explicit agent, or undefined to continue under the run's recorded agent. */
+    agentName: string | undefined,
     agents: AgentConfig[]
 ): ResumeTarget | string {
     // Same id semantics as subagent_inspect and /subagents resume: an exact
@@ -1847,22 +1850,24 @@ function resolveResumeTarget(
         return `Cannot resume "${shortId}": no transcript was persisted for it, so there is nothing to continue. Start a fresh delegation instead.`
     }
 
-    if (meta.agent !== agentName) {
+    const targetAgent = agentName ?? meta.agent
+
+    if (meta.agent !== targetAgent) {
         return (
-            `Cannot resume "${shortId}" with agent "${agentName}": the original run used agent "${meta.agent}". ` +
+            `Cannot resume "${shortId}" with agent "${targetAgent}": the original run used agent "${meta.agent}". ` +
             'Resuming under a different agent changes the system prompt and toolset; use the original agent.'
         )
     }
 
-    const agent = agents.find(a => a.name === agentName)
+    const agent = agents.find(a => a.name === targetAgent)
     const currentPromptHash = agent
         ? createHash('sha256').update(agent.systemPrompt).digest('hex')
         : undefined
     if (!agent || currentPromptHash !== meta.promptHash) {
-        return `Cannot resume "${shortId}": the "${agentName}" agent definition changed since the original run; start a fresh delegation instead.`
+        return `Cannot resume "${shortId}": the "${targetAgent}" agent definition changed since the original run; start a fresh delegation instead.`
     }
 
-    return { id: runId, meta }
+    return { id: runId, meta, agent: targetAgent }
 }
 
 type InspectTarget = { id: string } | { error: string }
@@ -3918,7 +3923,7 @@ export default function (pi: ExtensionAPI) {
         description: [
             'Delegate a task to a specialized subagent with isolated context.',
             'Resume: pass resume: <subagentId> to continue a persisted interrupted/failed run ' +
-                '(agent must match the original run).',
+                "(agent is optional there: it defaults to the run's recorded agent, and must match if given).",
             `Default agent scope is "user" (from ${path.join(getAgentDir(), 'agents')}).`,
             `To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
             'Background: the default. A call with `background` omitted or true returns immediately; the child keeps running and completion is reported via notification; fetch results with subagent_collect. Pass background: false to wait for the result in this turn. Print mode always runs foreground. Do not wait or poll on a background run: end your turn, and the completion notification starts the next one.',
@@ -3943,7 +3948,24 @@ export default function (pi: ExtensionAPI) {
                 results,
             })
 
-            if (!params.agent || !params.task) {
+            // Resume resolves before the agent check: the run's meta sidecar records
+            // the agent, so a resume needs no explicit `agent`, and the trust gate
+            // below has to see the agent this call will actually load.
+            let resume: ResumeTarget | undefined
+            if (params.resume) {
+                const resolved = resolveResumeTarget(params.resume, params.agent, agents)
+                if (typeof resolved === 'string') {
+                    return {
+                        content: [{ type: 'text', text: recoverableMiss(resolved) }],
+                        details: makeDetails([]),
+                        isError: true,
+                    }
+                }
+                resume = resolved
+            }
+
+            const agentName = params.agent ?? resume?.agent
+            if (!params.task || !agentName) {
                 const available =
                     agents.map(a => `${a.name} (${a.source})`).join(', ') || 'none'
                 return {
@@ -3951,11 +3973,13 @@ export default function (pi: ExtensionAPI) {
                         {
                             type: 'text',
                             text: recoverableMiss(
-                                `agent and task are both required. Available agents: ${available}`
+                                'task is required, and agent is required unless resume names a persisted run. ' +
+                                    `Available agents: ${available}`
                             ),
                         },
                     ],
                     details: makeDetails([]),
+                    isError: true,
                 }
             }
 
@@ -3975,6 +3999,7 @@ export default function (pi: ExtensionAPI) {
                         },
                     ],
                     details: makeDetails([]),
+                    isError: true,
                 }
             }
 
@@ -3983,8 +4008,7 @@ export default function (pi: ExtensionAPI) {
                 ctx.hasUI &&
                 !ctx.isProjectTrusted()
             ) {
-                const requestedAgentNames = new Set<string>()
-                if (params.agent) requestedAgentNames.add(params.agent)
+                const requestedAgentNames = new Set<string>([agentName])
 
                 const projectAgentsRequested = Array.from(requestedAgentNames)
                     .map(name => agents.find(a => a.name === name))
@@ -4012,17 +4036,6 @@ export default function (pi: ExtensionAPI) {
 
             const relayUiRequest = buildRelayUiRequest(ctx)
 
-            let resume: ResumeTarget | undefined
-            if (params.resume) {
-                const resolved = resolveResumeTarget(params.resume, params.agent, agents)
-                if (typeof resolved === 'string') {
-                    return {
-                        content: [{ type: 'text', text: recoverableMiss(resolved) }],
-                        details: makeDetails([]),
-                    }
-                }
-                resume = resolved
-            }
             if (background) {
                 // Spawn bridge (mirrors handleSubagentsResume): settle on the
                 // first of onSpawned, a pre-spawn failure of the floating run
@@ -4049,7 +4062,7 @@ export default function (pi: ExtensionAPI) {
                     ctx.cwd,
                     dispatchDefaults,
                     agents,
-                    params.agent,
+                    agentName,
                     params.task,
                     params.cwd,
                     undefined, // signal: runAbort is this run's abort path; undefined so Escape cannot kill it (spec §1.1)
@@ -4087,13 +4100,13 @@ export default function (pi: ExtensionAPI) {
                     // Before the result returns: the tracker starts polling as
                     // soon as it has details.asyncDir, and a missing file is a
                     // silent "keep running" there.
-                    writeRunStatusStart(entry.id, params.agent, entry.startedAt)
+                    writeRunStatusStart(entry.id, agentName, entry.startedAt)
                     return {
                         content: [
                             {
                                 type: 'text',
                                 text: [
-                                    `Background subagent ${shortSubagentId(entry.id)} started (agent: ${params.agent}).`,
+                                    `Background subagent ${shortSubagentId(entry.id)} started (agent: ${agentName}).`,
                                     `Task: ${previewText(params.task, LIST_TASK_PREVIEW_CHARS)}`,
                                     `You'll be notified when it completes. Call subagent_collect { id: "${shortSubagentId(entry.id)}" } for the result;`,
                                     `subagent_inspect { id: "${shortSubagentId(entry.id)}" } for progress.`,
@@ -4121,6 +4134,7 @@ export default function (pi: ExtensionAPI) {
                         return {
                             content: [{ type: 'text', text: recoverableMiss(miss) }],
                             details: makeDetails([spawn.result]),
+                            isError: true,
                         }
                     return {
                         content: [{ type: 'text', text: formatFailureReport(spawn.result) }],
@@ -4140,6 +4154,7 @@ export default function (pi: ExtensionAPI) {
                             },
                         ],
                         details: makeDetails([]),
+                        isError: true,
                     }
                 return {
                     content: [
@@ -4152,13 +4167,14 @@ export default function (pi: ExtensionAPI) {
                         },
                     ],
                     details: makeDetails([]),
+                    isError: true,
                 }
             }
             const result = await runSingleAgent(
                 ctx.cwd,
                 dispatchDefaults,
                 agents,
-                params.agent,
+                agentName,
                 params.task,
                 params.cwd,
                 signal,
@@ -4183,7 +4199,7 @@ export default function (pi: ExtensionAPI) {
                 // child's close event, a later I/O callback.
                 writeRunStatusStart(
                     result.subagentId,
-                    params.agent,
+                    agentName,
                     activeSubagents.get(result.subagentId)?.startedAt ?? Date.now()
                 )
                 return {
@@ -4191,7 +4207,7 @@ export default function (pi: ExtensionAPI) {
                         {
                             type: 'text',
                             text: [
-                                `Subagent ${shortSubagentId(result.subagentId)} (agent: ${params.agent}) was sent to the background by the user; it keeps running.`,
+                                `Subagent ${shortSubagentId(result.subagentId)} (agent: ${agentName}) was sent to the background by the user; it keeps running.`,
                                 `Task: ${previewText(params.task, LIST_TASK_PREVIEW_CHARS)}`,
                                 `You'll be notified when it completes. Call subagent_collect { id: "${shortSubagentId(result.subagentId)}" } for the result;`,
                                 `subagent_inspect { id: "${shortSubagentId(result.subagentId)}" } for progress.`,
@@ -4216,6 +4232,7 @@ export default function (pi: ExtensionAPI) {
                     return {
                         content: [{ type: 'text', text: recoverableMiss(miss) }],
                         details: makeDetails([result]),
+                        isError: true,
                     }
                 return {
                     content: [

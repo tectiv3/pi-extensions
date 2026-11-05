@@ -783,3 +783,159 @@ test('a resume without an agent continues as the agent the run recorded', async 
     assert.equal(payload.state, 'complete')
     assert.equal(payload.steps[0].agent, 'worker')
 })
+
+test('a resume with an empty agent string infers the recorded agent', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(agentDir)
+    const fake = useFakePi(t, agentDir)
+    const subagentsDir = seedFailedRun(agentDir, RESUME_ID)
+    const legacy = join(subagentsDir, `${RESUME_ID}.jsonl`)
+    writeFileSync(legacy, JSON.stringify({ type: 'session', id: 'earlier' }) + '\n')
+    const { subagent } = await loadDispatch()
+
+    const result = await subagent.execute(
+        'tool-call-1',
+        { agent: '', task: 'continue', resume: RESUME_ID, background: false },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+    assert.equal(result.isError, undefined, textOf(result))
+    assert.equal(await waitFor(() => spawnedSession(fake.spawnLog), 'the child spawn'), legacy)
+})
+
+test('a resume naming a different agent than the run recorded is a failed call', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(agentDir)
+    seedAgent(agentDir, 'other')
+    const subagentsDir = seedFailedRun(agentDir, RESUME_ID)
+    writeFileSync(join(subagentsDir, `${RESUME_ID}.jsonl`), '{}\n')
+    const { subagent } = await loadDispatch()
+
+    const result = await subagent.execute(
+        'tool-call-1',
+        { agent: 'other', task: 'continue', resume: RESUME_ID },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+    assert.equal(result.isError, true)
+    assert.match(textOf(result), /^FAILED: .*the original run used agent "worker"/)
+    assert.deepEqual((result.details as { results: unknown[] }).results, [])
+})
+
+test('a resume whose meta records no agent reports that, not a changed definition', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(agentDir)
+    const subagentsDir = seedFailedRun(agentDir, RESUME_ID)
+    writeFileSync(join(subagentsDir, `${RESUME_ID}.meta`), JSON.stringify({ task: 'do it' }))
+    writeFileSync(join(subagentsDir, `${RESUME_ID}.jsonl`), '{}\n')
+    const { subagent } = await loadDispatch()
+
+    const result = await subagent.execute(
+        'tool-call-1',
+        { task: 'continue', resume: RESUME_ID },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+    assert.equal(result.isError, true)
+    assert.match(textOf(result), /meta sidecar records no agent/)
+})
+
+test('a resume of a project agent under user scope names the scope', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(join(agentDir, '.pi'))
+    const subagentsDir = seedFailedRun(agentDir, RESUME_ID)
+    writeFileSync(join(subagentsDir, `${RESUME_ID}.jsonl`), '{}\n')
+    const { subagent } = await loadDispatch()
+
+    const result = await subagent.execute(
+        'tool-call-1',
+        { task: 'continue', resume: RESUME_ID },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+    assert.equal(result.isError, true)
+    assert.match(textOf(result), /not available in agentScope "user"/)
+})
+
+function untrustedCtx(cwd: string, answer: boolean, asked: string[]): unknown {
+    const base = makeCtx(cwd) as Record<string, unknown>
+    return {
+        ...base,
+        hasUI: true,
+        isProjectTrusted: () => false,
+        ui: {
+            notify: () => {},
+            confirm: async (_title: string, body: string) => {
+                asked.push(body)
+                return answer
+            },
+        },
+    }
+}
+
+test('declining the project-agent confirm is a failed call', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(join(agentDir, '.pi'))
+    const { subagent } = await loadDispatch()
+    const asked: string[] = []
+
+    const result = await subagent.execute(
+        'tool-call-1',
+        { agent: 'worker', task: 'do it', agentScope: 'both' },
+        undefined,
+        undefined,
+        untrustedCtx(agentDir, false, asked)
+    )
+    assert.equal(asked.length, 1)
+    assert.equal(result.isError, true)
+    assert.equal(textOf(result), 'Canceled: project-local agents not approved.')
+    assert.deepEqual((result.details as { results: unknown[] }).results, [])
+})
+
+test('an inferred project agent on resume still goes through the trust gate', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(join(agentDir, '.pi'))
+    const subagentsDir = seedFailedRun(agentDir, RESUME_ID)
+    writeFileSync(join(subagentsDir, `${RESUME_ID}.jsonl`), '{}\n')
+    const { subagent } = await loadDispatch()
+    const asked: string[] = []
+
+    const result = await subagent.execute(
+        'tool-call-1',
+        { task: 'continue', resume: RESUME_ID, agentScope: 'both' },
+        undefined,
+        undefined,
+        untrustedCtx(agentDir, false, asked)
+    )
+    assert.equal(asked.length, 1)
+    assert.match(asked[0], /Agents: worker/)
+    assert.equal(result.isError, true)
+})
+
+test('a resume re-checks liveness after the trust confirm', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(join(agentDir, '.pi'))
+    const subagentsDir = seedFailedRun(agentDir, RESUME_ID)
+    writeFileSync(join(subagentsDir, `${RESUME_ID}.jsonl`), '{}\n')
+    const { subagent } = await loadDispatch()
+    const base = untrustedCtx(agentDir, true, []) as { ui: Record<string, unknown> }
+    // A parallel resume of the same run spawned its child while this confirm was open.
+    base.ui.confirm = async () => {
+        writeFileSync(join(subagentsDir, `${RESUME_ID}.pid`), `${process.pid}\n`)
+        return true
+    }
+
+    const result = await subagent.execute(
+        'tool-call-1',
+        { task: 'continue', resume: RESUME_ID, agentScope: 'both' },
+        undefined,
+        undefined,
+        base
+    )
+    assert.equal(result.isError, true)
+    assert.match(textOf(result), /is still running \(pid \d+\)/)
+})

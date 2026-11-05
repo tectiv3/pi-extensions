@@ -1818,11 +1818,36 @@ async function attachToSubagent(ctx: ExtensionContext, entry: ActiveSubagent): P
     ctx.ui.notify(`Detached from subagent ${shortId}.`, 'info')
 }
 
+/** An error when the run's child is still alive; a stale pidfile is removed. */
+function checkResumeNotLive(runId: string): string | undefined {
+    // The registry catches a child this session spawned before its pidfile lands.
+    if (activeSubagents.has(runId)) {
+        return (
+            `Subagent "${shortSubagentId(runId)}" is still running in this session. ` +
+            'Wait for it to finish or inspect it with subagent_inspect instead of resuming.'
+        )
+    }
+    const { pid: pidPath } = getSubagentFilePaths(runId)
+    if (!fs.existsSync(pidPath)) return undefined
+    const pid = readSubagentPid(pidPath)
+    if (pid !== undefined && isProcessAlive(pid)) {
+        return (
+            `Subagent "${shortSubagentId(runId)}" is still running (pid ${pid}). ` +
+            'Wait for it to finish or inspect it with subagent_inspect instead of resuming.'
+        )
+    }
+    // Stale pidfile: the parent died before cleanup. Unlock and treat the run as interrupted.
+    removeSubagentFile(pidPath)
+    return undefined
+}
+
 function resolveResumeTarget(
     resumeId: string,
     /** Explicit agent, or undefined to continue under the run's recorded agent. */
     agentName: string | undefined,
-    agents: AgentConfig[]
+    agents: AgentConfig[],
+    /** Scope `agents` was discovered under, named when the recorded agent is absent. */
+    agentScope: AgentScope
 ): ResumeTarget | string {
     // Same id semantics as subagent_inspect and /subagents resume: an exact
     // id resolves across sessions, a unique suffix within this session.
@@ -1831,18 +1856,8 @@ function resolveResumeTarget(
     const { id: runId, meta } = resolution
     const shortId = shortSubagentId(runId)
 
-    const { pid: pidPath } = getSubagentFilePaths(runId)
-    if (fs.existsSync(pidPath)) {
-        const pid = readSubagentPid(pidPath)
-        if (pid !== undefined && isProcessAlive(pid)) {
-            return (
-                `Subagent "${shortId}" is still running (pid ${pid}). ` +
-                'Wait for it to finish or inspect it with subagent_inspect instead of resuming.'
-            )
-        }
-        // Stale pidfile: the parent died before cleanup. Unlock and treat the run as interrupted.
-        removeSubagentFile(pidPath)
-    }
+    const liveError = checkResumeNotLive(runId)
+    if (liveError) return liveError
 
     // Without a transcript the child would start an empty session told to
     // "continue": the run never wrote one, or retention removed it.
@@ -1850,6 +1865,9 @@ function resolveResumeTarget(
         return `Cannot resume "${shortId}": no transcript was persisted for it, so there is nothing to continue. Start a fresh delegation instead.`
     }
 
+    if (typeof meta.agent !== 'string' || !meta.agent) {
+        return `Cannot resume "${shortId}": its meta sidecar records no agent; start a fresh delegation instead.`
+    }
     const targetAgent = agentName ?? meta.agent
 
     if (meta.agent !== targetAgent) {
@@ -1860,10 +1878,14 @@ function resolveResumeTarget(
     }
 
     const agent = agents.find(a => a.name === targetAgent)
-    const currentPromptHash = agent
-        ? createHash('sha256').update(agent.systemPrompt).digest('hex')
-        : undefined
-    if (!agent || currentPromptHash !== meta.promptHash) {
+    if (!agent) {
+        return (
+            `Cannot resume "${shortId}": the "${targetAgent}" agent is not available in agentScope "${agentScope}". ` +
+            'Pass agentScope "both" if it is a project-local agent.'
+        )
+    }
+    const currentPromptHash = createHash('sha256').update(agent.systemPrompt).digest('hex')
+    if (currentPromptHash !== meta.promptHash) {
         return `Cannot resume "${shortId}": the "${targetAgent}" agent definition changed since the original run; start a fresh delegation instead.`
     }
 
@@ -3277,7 +3299,7 @@ async function handleSubagentsResume(ctx: ExtensionContext, rest: string[]): Pro
     // Shared gate with the subagent tool's resume parameter: pidfile not live
     // (another pi session's child), transcript exists, same agent, prompt hash
     // unchanged.
-    const resumeTarget = resolveResumeTarget(resolved.id, resolved.meta.agent, agents)
+    const resumeTarget = resolveResumeTarget(resolved.id, resolved.meta.agent, agents, 'both')
     if (typeof resumeTarget === 'string') {
         ctx.ui.notify(resumeTarget, 'warning')
         return
@@ -3951,9 +3973,16 @@ export default function (pi: ExtensionAPI) {
             // Resume resolves before the agent check: the run's meta sidecar records
             // the agent, so a resume needs no explicit `agent`, and the trust gate
             // below has to see the agent this call will actually load.
+            // Models fill optional strings with "" — that means "not given", not an agent name.
+            const requestedAgent = params.agent?.trim() || undefined
             let resume: ResumeTarget | undefined
             if (params.resume) {
-                const resolved = resolveResumeTarget(params.resume, params.agent, agents)
+                const resolved = resolveResumeTarget(
+                    params.resume,
+                    requestedAgent,
+                    agents,
+                    agentScope
+                )
                 if (typeof resolved === 'string') {
                     return {
                         content: [{ type: 'text', text: recoverableMiss(resolved) }],
@@ -3964,7 +3993,7 @@ export default function (pi: ExtensionAPI) {
                 resume = resolved
             }
 
-            const agentName = params.agent ?? resume?.agent
+            const agentName = requestedAgent ?? resume?.agent
             if (!params.task || !agentName) {
                 const available =
                     agents.map(a => `${a.name} (${a.source})`).join(', ') || 'none'
@@ -4008,18 +4037,12 @@ export default function (pi: ExtensionAPI) {
                 ctx.hasUI &&
                 !ctx.isProjectTrusted()
             ) {
-                const requestedAgentNames = new Set<string>([agentName])
-
-                const projectAgentsRequested = Array.from(requestedAgentNames)
-                    .map(name => agents.find(a => a.name === name))
-                    .filter((a): a is AgentConfig => a?.source === 'project')
-
-                if (projectAgentsRequested.length > 0) {
-                    const names = projectAgentsRequested.map(a => a.name).join(', ')
+                const requested = agents.find(a => a.name === agentName)
+                if (requested?.source === 'project') {
                     const dir = discovery.projectAgentsDir ?? '(unknown)'
                     const ok = await ctx.ui.confirm(
                         'Run project-local agents?',
-                        `Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`
+                        `Agents: ${requested.name}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`
                     )
                     if (!ok)
                         return {
@@ -4030,7 +4053,20 @@ export default function (pi: ExtensionAPI) {
                                 },
                             ],
                             details: makeDetails([]),
+                            isError: true,
                         }
+                    // The confirm can stay open indefinitely; a parallel call may have
+                    // resumed the same run meanwhile.
+                    if (resume) {
+                        const liveError = checkResumeNotLive(resume.id)
+                        if (liveError) {
+                            return {
+                                content: [{ type: 'text', text: recoverableMiss(liveError) }],
+                                details: makeDetails([]),
+                                isError: true,
+                            }
+                        }
+                    }
                 }
             }
 
@@ -4263,7 +4299,8 @@ export default function (pi: ExtensionAPI) {
 
         renderCall(args, theme, _context) {
             const scope: AgentScope = args.agentScope ?? 'user'
-            const agentName = args.agent || '...'
+            const agentName =
+                args.agent || (args.resume ? `resume ${shortSubagentId(args.resume)}` : '...')
             const preview = args.task
                 ? args.task.length > 60
                     ? `${args.task.slice(0, 60)}...`

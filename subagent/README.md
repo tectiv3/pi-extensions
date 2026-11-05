@@ -221,7 +221,7 @@ formatting, or the session-header read.
 ### Resuming
 
 ```
-subagent { agent: "scout", task: "<continuation instruction>", resume: "<id>" }
+subagent { task: "<continuation instruction>", resume: "<id>" }  # agent inferred from the run
 ```
 
 - The id may be exact or a unique suffix (same semantics as `subagent_inspect`): an exact
@@ -239,12 +239,23 @@ subagent { agent: "scout", task: "<continuation instruction>", resume: "<id>" }
   1. The id must resolve — exact id with a readable meta sidecar, or a unique suffix among
      this session's persisted runs; otherwise the error lists the available persisted ids
      (completed runs are cleaned up).
-  2. The pidfile must not belong to a live process — a stale pidfile (parent crashed before
-     cleanup) is auto-removed and the run is treated as interrupted.
-  3. `agent` is optional and defaults to the run's recorded agent; a given one must match
-     it — a different agent means a different system prompt and toolset.
-  4. The agent definition's `promptHash` must match — a changed agent file is refused with
+  2. The run must not be live — not running in this session, and its pidfile must not
+     belong to a live process. A stale pidfile (parent crashed before cleanup) is
+     auto-removed and the run is treated as interrupted. When the project-agent trust
+     confirm is shown, this check runs again after it, since a parallel call may have
+     resumed the run while the dialog was open.
+  3. A transcript must have been persisted — otherwise there is nothing to continue.
+  4. `agent` is optional (an empty string counts as omitted) and defaults to the run's
+     recorded agent; a given one must match it — a different agent means a different system
+     prompt and toolset.
+  5. The recorded agent must be loaded under the call's `agentScope` — a project-local
+     agent needs `agentScope: "both"` or `"project"`, and then passes the trust gate like a
+     fresh call.
+  6. The agent definition's `promptHash` must match — a changed agent file is refused with
      a suggestion to start a fresh delegation.
+- A refused resume — like every call that starts no run (unknown agent, missing task,
+  declined trust confirm) — returns a one-line `FAILED: <reason>` (or `Canceled: ...`) text
+  with `isError: true` and `results: []`, so trackers settle the call as failed.
 - Each resume increments `resumedCount` in the sidecar (shown by `subagent_inspect`).
 
 ### Inspecting runs: `subagent_inspect`
@@ -311,7 +322,7 @@ What the tool actually guarantees, and nothing beyond it:
 If the child has committed the wrong edit, spent its budget on the wrong approach, or is
 stuck in a tool call, a queued message will not help: abort it (`/subagents abort <id>`, or
 Escape for a foreground run) and resume with a corrected brief —
-`subagent { agent, task, resume: "<id>" }` keeps the conversation and replaces the
+`subagent { task, resume: "<id>" }` keeps the conversation and replaces the
 instruction. The same applies to a run that has stopped: restart with a corrected plan
 rather than trying to steer a finished run.
 

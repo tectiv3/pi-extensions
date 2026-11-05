@@ -1,9 +1,23 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import {
+    mkdirSync,
+    mkdtempSync,
+    readdirSync,
+    readFileSync,
+    rmSync,
+    writeFileSync,
+} from 'node:fs'
 import { registerHooks } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test, { type TestContext } from 'node:test'
+import {
+    ASYNC_DIR_SUFFIX,
+    ASYNC_RETENTION_MS,
+    ASYNC_STATUS_FILE,
+    sweepExpiredAsyncDirs,
+} from './async-status.ts'
+import { advanceSessionEpoch, currentSessionEpoch } from './session-epoch.ts'
 
 // The extension's entry module imports the host packages that pi provides at
 // runtime, so the test has to substitute them: everything here is only reached
@@ -57,7 +71,15 @@ type SubagentModule = {
     default: (pi: unknown) => void
     recoverableMiss: (reason: string) => string
     preSpawnMissReason: (result: any, subject?: string) => string | undefined
+    emitBackgroundSettlement: (
+        id: string,
+        agent: string,
+        status: 'succeeded' | 'failed' | 'aborted',
+        runEpoch: number
+    ) => void
 }
+
+type EntryRecord = { customType: string; data: unknown }
 
 type Tool = {
     name: string
@@ -70,7 +92,7 @@ type Tool = {
     ) => Promise<ToolResult>
 }
 
-type Dispatch = { module: SubagentModule; subagent: Tool }
+type Dispatch = { module: SubagentModule; subagent: Tool; entries: EntryRecord[] }
 
 let dispatch: Promise<Dispatch> | undefined
 
@@ -79,6 +101,7 @@ function loadDispatch(): Promise<Dispatch> {
     dispatch ??= (async () => {
         const module = (await import('./index.ts')) as unknown as SubagentModule
         const tools = new Map<string, Tool>()
+        const entries: EntryRecord[] = []
         module.default({
             registerTool: (tool: Tool) => tools.set(tool.name, tool),
             registerCommand: () => {},
@@ -87,11 +110,12 @@ function loadDispatch(): Promise<Dispatch> {
             registerMarkdownTheme: () => {},
             registerToolRenderer: () => {},
             on: () => {},
-            appendEntry: () => {},
+            appendEntry: (customType: string, data: unknown) =>
+                entries.push({ customType, data }),
         })
         const subagent = tools.get('subagent')
         assert.ok(subagent, 'the subagent tool was registered')
-        return { module, subagent }
+        return { module, subagent, entries }
     })()
     return dispatch
 }
@@ -265,4 +289,69 @@ test('recoverableMiss keeps one prefixed line', async () => {
         module.recoverableMiss('reason; next step.\nlisting line\n- run 1'),
         'FAILED: reason; next step.'
     )
+})
+
+const STALE_RUN_ID = '0195f2c4-7b1e-7c3a-9f21-8d0e6a4b2c31'
+
+function readStatus(agentDir: string, runId: string): Record<string, any> {
+    return JSON.parse(
+        readFileSync(
+            join(agentDir, 'subagents', `${runId}${ASYNC_DIR_SUFFIX}`, ASYNC_STATUS_FILE),
+            'utf-8'
+        )
+    )
+}
+
+// The status file is the poller channel and names a run-scoped directory, so a
+// settlement that arrives after session_shutdown must still write it: without the
+// terminal state the directory reads `running` forever and the retention sweep —
+// which only deletes terminal runs — never reclaims it.
+test('a stale-epoch settlement still writes a sweepable terminal status file', async t => {
+    const agentDir = tempAgentDir(t)
+    const { module, entries } = await loadDispatch()
+    const staleEpoch = currentSessionEpoch()
+    advanceSessionEpoch()
+
+    const entriesBefore = entries.length
+    module.emitBackgroundSettlement(STALE_RUN_ID, 'worker', 'failed', staleEpoch)
+
+    assert.equal(entries.length, entriesBefore, 'no entry for a torn-down session')
+    const payload = readStatus(agentDir, STALE_RUN_ID)
+    assert.equal(payload.runId, STALE_RUN_ID)
+    assert.equal(payload.state, 'failed')
+    assert.equal(payload.endedAt, payload.lastUpdate)
+    // No spawn time recorded in this process: the payload falls back to endedAt
+    // rather than reporting a start after the end.
+    assert.equal(payload.startedAt, payload.endedAt)
+    assert.deepEqual(
+        payload.steps.map((step: { agent: string; status: string }) => [
+            step.agent,
+            step.status,
+        ]),
+        [['worker', 'failed']]
+    )
+
+    // The whole point: the directory the bug leaked is now sweepable.
+    const subagentsDir = join(agentDir, 'subagents')
+    assert.deepEqual(
+        sweepExpiredAsyncDirs(subagentsDir, {
+            now: payload.lastUpdate + ASYNC_RETENTION_MS + 1000,
+        }),
+        { scanned: 1, deleted: 1, kept: 0, reaped: 0 }
+    )
+    assert.deepEqual(readdirSync(subagentsDir), [])
+})
+
+test('a live-epoch settlement writes both channels', async t => {
+    const agentDir = tempAgentDir(t)
+    const { module, entries } = await loadDispatch()
+
+    const entriesBefore = entries.length
+    module.emitBackgroundSettlement(STALE_RUN_ID, 'worker', 'aborted', currentSessionEpoch())
+
+    const appended = entries.slice(entriesBefore)
+    assert.equal(appended.length, 1, 'one entry per settlement')
+    assert.equal(appended[0].customType, 'subagent-notify')
+    assert.match(String((appended[0].data as { content: string }).content), /stopped/)
+    assert.equal(readStatus(agentDir, STALE_RUN_ID).state, 'stopped')
 })

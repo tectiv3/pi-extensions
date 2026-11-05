@@ -36,8 +36,11 @@ cannot be settled from code are collected in §5 (verification checklist).
 - **Session-scoped lifetime.** Live runs (foreground and background) are killed on session
   teardown. `pi.on('session_shutdown')` (`reason: quit | reload | new | resume | fork`)
   SIGTERMs every `activeSubagents` child, drops the drain timer/queue and
-  `backgroundResults`, clears the footer slot, and sets a `sessionTearingDown` flag so the
-  killed runs' settlements emit no completion notification. This is required, not cosmetic:
+  `backgroundResults`, clears the footer slot, and advances the session epoch so the
+  killed runs' settlements write no completion notification into the replacement session.
+  The epoch guard covers the transcript entry only: the run's `status.json` is still
+  written terminal, because that file is run-scoped and the retention sweep only deletes
+  terminal runs. This is required, not cosmetic:
   pi reloads and rebinds extensions on session replacement, which drops the module-level
   registries — a surviving child would be an untracked orphan. A `process.on('exit')` hook
   is kept as well, because pi's `uncaughtException` path calls `process.exit` without
@@ -285,7 +288,7 @@ subagent_collect { id: string }
 | Parent Escape | **no effect** (detached) | — |
 | `/subagents abort <id>` / manager `x` | close → sink, failure | failure (killed) |
 | Parent process exit | exit handler SIGTERM (unchanged) | lost with the process (documented) |
-| Session switch/fork/reload (`session_shutdown`) | SIGTERM live children + drop state | none (suppressed; the run belonged to the old session) |
+| Session switch/fork/reload (`session_shutdown`) | SIGTERM live children + drop state | none (entry suppressed by the stale epoch; the run belonged to the old session), but `status.json` is still written terminal |
 | Resume of this id (tool or `/subagents resume`) | registration-time supersession | none for the stale entry; the resume path's own handling applies |
 
 ---
@@ -454,7 +457,8 @@ on the target box before the feature is declared done:
 10. **Session switch with an in-flight background run** (`switchSession`/`newSession`/
     `fork`/`reload`): the run is SIGTERM'd on `session_shutdown`, the footer slot is
     cleared, and no completion notification fires for it. Verify: `/new` with a run in
-    flight → the child process is gone (`ps`), the footer is empty, no follow-up arrives.
+    flight → the child process is gone (`ps`), the footer is empty, no follow-up arrives,
+    and `<id>.async/status.json` reads a terminal `state` (not `running`).
 11. **Cross-child relay mutex hold:** with a backgrounded dialog open, a second child's
     relay queues behind it; the queued child's stall watchdog keeps running (its
     `relayPending` is set only after the mutex) — observe the queued behavior and that

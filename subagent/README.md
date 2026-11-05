@@ -422,19 +422,51 @@ Entry `data`:
 A consumer reading the parent transcript must read the entry's `data.content`; the notice is
 no longer a `custom_message` entry and fires no `custom_message` event.
 
-The token is `<agentDir>/subagents/<id>.async` — a synthetic correlation key that must be
-derivable from the run id alone (a replay rebuilds it from the transcript). **Nothing is
-written at that path**; it is not a directory. The spawn side reports the same string on
-the tool result's `details.asyncDir`, next to `details.asyncId` (the full run id); a
-tracker keys the two together, so a drift in either half strands the run with no error.
+The token is `<agentDir>/subagents/<id>.async` — a correlation key that must be
+derivable from the run id alone (a replay rebuilds it from the transcript). It is a real
+directory and holds two payloads with the same correlation string. The spawn side
+reports the path on the tool result's `details.asyncDir`, next to `details.asyncId` (the
+full run id); a tracker keys the two together, so a drift in either half strands the run
+with no error.
+
+`status.json` in that directory is the **live channel**, for trackers that poll rather
+than read a transcript:
+
+- Written at spawn (`state: "running"`, `startedAt`, one step for the dispatched agent
+  with `agent` + `status: "running"`, plus `sessionFile` once the child's session JSONL
+  exists) and again at settlement (`state`, `endedAt`, `lastUpdate`; step status mirrors
+  the run). Written atomically — temp file plus rename in the same directory — so a
+  poller never reads a half-written payload. The settlement write is not session-scoped:
+  it lands whatever the session epoch, since the directory it names belongs to the run,
+  not to a transcript.
+- Shape: `{ runId, mode: "single", state, startedAt, endedAt?, lastUpdate, steps: [{ agent,
+  status?, sessionFile? }] }`, epoch milliseconds for the timestamps.
+- `state` is `running | complete | failed | stopped`; the internal outcome maps
+  `succeeded → complete`, `failed → failed`, `aborted → stopped`.
+- A run that never reaches a terminal state (killed process, crash) leaves `running`
+  behind: the directory then stays until something overwrites or removes it.
+- Retention: one sweep per session, 60 s after the extension loads. It looks only at
+  `<agentDir>/subagents/*.async` directories, skips any run still live in this process,
+  keeps anything with a missing/unreadable `status.json` or a non-terminal state, and
+  deletes a terminal run (`complete | failed | stopped | rejected`) whose newest signal
+  (`endedAt`/`lastUpdate`, then the directory's and the file's mtime) is older than 30
+  days — rename aside, then `rm -r`, with `*.async.deleting-*` crash residue older than
+  an hour reaped on the next pass. `<id>.pid` / `<id>.meta` / `<id>.jsonl` siblings are
+  never touched.
+
+The `subagent-notify` entry described above remains the **durable replay channel**, and
+it is what a tracker that started after the run finished has to read: the entry survives
+in the parent transcript, `status.json` only outlives its directory.
 
 Two behaviours a consumer must tolerate:
 
 - The header always reads `Background task …`, even for a foreground run the user sent to
   the background mid-flight with the manager view's `b` key.
-- A settlement arriving after `session_shutdown` emits nothing (the run's session epoch is
-  stale, so no entry is written), and a tracker holding such a run keeps displaying it as
-  running.
+- A settlement arriving after `session_shutdown` writes no `subagent-notify` entry (the
+  run's session epoch is stale, so the entry — the only channel that lands in a transcript —
+  is suppressed). Its `status.json` **is** still written terminal: the file names a
+  run-scoped directory, not a transcript, so a tracker polling it settles instead of
+  displaying the run as running, and the retention sweep still deletes the directory.
 
 ### Running-subagents footer
 

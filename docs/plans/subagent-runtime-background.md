@@ -26,9 +26,10 @@ semantics this feature reuses at runtime.
   - `onUpdate` streaming stops (the tool call has returned);
   - when the child exits, the existing background settlement path runs
     (`settleBackgroundRun`: store in `backgroundResults`, coalesced completion
-    notification, footer refresh; plus the `subagent-notify` settlement entry
-    `finalizeExit` persists before cleanup), and `subagent_collect` delivers the
-    result.
+    notification, footer refresh; plus the `subagent-notify` settlement entry and
+    the terminal `<asyncDir>/status.json` payload `finalizeExit` persists before
+    cleanup — the entry for transcript replay, the file for a poller), and
+    `subagent_collect` delivers the result.
 - **Eligibility: foreground single-mode tool-call runs only**, including
   foreground `resume` runs (same dispatch call site). NOT parallel tasks, NOT
   chain steps, NOT `/subagents resume` handler spawns (no awaiting tool call),
@@ -100,8 +101,8 @@ semantics this feature reuses at runtime.
    manager `x` still kills it, and it settles as a failure notification.
 4. Child exit after the conversion → coalesced completion notification fires and
    exactly one `subagent-notify` settlement entry is appended (visible via its entry
-   renderer, absent from model context); `subagent_collect` returns the full result and
-   clears the entry.
+   renderer, absent from model context) next to the terminal `<asyncDir>/status.json`
+   write; `subagent_collect` returns the full result and clears the entry.
 5. `b` on a parallel task, chain step, `/subagents resume` spawn, or
    spawn-time background row → refusal notice.
 6. `b` twice on the same row → "already backgrounded"; `b` on a row whose child

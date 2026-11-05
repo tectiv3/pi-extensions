@@ -2,12 +2,17 @@
  * Settlement notice for background runs, in the format external trackers read.
  *
  * A tracker (Paseo's `pi-subagents` adapter) keeps a background run "working"
- * until it can derive a terminal status. Its durable source is the
- * `subagent-notify` payload in the parent transcript, whose first line carries
- * the outcome and whose body names the async token the spawn tool call reported
- * as `details.asyncDir`. Both halves therefore live here: a wording or token
- * drift silently strands the run as running in those trackers, with no error
- * anywhere.
+ * until it can derive a terminal status. It has two channels for that, and both
+ * key on the async token this module builds:
+ *
+ * - live: it polls `<token>/status.json` every 250 ms and stops on a terminal
+ *   `state` (written by async-status.ts at spawn and at settlement).
+ * - durable: it reads this module's `subagent-notify` payload from the parent
+ *   transcript, whose first line carries the outcome and whose body names the
+ *   token. That survives a reload; the poller's file does not outlive its run.
+ *
+ * A wording or token drift in either channel silently strands the run as running
+ * in those trackers, with no error anywhere.
  *
  * The notice is a session entry (`pi.appendEntry`), not a message. The host
  * turns every custom message into a user-role LLM message on the following
@@ -64,7 +69,9 @@ const OUTCOME_LABEL: Record<TerminalRunStatus, string> = {
  * Correlation token reported as the spawn call's `details.asyncDir` and echoed in
  * the notice. Trackers key on the exact string, so it must be derivable from the
  * run id alone: replay rebuilds both sides from the transcript, long after any
- * live state is gone. Nothing is written at this path.
+ * live state is gone. It is a real directory holding `status.json` (see
+ * async-status.ts), one of the two settlement channels; the notice below is the
+ * other, for trackers that read the transcript rather than poll.
  */
 export function asyncRunToken(subagentsDir: string, subagentId: string): string {
     return path.join(subagentsDir, `${subagentId}.async`)

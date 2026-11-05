@@ -56,6 +56,7 @@ import {
     type TerminalNoticeSink,
     type TerminalRunStatus,
 } from './async-notice.ts'
+import { RUN_STATE_BY_OUTCOME, sweepExpiredAsyncDirs, writeRunStatus } from './async-status.ts'
 import { spawnChild } from './child-env.ts'
 import {
     advanceSessionEpoch,
@@ -105,6 +106,10 @@ const SUBAGENT_TOOL_NAMES = [
 // before reporting failure (covers pre-spawn exits inside runSingleAgent).
 const RESUME_DEFAULT_INSTRUCTION = 'Continue from where you stopped.'
 const RESUME_SPAWN_TIMEOUT_MS = 15_000
+
+// Retention sweep for settled run directories: one shot per extension load,
+// delayed so the sweep never competes with the spawns of the first minute.
+const ASYNC_RETENTION_SWEEP_DELAY_MS = 60_000
 
 // Footer status line: refresh cadence (same as the stall check) and cap on
 // per-agent segments before extras collapse to "+N".
@@ -529,21 +534,100 @@ function backgroundRunAsyncToken(subagentId: string): string {
     return asyncRunToken(getSubagentsDir(), subagentId)
 }
 
+// Spawn time per background run, so the terminal payload repeats the value the
+// spawn payload reported. The ActiveSubagent entry cannot serve here: the child's
+// close handler unregisters it before finalizeExit writes the settlement.
+const backgroundRunStartedAt = new Map<string, number>()
+
+// Only a session file that exists now: trackers register a step's file once and
+// follow it from there, so naming a path the child has not created yet buys a
+// follower that never sees the transcript.
+function existingSessionFile(subagentId: string): string | undefined {
+    const { session } = getSubagentFilePaths(subagentId)
+    try {
+        return fs.existsSync(session) ? session : undefined
+    } catch {
+        return undefined
+    }
+}
+
+// Live channel of the settlement contract (see async-status.ts): a tracker polls
+// `<asyncDir>/status.json` from the moment it reads `details.asyncDir` and keeps
+// the run "working" until it sees a terminal state, so the spawn payload has to
+// land before the tool result returns. Best-effort by construction — the write
+// never throws, and it is not on any awaited path.
+function writeRunStatusStart(subagentId: string, agent: string, startedAt: number): void {
+    backgroundRunStartedAt.set(subagentId, startedAt)
+    const sessionFile = existingSessionFile(subagentId)
+    writeRunStatus(backgroundRunAsyncToken(subagentId), {
+        runId: subagentId,
+        mode: 'single',
+        state: 'running',
+        startedAt,
+        lastUpdate: Date.now(),
+        steps: [{ agent, status: 'running', ...(sessionFile ? { sessionFile } : {}) }],
+    })
+}
+
 // One terminal notice per settled background run, whatever ended it (exit,
-// error, abort). Epoch-guarded like the settlement sink: a run from a torn-down
-// session must not write into its replacement's transcript.
-function emitBackgroundSettlement(
+// error, abort). The two channels are split on the epoch on purpose: the entry is
+// session-scoped (a run from a torn-down session must not write into its
+// replacement's transcript), the status file is run-scoped — it names a directory
+// on disk and touches no transcript, so it has to land even for a stale epoch.
+// Suppressing it there left the directory `running` forever: the retention sweep
+// only deletes terminal runs, so every quit with a background run in flight leaked
+// one directory and its trackers never settled.
+export function emitBackgroundSettlement(
     id: string,
     agent: string,
     status: TerminalRunStatus,
     runEpoch: number
 ): void {
-    if (!isCurrentSessionRun(runEpoch)) return
-    const pi = latestPi
-    emitTerminalNotice(
-        pi && entryOnlySink(pi),
-        buildTerminalNotice({ agent, status, asyncToken: backgroundRunAsyncToken(id) })
-    )
+    if (isCurrentSessionRun(runEpoch)) {
+        const pi = latestPi
+        emitTerminalNotice(
+            pi && entryOnlySink(pi),
+            buildTerminalNotice({ agent, status, asyncToken: backgroundRunAsyncToken(id) })
+        )
+    }
+    // Poller channel: the poller knows only the async directory and has no
+    // transcript to read, so this write is what actually settles a live row. The
+    // entry stays the durable replay channel.
+    const endedAt = Date.now()
+    // Falls back to endedAt for a run this process never recorded a spawn time
+    // for; the payload must never report startedAt > endedAt.
+    const startedAt = backgroundRunStartedAt.get(id) ?? endedAt
+    backgroundRunStartedAt.delete(id)
+    const state = RUN_STATE_BY_OUTCOME[status]
+    // A successful run's transcript is deleted in finalizeExit, immediately after
+    // this call, so advertising its path would point trackers at nothing.
+    const sessionFile = status === 'succeeded' ? undefined : existingSessionFile(id)
+    writeRunStatus(backgroundRunAsyncToken(id), {
+        runId: id,
+        mode: 'single',
+        state,
+        startedAt,
+        endedAt,
+        lastUpdate: endedAt,
+        steps: [{ agent, status: state, ...(sessionFile ? { sessionFile } : {}) }],
+    })
+}
+
+// One shot per extension load. Retention is housekeeping for directories nothing
+// in this process references any more, so a single delayed pass is enough; the
+// timer must not keep the process alive.
+let asyncRetentionSweepScheduled = false
+function scheduleAsyncRetentionSweep(): void {
+    if (asyncRetentionSweepScheduled) return
+    asyncRetentionSweepScheduled = true
+    const timer = setTimeout(() => {
+        sweepExpiredAsyncDirs(getSubagentsDir(), {
+            // Read at sweep time: a run registered after the timer was armed is
+            // still live and must not be swept.
+            protectedRunIds: new Set(activeSubagents.keys()),
+        })
+    }, ASYNC_RETENTION_SWEEP_DELAY_MS)
+    timer.unref()
 }
 
 // Narrowed on purpose: the notice goes to the session as an off-context entry,
@@ -3638,6 +3722,7 @@ const SubagentSteerParams = Type.Object({
 export default function (pi: ExtensionAPI) {
     eventBus = pi.events
     latestPi = pi
+    scheduleAsyncRetentionSweep()
     if (entryRendererPi !== pi) {
         // Text wraps the lines to the terminal width: the main screen throws on
         // an over-wide line from a custom entry renderer.
@@ -3673,6 +3758,10 @@ export default function (pi: ExtensionAPI) {
         } catch {
             // In-memory only; the reload drops it regardless.
         }
+        // Killed children still settle: the terminal status write is not
+        // epoch-guarded, and each settlement consumes its own spawn time, so this
+        // map needs no reset here — dropping it would cost the shutdown-path
+        // payload its real startedAt.
         for (const entry of activeSubagents.values()) {
             // Same kill path as an explicit abort, so a child stuck in a tool call is
             // still escalated to SIGKILL while the (surviving) parent process lives.
@@ -3978,6 +4067,10 @@ export default function (pi: ExtensionAPI) {
                     clearTimeout(timer)
                     if (spawn.kind === 'spawned') {
                         const entry = spawn.entry
+                        // Before the result returns: the tracker starts polling as
+                        // soon as it has details.asyncDir, and a missing file is a
+                        // silent "keep running" there.
+                        writeRunStatusStart(entry.id, params.agent, entry.startedAt)
                         return {
                             content: [
                                 {
@@ -4068,6 +4161,14 @@ export default function (pi: ExtensionAPI) {
                     params.model
                 )
                 if (result.runtimeBackgrounded) {
+                    // Same contract as a spawn-time background run, but the run
+                    // started foreground: the tracker only learns the async
+                    // directory now, so the spawn payload is written here.
+                    writeRunStatusStart(
+                        result.subagentId,
+                        params.agent,
+                        activeSubagents.get(result.subagentId)?.startedAt ?? Date.now()
+                    )
                     return {
                         content: [
                             {

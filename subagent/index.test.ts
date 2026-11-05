@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import {
+    existsSync,
     mkdirSync,
     mkdtempSync,
     readdirSync,
@@ -28,7 +29,18 @@ const HOST_STUB = `
 export const CONFIG_DIR_NAME = '.pi'
 export const getAgentDir = () => process.env.PI_CODING_AGENT_DIR ?? '/nonexistent-pi-agent-dir'
 export const getMarkdownTheme = () => ({})
-export const parseFrontmatter = () => ({ frontmatter: {}, body: '' })
+export const parseFrontmatter = text => {
+    const match = /^---\\r?\\n([\\s\\S]*?)\\r?\\n---\\r?\\n?([\\s\\S]*)$/.exec(text)
+    if (!match) return { frontmatter: {}, body: text }
+    const frontmatter = {}
+    for (const line of match[1].split(/\\r?\\n/)) {
+        const colon = line.indexOf(':')
+        if (colon === -1) continue
+        const key = line.slice(0, colon).trim()
+        if (key) frontmatter[key] = line.slice(colon + 1).trim()
+    }
+    return { frontmatter, body: match[2] }
+}
 export const withFileMutationQueue = (_path, fn) => fn()
 export const StringEnum = values => ({ type: 'string', enum: values })
 export const uuidv7 = () => 'stub0000-0000-4000-8000-000000000000'
@@ -354,4 +366,187 @@ test('a live-epoch settlement writes both channels', async t => {
     assert.equal(appended[0].customType, 'subagent-notify')
     assert.match(String((appended[0].data as { content: string }).content), /stopped/)
     assert.equal(readStatus(agentDir, STALE_RUN_ID).state, 'stopped')
+})
+
+function existsFile(target: string): boolean {
+    try {
+        return existsSync(target)
+    } catch {
+        return false
+    }
+}
+
+async function waitFor<T>(read: () => T | undefined, what: string): Promise<T> {
+    const deadline = Date.now() + 10_000
+    for (;;) {
+        const value = read()
+        if (value !== undefined) return value
+        if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`)
+        await new Promise(resolve => setTimeout(resolve, 25))
+    }
+}
+
+function seedAgent(agentDir: string, name = 'worker'): void {
+    const dir = join(agentDir, 'agents')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(
+        join(dir, `${name}.md`),
+        `---\nname: ${name}\ndescription: test agent\n---\nSystem prompt.\n`
+    )
+}
+
+// The real child would be a pi process. This stand-in records the `--session`
+// path it was spawned with, optionally waits for a release file, then writes that
+// session file and exits cleanly. The wait lets a test observe the spawn payload
+// before the child creates the transcript, which is the point of advertising a
+// deterministic path.
+const FAKE_PI_SOURCE = `
+import { existsSync, writeFileSync } from 'node:fs'
+import { setTimeout as sleep } from 'node:timers/promises'
+const args = process.argv.slice(2)
+const sessionIndex = args.indexOf('--session')
+if (sessionIndex !== -1) {
+    const session = args[sessionIndex + 1]
+    writeFileSync(process.env.FAKE_PI_LOG, session + '\\n')
+    if (process.env.FAKE_PI_WAIT) {
+        const deadline = Date.now() + 5000
+        while (!existsSync(process.env.FAKE_PI_WAIT) && Date.now() < deadline) {
+            await sleep(10)
+        }
+    }
+    writeFileSync(session, JSON.stringify({ type: 'session', id: 'fake-session' }) + '\\n')
+}
+process.exit(0)
+`
+
+interface FakePi {
+    /** Records the `--session` path the child was spawned with. */
+    spawnLog: string
+    /** Lets a waiting child write its transcript and exit. */
+    release: () => void
+}
+
+/** Points getPiInvocation at the stand-in. */
+function useFakePi(
+    t: TestContext,
+    agentDir: string,
+    opts: { waitForRelease?: boolean } = {}
+): FakePi {
+    const script = join(agentDir, 'fake-pi.mjs')
+    const spawnLog = join(agentDir, 'spawn-session.log')
+    const waitPath = join(agentDir, 'fake-pi-go')
+    writeFileSync(script, FAKE_PI_SOURCE)
+    const previousArgv1 = process.argv[1]
+    const previousLog = process.env.FAKE_PI_LOG
+    const previousWait = process.env.FAKE_PI_WAIT
+    process.argv[1] = script
+    process.env.FAKE_PI_LOG = spawnLog
+    if (opts.waitForRelease) process.env.FAKE_PI_WAIT = waitPath
+    else delete process.env.FAKE_PI_WAIT
+    const release = () => {
+        try {
+            writeFileSync(waitPath, 'go')
+        } catch {
+            // The temp dir's cleanup may already have run; the child's own
+            // deadline then ends the wait.
+        }
+    }
+    t.after(() => {
+        // Never leave a waiting child behind when an assertion failed first.
+        release()
+        process.argv[1] = previousArgv1
+        if (previousLog === undefined) delete process.env.FAKE_PI_LOG
+        else process.env.FAKE_PI_LOG = previousLog
+        if (previousWait === undefined) delete process.env.FAKE_PI_WAIT
+        else process.env.FAKE_PI_WAIT = previousWait
+    })
+    return { spawnLog, release }
+}
+
+function spawnedSession(log: string): string | undefined {
+    if (!existsFile(log)) return undefined
+    const value = readFileSync(log, 'utf-8').trim()
+    return value.length > 0 ? value : undefined
+}
+
+function terminalStatus(asyncDir: string): Record<string, any> | undefined {
+    try {
+        const payload = JSON.parse(readFileSync(join(asyncDir, ASYNC_STATUS_FILE), 'utf-8'))
+        return payload.state === 'running' ? undefined : payload
+    } catch {
+        return undefined
+    }
+}
+
+test('a background spawn writes its transcript inside the run directory and keeps it on success', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(agentDir)
+    const fake = useFakePi(t, agentDir, { waitForRelease: true })
+    const { subagent } = await loadDispatch()
+
+    const result = await subagent.execute(
+        'tool-call-1',
+        { agent: 'worker', task: 'do it' },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+    const details = result.details as { asyncId?: string; asyncDir?: string }
+    assert.ok(details.asyncId, 'the spawn reported an async id')
+    assert.ok(details.asyncDir, 'the spawn reported an async dir')
+
+    const asyncDir = details.asyncDir
+    const transcript = join(asyncDir, 'transcript.jsonl')
+    assert.equal(transcript.startsWith(asyncDir), true)
+
+    // The first poll already names the transcript, before the child has created
+    // it: the tracker retries a missing file, so waiting for an existsSync gate
+    // would only lose the live half of the run.
+    const spawnPayload = readStatus(agentDir, details.asyncId)
+    assert.equal(spawnPayload.state, 'running')
+    assert.equal(spawnPayload.steps[0].sessionFile, transcript)
+    assert.equal(existsFile(transcript), false)
+
+    // `--session` and the status step name the same file, so a tracker that
+    // registers the step follows the transcript the child actually writes.
+    assert.equal(
+        await waitFor(() => spawnedSession(fake.spawnLog), 'the child spawn'),
+        transcript
+    )
+    fake.release()
+    const payload = await waitFor(() => terminalStatus(asyncDir), 'the terminal status')
+    assert.equal(payload.state, 'complete')
+    assert.equal(payload.steps[0].sessionFile, transcript)
+
+    // Success cleanup: retention owns the transcript, the meta-driven list is not
+    // left pointing at nothing.
+    assert.equal(existsFile(transcript), true)
+    assert.equal(existsFile(join(agentDir, 'subagents', `${details.asyncId}.meta`)), false)
+})
+
+test('a foreground spawn keeps the legacy path and deletes transcript and meta on success', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(agentDir)
+    const fake = useFakePi(t, agentDir)
+    const { subagent } = await loadDispatch()
+
+    const result = await subagent.execute(
+        'tool-call-1',
+        { agent: 'worker', task: 'do it', background: false },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+    const details = result.details as {
+        asyncId?: string
+        results: Array<{ subagentId: string }>
+    }
+    assert.equal(details.asyncId, undefined, 'a foreground run has no async dir')
+    const id = details.results[0].subagentId
+    const legacy = join(agentDir, 'subagents', `${id}.jsonl`)
+
+    assert.equal(await waitFor(() => spawnedSession(fake.spawnLog), 'the child spawn'), legacy)
+    assert.equal(existsFile(legacy), false)
+    assert.equal(existsFile(join(agentDir, 'subagents', `${id}.meta`)), false)
+    assert.equal(existsFile(join(agentDir, 'subagents', `${id}.async`)), false)
 })

@@ -22,9 +22,9 @@
  * SUBAGENT_NOTIFY_CUSTOM_TYPE (see createTerminalNoticeRenderer).
  */
 
-import * as path from 'node:path'
 import type { Component } from '@earendil-works/pi-tui'
 import type { CustomEntry, EntryRenderer, Theme } from '@earendil-works/pi-coding-agent'
+import { asyncRunDir } from './async-status.ts'
 
 export const SUBAGENT_NOTIFY_CUSTOM_TYPE = 'subagent-notify'
 
@@ -74,7 +74,7 @@ const OUTCOME_LABEL: Record<TerminalRunStatus, string> = {
  * other, for trackers that read the transcript rather than poll.
  */
 export function asyncRunToken(subagentsDir: string, subagentId: string): string {
-    return path.join(subagentsDir, `${subagentId}.async`)
+    return asyncRunDir(subagentsDir, subagentId)
 }
 
 export function buildTerminalNotice(input: TerminalNoticeInput): SubagentTerminalNotice {

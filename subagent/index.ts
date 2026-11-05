@@ -56,7 +56,16 @@ import {
     type TerminalNoticeSink,
     type TerminalRunStatus,
 } from './async-notice.ts'
-import { RUN_STATE_BY_OUTCOME, sweepExpiredAsyncDirs, writeRunStatus } from './async-status.ts'
+import {
+    asyncRunDir,
+    asyncRunTranscriptPath,
+    findRunTranscriptPath,
+    legacyRunTranscriptPath,
+    resolveRunTranscriptPath,
+    RUN_STATE_BY_OUTCOME,
+    sweepExpiredAsyncDirs,
+    writeRunStatus,
+} from './async-status.ts'
 import { spawnChild } from './child-env.ts'
 import {
     advanceSessionEpoch,
@@ -539,17 +548,12 @@ function backgroundRunAsyncToken(subagentId: string): string {
 // close handler unregisters it before finalizeExit writes the settlement.
 const backgroundRunStartedAt = new Map<string, number>()
 
-// Only a session file that exists now: trackers register a step's file once and
-// follow it from there, so naming a path the child has not created yet buys a
-// follower that never sees the transcript.
-function existingSessionFile(subagentId: string): string | undefined {
-    const { session } = getSubagentFilePaths(subagentId)
-    try {
-        return fs.existsSync(session) ? session : undefined
-    } catch {
-        return undefined
-    }
-}
+// The transcript a spawn-time background child was actually given. A run in
+// this map advertises it without an existsSync gate; when the path is the
+// retention-directory transcript, success cleanup keeps it. A foreground run
+// (including one the user backgrounds mid-flight) never enters: its legacy
+// `<id>.jsonl` sits outside the run directory, so it advertises no `sessionFile`.
+const backgroundRunSessionFiles = new Map<string, string>()
 
 // Live channel of the settlement contract (see async-status.ts): a tracker polls
 // `<asyncDir>/status.json` from the moment it reads `details.asyncDir` and keeps
@@ -558,7 +562,11 @@ function existingSessionFile(subagentId: string): string | undefined {
 // never throws, and it is not on any awaited path.
 function writeRunStatusStart(subagentId: string, agent: string, startedAt: number): void {
     backgroundRunStartedAt.set(subagentId, startedAt)
-    const sessionFile = existingSessionFile(subagentId)
+    // The tracker retries a missing file indefinitely (offset 0, 250 ms ticks), so
+    // a spawn-time background run advertises its deterministic transcript before
+    // the child has created it. A runtime-backgrounded run has no entry here and
+    // stays silent rather than naming a legacy path that will not be tailed.
+    const sessionFile = backgroundRunSessionFiles.get(subagentId)
     writeRunStatus(backgroundRunAsyncToken(subagentId), {
         runId: subagentId,
         mode: 'single',
@@ -599,9 +607,15 @@ export function emitBackgroundSettlement(
     const startedAt = backgroundRunStartedAt.get(id) ?? endedAt
     backgroundRunStartedAt.delete(id)
     const state = RUN_STATE_BY_OUTCOME[status]
-    // A successful run's transcript is deleted in finalizeExit, immediately after
-    // this call, so advertising its path would point trackers at nothing.
-    const sessionFile = status === 'succeeded' ? undefined : existingSessionFile(id)
+    const spawnedSessionFile = backgroundRunSessionFiles.get(id)
+    // Retention keeps a spawn-time background transcript on success, so the path
+    // stays real. A runtime-backgrounded run is absent from the map; a legacy
+    // transcript outside the run directory is deleted on success below. Neither is
+    // advertised.
+    const retained =
+        spawnedSessionFile !== undefined &&
+        spawnedSessionFile === asyncRunTranscriptPath(getSubagentsDir(), id)
+    const sessionFile = status === 'succeeded' && !retained ? undefined : spawnedSessionFile
     writeRunStatus(backgroundRunAsyncToken(id), {
         runId: id,
         mode: 'single',
@@ -611,6 +625,7 @@ export function emitBackgroundSettlement(
         lastUpdate: endedAt,
         steps: [{ agent, status: state, ...(sessionFile ? { sessionFile } : {}) }],
     })
+    backgroundRunSessionFiles.delete(id)
 }
 
 // One shot per extension load. Retention is housekeeping for directories nothing
@@ -1091,14 +1106,22 @@ function getSubagentsDir(): string {
 }
 
 function getSubagentFilePaths(subagentId: string): {
+    /** The transcript this run actually wrote (retention dir first, else legacy). */
     session: string
+    /** Deterministic path a fresh background run is spawned with. */
+    sessionAsync: string
+    /** The run directory retention owns; absent for foreground-only runs. */
+    asyncDir: string
     pid: string
     meta: string
 } {
+    const subagentsDir = getSubagentsDir()
     return {
-        session: path.join(getSubagentsDir(), `${subagentId}.jsonl`),
-        pid: path.join(getSubagentsDir(), `${subagentId}.pid`),
-        meta: path.join(getSubagentsDir(), `${subagentId}.meta`),
+        session: resolveRunTranscriptPath(subagentsDir, subagentId),
+        sessionAsync: asyncRunTranscriptPath(subagentsDir, subagentId),
+        asyncDir: asyncRunDir(subagentsDir, subagentId),
+        pid: path.join(subagentsDir, `${subagentId}.pid`),
+        meta: path.join(subagentsDir, `${subagentId}.meta`),
     }
 }
 
@@ -1159,6 +1182,18 @@ function removeSubagentFile(filePath: string): void {
         // A failed rm leaves a stale .pid guard, an orphaned .jsonl, or a phantom .meta entry.
         subagentDebugLog(
             `[subagent] rm failed (${filePath}): ${err instanceof Error ? err.message : String(err)}`
+        )
+    }
+}
+
+// Only an explicit delete removes a run directory; the retention sweep owns the
+// terminal-run case and the two paths must not race each other.
+function removeSubagentDir(dirPath: string): void {
+    try {
+        fs.rmSync(dirPath, { recursive: true, force: true })
+    } catch (err) {
+        subagentDebugLog(
+            `[subagent] rmdir failed (${dirPath}): ${err instanceof Error ? err.message : String(err)}`
         )
     }
 }
@@ -1937,9 +1972,10 @@ function readSubagentPid(pidPath: string): number | undefined {
 }
 
 // Manager-view delete (§11): remove a persisted run's artifacts
-// (.jsonl/.meta/.pid). Refuses ids owned by a live child — this session's
-// registry or another session's live pidfile — and returns the refusal
-// reason; undefined means the artifacts were removed.
+// (.jsonl/.meta/.pid and the retention-managed run directory with its
+// transcript). Refuses ids owned by a live child — this session's registry or
+// another session's live pidfile — and returns the refusal reason; undefined
+// means the artifacts were removed.
 //
 // Not atomic: a concurrent session could resume this id between the
 // isProcessAlive check and the file removal, orphaning the child.
@@ -1950,7 +1986,7 @@ function deletePersistedRunArtifacts(subagentId: string): string | undefined {
     if (activeSubagents.has(subagentId)) {
         return `Refused: ${shortSubagentId(subagentId)} is running in this session — abort it first.`
     }
-    const { session, pid, meta } = getSubagentFilePaths(subagentId)
+    const { session, pid, meta, asyncDir } = getSubagentFilePaths(subagentId)
     const livePid = readSubagentPid(pid)
     if (livePid !== undefined && isProcessAlive(livePid)) {
         return `Refused: pid ${livePid} is live — another session's child owns this run.`
@@ -1958,6 +1994,7 @@ function deletePersistedRunArtifacts(subagentId: string): string | undefined {
     removeSubagentFile(session)
     removeSubagentFile(pid)
     removeSubagentFile(meta)
+    removeSubagentDir(asyncDir)
     return undefined
 }
 
@@ -2198,10 +2235,19 @@ async function runSingleAgent(
     const resolvedCwd = cwd ?? defaultCwd
     const runEpoch = currentSessionEpoch()
     const {
-        session: sessionPath,
+        sessionAsync: sessionAsyncPath,
         pid: pidPath,
         meta: metaPath,
     } = getSubagentFilePaths(subagentId)
+    // A fresh background run writes inside the directory retention owns from its
+    // first byte. A resume continues the transcript the original run actually
+    // wrote, which the resolver finds — including the legacy `<id>.jsonl` of a
+    // run that was foreground-spawned and only backgrounded later.
+    const sessionPath =
+        (resume ? findRunTranscriptPath(getSubagentsDir(), subagentId) : undefined) ??
+        (background
+            ? sessionAsyncPath
+            : legacyRunTranscriptPath(getSubagentsDir(), subagentId))
     const agent = agents.find(a => a.name === agentName)
 
     if (!agent) {
@@ -2351,6 +2397,21 @@ async function runSingleAgent(
         let wasAborted = false
 
         ensureSubagentsDir()
+        if (background) {
+            // Must exist before the child can write its transcript, and before the
+            // spawn payload advertises it to a tracker. A mkdir failure surfaces as
+            // a failed run, not as a crash of the parent's delegation.
+            const runDir = path.dirname(sessionAsyncPath)
+            try {
+                fs.mkdirSync(runDir, { recursive: true, mode: SUBAGENTS_DIR_MODE })
+            } catch (err) {
+                subagentDebugLog(
+                    `[subagent] async run dir setup failed (${runDir}): ${
+                        err instanceof Error ? err.message : String(err)
+                    }`
+                )
+            }
+        }
         const spawnMeta: SubagentMeta = {
             agent: agentName,
             task,
@@ -2382,6 +2443,9 @@ async function runSingleAgent(
 
         // Counted outside the exit promise: the settle log reports the suppressed total.
         let frameParseFailures = 0
+        // The spawn payload (written once the spawn bridge resolves) and the
+        // settlement read this: the transcript path this child was actually given.
+        if (background) backgroundRunSessionFiles.set(subagentId, sessionPath)
         const exitCodePromise = new Promise<number>(resolve => {
             const invocation = getPiInvocation(args)
             debug(`spawn: ${invocation.command} ${invocation.args.join(' ')}`)
@@ -2948,6 +3012,13 @@ async function runSingleAgent(
                 : isFailedResult(currentResult)
                   ? 'failed'
                   : 'succeeded'
+            // Retention owns a transcript only when this run was spawned as
+            // background AND the child was given the path inside the run directory.
+            // A foreground run — including one the user backgrounded mid-flight,
+            // whose child already has `<id>.jsonl` open — keeps today's success
+            // cleanup. The distinction is explicit here rather than hidden in the
+            // path resolver.
+            const retentionOwnsTranscript = background && sessionPath === sessionAsyncPath
             // Before the cleanup below, deliberately: the notice is the only
             // terminal marker external trackers persist, so it has to reach the
             // transcript while the run is still the most recent thing in it.
@@ -2956,7 +3027,7 @@ async function runSingleAgent(
             }
             removeSubagentFile(pidPath)
             if (status === 'succeeded') {
-                removeSubagentFile(sessionPath)
+                if (!retentionOwnsTranscript) removeSubagentFile(sessionPath)
                 removeSubagentFile(metaPath)
             } else {
                 writeSubagentMetaFile(metaPath, {
@@ -3464,7 +3535,7 @@ async function openSubagentsManager(ctx: ExtensionContext): Promise<void> {
                 if (refusal) showNotice(refusal, true)
                 else
                     showNotice(
-                        `Deleted ${shortSubagentId(row.id)} artifacts (.jsonl/.meta/.pid).`
+                        `Deleted ${shortSubagentId(row.id)} artifacts (.jsonl/.meta/.pid/run directory).`
                     )
                 return
             }

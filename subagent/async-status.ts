@@ -1,6 +1,10 @@
 /**
  * Machine-readable run status: `<subagentsDir>/<id>.async/status.json`.
  *
+ * The run directory is retention-managed: for a spawn-time background run it also
+ * holds `transcript.jsonl`, the child's pi session file, so the retention sweep
+ * deletes the transcript with the run instead of orphaning it.
+ *
  * This is the live half of the settlement contract. External trackers (Paseo's
  * `pi-subagents` adapter) poll the file every 250 ms and publish the run as
  * working until `state` reads terminal — they have no tool result to fall back
@@ -25,6 +29,8 @@ import * as path from 'node:path'
 
 export const ASYNC_STATUS_FILE = 'status.json'
 export const ASYNC_DIR_SUFFIX = '.async'
+/** The child's pi session file, inside the run directory for background runs. */
+export const ASYNC_TRANSCRIPT_FILE = 'transcript.jsonl'
 /** rename target suffix; a renamed directory is crash residue the sweep reaps. */
 export const ASYNC_DELETING_INFIX = '.deleting-'
 /** What a renamed run directory starts matching after its `.async` suffix. */
@@ -32,6 +38,53 @@ const ASYNC_RESIDUE_MARKER = `${ASYNC_DIR_SUFFIX}${ASYNC_DELETING_INFIX}`
 
 const ASYNC_DIR_MODE = 0o700
 const ASYNC_FILE_MODE = 0o600
+
+/** `<subagentsDir>/<id>.async` — the directory the retention sweep owns. */
+export function asyncRunDir(subagentsDir: string, runId: string): string {
+    return path.join(subagentsDir, `${runId}${ASYNC_DIR_SUFFIX}`)
+}
+
+/** Where a spawn-time background run's child writes its transcript. */
+export function asyncRunTranscriptPath(subagentsDir: string, runId: string): string {
+    return path.join(asyncRunDir(subagentsDir, runId), ASYNC_TRANSCRIPT_FILE)
+}
+
+/** The per-run session file used by foreground, chain, and runtime-backgrounded runs. */
+export function legacyRunTranscriptPath(subagentsDir: string, runId: string): string {
+    return path.join(subagentsDir, `${runId}.jsonl`)
+}
+
+function fileExists(target: string): boolean {
+    try {
+        return fs.existsSync(target)
+    } catch {
+        return false
+    }
+}
+
+/**
+ * The transcript a run actually wrote, for readers that only know its id: the
+ * retention-directory transcript when the child created it, else the legacy
+ * `<id>.jsonl` a foreground or runtime-backgrounded run used. Evidence on disk,
+ * not a mode flag — the writer may be a different process or an earlier session.
+ */
+export function findRunTranscriptPath(
+    subagentsDir: string,
+    runId: string
+): string | undefined {
+    const inRunDir = asyncRunTranscriptPath(subagentsDir, runId)
+    if (fileExists(inRunDir)) return inRunDir
+    const legacy = legacyRunTranscriptPath(subagentsDir, runId)
+    return fileExists(legacy) ? legacy : undefined
+}
+
+/** Resolver spelling for call sites that also use the path to name a file. */
+export function resolveRunTranscriptPath(subagentsDir: string, runId: string): string {
+    return (
+        findRunTranscriptPath(subagentsDir, runId) ??
+        legacyRunTranscriptPath(subagentsDir, runId)
+    )
+}
 
 /** 30 days after the last activity of a terminal run. */
 export const ASYNC_RETENTION_MS = 30 * 24 * 60 * 60 * 1000

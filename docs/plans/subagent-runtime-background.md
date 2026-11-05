@@ -30,6 +30,14 @@ semantics this feature reuses at runtime.
     the terminal `<asyncDir>/status.json` payload `finalizeExit` persists before
     cleanup — the entry for transcript replay, the file for a poller), and
     `subagent_collect` delivers the result.
+  The child's transcript lives in the same run directory: a spawn-time background
+  run is spawned with `--session <asyncDir>/transcript.jsonl`, so the status
+  payload can advertise `steps[].sessionFile` from the first poll, a tracker can
+  tail it live, and the 30-day sweep deletes it with the run. Success keeps the
+  transcript and removes only `.meta`/`.pid`.
+  Runtime backgrounding cannot move a file the child already has open: such a run
+  keeps `<id>.jsonl`, and both status payloads omit `sessionFile` instead of
+  naming a path no tracker followed.
 - **Eligibility: foreground single-mode tool-call runs only**, including
   foreground `resume` runs (same dispatch call site). NOT parallel tasks, NOT
   chain steps, NOT `/subagents resume` handler spawns (no awaiting tool call),
@@ -42,6 +50,16 @@ semantics this feature reuses at runtime.
 
 ## 2. Invariants
 
+- **Transcript placement.** A spawn-time background child is spawned with
+  `--session <asyncDir>/transcript.jsonl`; the run directory is created before the
+  spawn, and retention deletes the transcript with the directory. A successful
+  background exit keeps the transcript and removes only `.meta`/`.pid`. Readers
+  resolve the transcript from the id: `<asyncDir>/transcript.jsonl` when it exists,
+  else `<id>.jsonl`.
+- **Runtime-backgrounded transcripts stay legacy.** A foreground run has already
+  been spawned with `--session <id>.jsonl` when `b` converts it; that file stays
+  where it is and is never advertised as `sessionFile` (the tracker only ever
+  followed the path from the first mapping).
 - **Exit wins ties.** `runSingleAgent` awaits
   `Promise.race([exitCodePromise.then(…), backgroundizePromise.then(…)])` with
   the exit term FIRST in the array: when both promises are already settled,

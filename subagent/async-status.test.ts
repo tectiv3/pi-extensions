@@ -8,6 +8,11 @@ import {
     ASYNC_DIR_SUFFIX,
     ASYNC_RETENTION_MS,
     ASYNC_STATUS_FILE,
+    ASYNC_TRANSCRIPT_FILE,
+    asyncRunDir,
+    asyncRunTranscriptPath,
+    legacyRunTranscriptPath,
+    resolveRunTranscriptPath,
     RUN_STATE_BY_OUTCOME,
     type RunStatusPayload,
     type RunStatusState,
@@ -324,3 +329,65 @@ test(
 test('the default retention window is 30 days', () => {
     assert.equal(ASYNC_RETENTION_MS, 30 * DAY)
 })
+
+test(
+    'the transcript resolver prefers the run directory and falls back to the legacy file',
+    withDir(async dir => {
+        const legacy = legacyRunTranscriptPath(dir, RUN_ID)
+        const inRunDir = asyncRunTranscriptPath(dir, RUN_ID)
+
+        // Neither exists: callers still need a path to name (size, cleanup).
+        assert.equal(resolveRunTranscriptPath(dir, RUN_ID), legacy)
+
+        await writeFile(legacy, 'x')
+        assert.equal(resolveRunTranscriptPath(dir, RUN_ID), legacy)
+
+        // A runtime-backgrounded run has the run directory (status.json) but no
+        // transcript in it; the legacy file it was spawned with wins.
+        await mkdir(asyncRunDir(dir, RUN_ID), { recursive: true })
+        assert.equal(resolveRunTranscriptPath(dir, RUN_ID), legacy)
+
+        await writeFile(inRunDir, 'x')
+        assert.equal(resolveRunTranscriptPath(dir, RUN_ID), inRunDir)
+    })
+)
+
+test(
+    'sweep deletes a terminal run directory together with its transcript',
+    withDir(async dir => {
+        const runDir = createRun(dir, RUN_ID, 'complete', NOW - 40 * DAY, {
+            backdateFiles: false,
+        })
+        const transcript = path.join(runDir, ASYNC_TRANSCRIPT_FILE)
+        await writeFile(transcript, '{"type":"session","id":"x"}\n')
+        backdate(transcript, NOW - 40 * DAY)
+        backdate(path.join(runDir, ASYNC_STATUS_FILE), NOW - 40 * DAY)
+        backdate(runDir, NOW - 40 * DAY)
+
+        assert.deepEqual(sweepExpiredAsyncDirs(dir, { now: NOW }), {
+            scanned: 1,
+            deleted: 1,
+            kept: 0,
+            reaped: 0,
+        })
+        assert.equal(await exists(transcript), false)
+        assert.equal(await exists(runDir), false)
+    })
+)
+
+test(
+    'a running run keeps its transcript however old the directory is',
+    withDir(async dir => {
+        const runDir = createRun(dir, RUN_ID, 'running', NOW - 400 * DAY, {
+            backdateFiles: false,
+        })
+        const transcript = path.join(runDir, ASYNC_TRANSCRIPT_FILE)
+        await writeFile(transcript, '{"type":"session","id":"x"}\n')
+        backdate(transcript, NOW - 400 * DAY)
+        backdate(path.join(runDir, ASYNC_STATUS_FILE), NOW - 400 * DAY)
+        backdate(runDir, NOW - 400 * DAY)
+
+        assert.equal(sweepExpiredAsyncDirs(dir, { now: NOW }).kept, 1)
+        assert.equal(await exists(transcript), true)
+    })
+)

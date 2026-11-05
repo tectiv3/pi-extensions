@@ -160,22 +160,35 @@ later, when a request is made.
 
 ## Persistence & Resume
 
-Every invocation (single task or chain step) gets a UUIDv7 subagent id and
-runs with `--session ~/.pi/agent/subagents/<id>.jsonl`, so the child's transcript survives
-the parent process.
+Every invocation (single task or chain step) gets a UUIDv7 subagent id. A spawn-time
+background run is spawned with
+`--session ~/.pi/agent/subagents/<id>.async/transcript.jsonl`, inside its
+retention-managed run directory, which exists before the child starts writing.
+Foreground and chain runs use `--session ~/.pi/agent/subagents/<id>.jsonl`; a run the user
+sends to the background mid-flight keeps that same legacy path, because its child already
+has the file open.
 
 **Artifacts** — in `~/.pi/agent/subagents/`, created with directory mode `0700` (session
 files contain full tool output, potentially secrets):
 
 | File | Contents |
 |------|----------|
-| `<id>.jsonl` | pi session file, written by the child |
+| `<id>.jsonl` | pi session file for foreground and chain runs, and for runs runtime-backgrounded mid-flight |
+| `<id>.async/transcript.jsonl` | pi session file for spawn-time background runs; lives in the retention-managed directory |
+| `<id>.async/status.json` | tracker payload written at spawn and settlement (see [Async settlement notice](#async-settlement-notice)) |
 | `<id>.meta` | JSON sidecar (mode `0600`): agent, task, model, thinking level, startedAt, sha256 `promptHash` of the agent system prompt, and the spawning `subagent` tool call id (absent for non-tool spawns such as `/subagents resume`); updated on close with status, stopReason, exitCode, and the session header id |
 | `<id>.pid` | Child pid, present while the child is running |
 
-- **Retention**: a clean success deletes all three files — the output already lives in the
-  parent's tool result. Aborted/failed/killed runs persist until resumed to completion or
-  manually deleted (`rm ~/.pi/agent/subagents/<id>.*`; `/subagents` lists what is there).
+Readers resolve a run's transcript from its id: `<id>.async/transcript.jsonl` when it
+exists, else `<id>.jsonl`. No mode flag is threaded through inspect, resume, delete, size
+formatting, or the session-header read.
+
+- **Retention**: a foreground or chain success deletes its transcript and `.meta` — the
+  output already lives in the parent's tool result. A spawn-time background success
+  deletes `.meta` and `.pid` but **keeps** `.async/transcript.jsonl`: the run directory
+  owns it now, and the 30-day retention sweep deletes the directory and transcript
+  together. Aborted/failed/killed runs persist until resumed to completion or manually
+  deleted (`rm -r ~/.pi/agent/subagents/<id>.*`; `/subagents` lists what is there).
 - The directory sits outside the per-project sessions tree, so subagent runs never appear
   in the `/resume` picker.
 - **Recovery granularity**: pi creates the session file only at the child's first
@@ -433,12 +446,18 @@ with no error.
 than read a transcript:
 
 - Written at spawn (`state: "running"`, `startedAt`, one step for the dispatched agent
-  with `agent` + `status: "running"`, plus `sessionFile` once the child's session JSONL
-  exists) and again at settlement (`state`, `endedAt`, `lastUpdate`; step status mirrors
-  the run). Written atomically — temp file plus rename in the same directory — so a
-  poller never reads a half-written payload. The settlement write is not session-scoped:
-  it lands whatever the session epoch, since the directory it names belongs to the run,
-  not to a transcript.
+  with `agent` + `status: "running"`, plus `sessionFile` naming the run's transcript from
+  the first poll) and again at settlement (`state`, `endedAt`, `lastUpdate`; step status
+  mirrors the run). A spawn-time background run's path is deterministic and inside the
+  run directory, so it is advertised before the child creates it: the tracker retries a
+  missing file indefinitely. Written atomically — temp file plus rename in the same
+  directory — so a poller never reads a half-written payload. The settlement write is not
+  session-scoped: it lands whatever the session epoch, since the directory it names
+  belongs to the run, not to a transcript.
+- `sessionFile` is always the transcript the run actually wrote. A run runtime-backgrounded
+  mid-flight is the exception: it keeps the legacy `<id>.jsonl`, which no tracker followed
+  from spawn, so both its spawn and settlement payloads omit `sessionFile` rather than
+  naming a path nothing tails.
 - Shape: `{ runId, mode: "single", state, startedAt, endedAt?, lastUpdate, steps: [{ agent,
   status?, sessionFile? }] }`, epoch milliseconds for the timestamps.
 - `state` is `running | complete | failed | stopped`; the internal outcome maps
@@ -449,10 +468,10 @@ than read a transcript:
   `<agentDir>/subagents/*.async` directories, skips any run still live in this process,
   keeps anything with a missing/unreadable `status.json` or a non-terminal state, and
   deletes a terminal run (`complete | failed | stopped | rejected`) whose newest signal
-  (`endedAt`/`lastUpdate`, then the directory's and the file's mtime) is older than 30
-  days — rename aside, then `rm -r`, with `*.async.deleting-*` crash residue older than
-  an hour reaped on the next pass. `<id>.pid` / `<id>.meta` / `<id>.jsonl` siblings are
-  never touched.
+  (`endedAt`/`lastUpdate`, then the directory's and `status.json`'s mtime) is older
+  than 30 days — rename aside, then `rm -r`, with `*.async.deleting-*` crash
+  residue older than an hour reaped on the next pass. The transcript is deleted with its
+  directory; `<id>.pid` / `<id>.meta` / `<id>.jsonl` siblings are never touched.
 
 The `subagent-notify` entry described above remains the **durable replay channel**, and
 it is what a tracker that started after the run finished has to read: the entry survives
@@ -573,7 +592,9 @@ resume hint:
 - **L3 — recovery is per-`message_end`**: partial output survives only up to the last
   completed message; a run interrupted during its first message persists no transcript
 - **L4 — background results are in-memory**: if the parent exits before `subagent_collect`,
-  the result is lost (a successful run's transcript files are deleted at settlement)
+  the result is lost (a successful foreground run's transcript files are deleted at
+  settlement; a successful background run's transcript stays in its run directory but the
+  result itself is not re-read from it)
 - **L5 — no true detach**: backgrounded runs do not survive the parent process or a session
   replacement (`/new`, `/resume`, `/fork`, `/reload`); live runs are SIGTERM'd on session
   teardown
@@ -594,3 +615,7 @@ resume hint:
 - **L11 — chain items are steerable only while live**: each chain step registers and
   unregisters its own id, so a steer between items finds no child. Chains are foreground-only,
   so the human's `/subagents attach` view is the realistic chain-steering entry point
+- **L12 — a hard kill leaks the run directory**: a SIGKILLed run never writes a terminal
+  `status.json`, so its `running` directory and transcript stay on disk forever and are
+  never swept. The sweep has no orphan reconciliation by design; remove it manually
+  (`rm -r ~/.pi/agent/subagents/<id>.async`)

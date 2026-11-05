@@ -585,13 +585,23 @@ export function emitBackgroundSettlement(
     id: string,
     agent: string,
     status: TerminalRunStatus,
-    runEpoch: number
+    runEpoch: number,
+    // The notification the parent receives. Passed in because it is built from
+    // the run's messages and usage, which this module never sees.
+    notification?: string
 ): void {
     if (isCurrentSessionRun(runEpoch)) {
         const pi = latestPi
         emitTerminalNotice(
             pi && entryOnlySink(pi),
-            buildTerminalNotice({ agent, status, asyncToken: backgroundRunAsyncToken(id) })
+            buildTerminalNotice({
+                agent,
+                status,
+                asyncToken: backgroundRunAsyncToken(id),
+                ...(notification
+                    ? { notification: { shortId: shortSubagentId(id), text: notification } }
+                    : {}),
+            })
         )
     }
     // Poller channel: the poller knows only the async directory and has no
@@ -3010,7 +3020,13 @@ async function runSingleAgent(
             // terminal marker external trackers persist, so it has to reach the
             // transcript while the run is still the most recent thing in it.
             if (backgrounded) {
-                emitBackgroundSettlement(subagentId, currentResult.agent, status, runEpoch)
+                emitBackgroundSettlement(
+                    subagentId,
+                    currentResult.agent,
+                    status,
+                    runEpoch,
+                    buildBackgroundNotification(currentResult)
+                )
             }
             removeSubagentFile(pidPath)
             if (status === 'succeeded') {

@@ -124,6 +124,43 @@ test('cancellation writes a stopped payload the tracker maps to canceled', () =>
     assert.equal(tokenFrom(notice), TOKEN)
 })
 
+test('the parent notification rides along without touching the tracker payload', () => {
+    const notification = {
+        shortId: 'a4b2c11',
+        text:
+            'Background subagent a4b2c11 (scout) finished.\n\nReport body.\n\n' +
+            'Call subagent_collect { id: "a4b2c11" } for the full result.',
+    }
+    const notice = buildTerminalNotice({
+        agent: 'scout',
+        status: 'succeeded',
+        asyncToken: TOKEN,
+        notification,
+    })
+    assert.deepEqual(notice.data.notification, notification)
+    // The tracker payload is untouched: trackers match it verbatim.
+    assert.equal(
+        notice.data.content,
+        `Background task completed: **scout**\n\nRetention-managed async directory: ${TOKEN}`
+    )
+    // Without it the payload is identical to what earlier hosts wrote.
+    assert.equal(
+        'notification' in
+            buildTerminalNotice({ agent: 'scout', status: 'succeeded', asyncToken: TOKEN })
+                .data,
+        false
+    )
+})
+
+test('a malformed notification makes the entry unreadable rather than misleading', () => {
+    const lines = render({
+        ...buildTerminalNotice({ agent: 'scout', status: 'succeeded', asyncToken: TOKEN })
+            .data,
+        notification: { shortId: 42 },
+    })
+    assert.match(lines.join('\n'), /unreadable entry entry-1/)
+})
+
 // Compile-time half of the off-context proof: a sink that gained sendMessage
 // (or any other context-writing member) would flip this to true and fail tsc.
 type SinkWritesContext = 'sendMessage' extends keyof TerminalNoticeSink ? true : false

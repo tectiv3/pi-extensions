@@ -19,7 +19,9 @@
  * turn, while `sessionEntryToContextMessages` returns [] for `type: "custom"` —
  * so an entry is persisted for replay and never reaches the model.
  * Inspectability therefore comes from the renderer registered for
- * SUBAGENT_NOTIFY_CUSTOM_TYPE (see createTerminalNoticeRenderer).
+ * SUBAGENT_NOTIFY_CUSTOM_TYPE (see createTerminalNoticeRenderer), and the
+ * `notification` field carries the parent's own notification so a host can show
+ * the settlement as a row rather than the user-role message that mirrors it.
  */
 
 import type { Component } from '@earendil-works/pi-tui'
@@ -39,6 +41,24 @@ export interface SubagentTerminalNoticeData {
     status: TerminalRunStatus
     asyncToken: string
     content: string
+    /**
+     * What the parent was told, for hosts that render settlement as a row instead
+     * of the mirrored user message. Optional: transcripts written before this
+     * field exist replay without it.
+     */
+    notification?: SubagentNoticeSummary
+}
+
+/**
+ * The parent-facing half of a settlement. `text` is the notification verbatim, so
+ * a host derives the row from the same words the model saw; the call-to-action
+ * lines in it are the host's to drop. `shortId` is the id that notification
+ * names, and the only stable key between the two channels: the tracker text
+ * carries the async directory, which is not the id the parent was shown.
+ */
+export interface SubagentNoticeSummary {
+    shortId: string
+    text: string
 }
 
 export interface SubagentTerminalNotice {
@@ -55,6 +75,7 @@ export interface TerminalNoticeInput {
     agent: string
     status: TerminalRunStatus
     asyncToken: string
+    notification?: SubagentNoticeSummary
 }
 
 // Trackers match `/^(?:Background task|Detached foreground task) (completed|failed|stopped): \*\*/`
@@ -89,6 +110,7 @@ export function buildTerminalNotice(input: TerminalNoticeInput): SubagentTermina
             status: input.status,
             asyncToken: input.asyncToken,
             content,
+            ...(input.notification ? { notification: input.notification } : {}),
         },
     }
 }
@@ -125,8 +147,15 @@ function isNoticeData(value: unknown): value is SubagentTerminalNoticeData {
         typeof data.status === 'string' &&
         STATUSES.has(data.status) &&
         typeof data.asyncToken === 'string' &&
-        typeof data.content === 'string'
+        typeof data.content === 'string' &&
+        (data.notification === undefined || isNoticeSummary(data.notification))
     )
+}
+
+function isNoticeSummary(value: unknown): value is SubagentNoticeSummary {
+    if (typeof value !== 'object' || value === null) return false
+    const summary = value as Partial<SubagentNoticeSummary>
+    return typeof summary.shortId === 'string' && typeof summary.text === 'string'
 }
 
 /**

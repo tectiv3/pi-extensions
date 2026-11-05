@@ -60,10 +60,11 @@ Ctrl+C abort propagation (the parallel mode the example shipped was removed here
 - **Per-subagent abort** — from the manager view.
 - **Question relay** — a subagent's own `ask_user_question` call is relayed to the parent,
   so a child can ask the user questions through the parent's tool.
-- **Background runs** — `background: true` returns immediately and leaves the child running
-  detached from parent Escape; completion is delivered as a coalesced notification
-  (settlements within 100 ms arrive as a single turn) and the full result is fetched with
-  `subagent_collect`.
+- **Background runs** — the default for single-mode calls: `background` omitted (or `true`)
+  returns immediately and leaves the child running detached from parent Escape; completion is
+  delivered as a coalesced notification (settlements within 100 ms arrive as a single turn)
+  and the full result is fetched with `subagent_collect`. `background: false` waits for the
+  result in the current turn.
 - **Running-subagents footer** — the pi footer shows live running subagents
   (`⏳ <n>: <agent> <elapsed>`) while any run is in flight.
 

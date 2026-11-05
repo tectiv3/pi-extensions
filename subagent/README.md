@@ -13,7 +13,7 @@ Delegate tasks to specialized subagents with isolated context windows.
 - **Resume**: Continue a persisted run in the same conversation (`resume: "<id or unique suffix>"`, single mode)
 - **Recoverable abort**: Interrupting the parent returns an error tool result with partial output, not an exception
 - **Steering**: `subagent_steer { id, message }` queues a correction for a running foreground or background run; it is delivered at the child's next turn boundary, never as an interruption (see [Steering a running run](#steering-a-running-run-subagent_steer))
-- **Background runs**: `background: true` returns immediately, leaving the child running; completion is delivered as a notification and fetched with `subagent_collect` (single mode); a running foreground single run can also be converted mid-flight from `/subagents` (`b`)
+- **Background runs (default)**: a single-mode call with `background` omitted or `true` returns immediately, leaving the child running; completion is delivered as a notification and fetched with `subagent_collect`. Pass `background: false` for a foreground run that waits for the result. A running foreground single run can also be converted mid-flight from `/subagents` (`b`)
 - **Running-subagents footer**: the pi footer shows live running subagents (`⏳ <n>: <agent> <id> <elapsed> <turns>t ↓<output>`, elapsed refreshed every 10s, counters per turn)
 
 ## Structure
@@ -92,9 +92,10 @@ Use a chain: first have scout find the read tool, then have planner suggest impr
 
 | Mode | Parameter | Description |
 |------|-----------|-------------|
-| Single | `{ agent, task, resume? }` | One agent, one task; `resume` continues a persisted run |
-| Chain | `{ chain: [...] }` | Sequential with `{previous}` placeholder |
-| Background | `{ agent, task, background: true }` | Returns immediately; result delivered by notification, fetched via subagent_collect (single mode only) |
+| Single | `{ agent, task, resume? }` | One agent, one task; `resume` continues a persisted run. Runs in the background by default |
+| Chain | `{ chain: [...] }` | Sequential with `{previous}` placeholder; always foreground |
+| Foreground single | `{ agent, task, background: false }` | Waits for the result; the tool call blocks until the child settles |
+| Background single | `{ agent, task }` or `background: true` | Returns immediately; result delivered by notification, fetched via subagent_collect |
 
 The extension also registers the `subagent_inspect`, `subagent_collect`, and
 `subagent_steer` tools and the `/subagents` command — see
@@ -284,8 +285,8 @@ What the tool actually guarantees, and nothing beyond it:
   has passed) with a hint to collect the result or resume; a failed stdin write is reported
   as a tool error, never swallowed.
 - **Reachability**: a foreground `subagent` tool call blocks the parent's turn and a chain
-  is foreground-only, so in practice this tool reaches **background** runs (spawned detached
-  or runtime-backgrounded). A foreground run, including a live chain item, is steered by the
+  is foreground-only, so in practice this tool reaches **background** runs (the default, or
+  runtime-backgrounded). A foreground run, including a live chain item, is steered by the
   human through `/subagents attach` — same write, same turn-boundary semantics.
 - The watchdog is unaffected: a steer resets the activity timer, so a queued steer cannot
   cause a silent kill, and it cannot keep a genuinely dead child alive.
@@ -302,8 +303,8 @@ rather than trying to steer a finished run.
 
 Opens the interactive manager view (TUI): RUNNING rows — short id (last 8 characters),
 agent, elapsed time, a `bg` badge on runtime-backgrounded runs — above PERSISTED rows
-(status). Keys on a running row: `Enter/a` attach, `b` background (foreground
-single-mode runs only — see [Runtime backgrounding](#runtime-backgrounding)), `x` abort,
+(status). Keys on a running row: `Enter/a` attach, `b` background (foreground,
+`background: false` single-mode runs only — see [Runtime backgrounding](#runtime-backgrounding)), `x` abort,
 `i` inspect; on a persisted row: `Enter/r` resume, `d` delete, `i` inspect; `Esc/q`
 closes. Print mode keeps the plain text report.
 
@@ -338,12 +339,16 @@ tool calls formatted like the parent TUI, tool output truncated (200 chars). Str
 
 ## Background Runs
 
-`subagent { agent, task, background: true }` spawns a single run detached from the parent
-tool call and returns immediately with the spawn text (short id, task preview, and the
-full id plus `subagent_collect` / `subagent_inspect` hints). The child keeps running.
+`subagent { agent, task }` — `background` omitted, or `background: true` — spawns a single
+run detached from the parent tool call and returns immediately with the spawn text (short
+id, task preview, and the full id plus `subagent_collect` / `subagent_inspect` hints).
+The child keeps running. This is the default for single mode; `background: false` opts
+into a foreground run that waits for the result.
 
-- **Single mode only** — `background` alongside `chain` is rejected. Rejected in
-  print mode too (no notification channel); use the blocking call there.
+- **Chain and print mode are always foreground** — a `chain` call ignores `background`
+  (each step is awaited; no error), and `ctx.mode === 'print'` forces foreground because
+  the parent exits before a detached child could settle. There is no notification
+  channel in print mode, so the blocking call is the only working shape there.
 - **Detached from the parent's abort** — Escape does not kill a background child. Kill it
   with `/subagents abort <id>` or the manager view's `x` key; a killed run settles as a
   failure notification. Both paths use the same kill sequence as a foreground abort:
@@ -356,8 +361,9 @@ full id plus `subagent_collect` / `subagent_inspect` hints). The child keeps run
   closes the dialog at that deadline instead.
 - **Concurrency** is unchanged — there is no separate cap, and background and foreground
   runs coexist.
-- **Backgrounded resume** — `background: true` with `resume` re-runs a persisted run
-  detached and stores a fresh result at settlement like any background run.
+- **Backgrounded resume** — a `resume` call runs in the background unless it passes
+  `background: false`; either way the resumed run stores (background) or returns
+  (foreground) a fresh result at settlement.
 - **Id supersession** — spawning a run whose id has an uncollected background result
   deletes the stale entry at registration, so `subagent_collect` on a re-running id reports
   "still running" rather than the stale result.
@@ -498,8 +504,9 @@ resume hint:
 - **L5 — no true detach**: backgrounded runs do not survive the parent process or a session
   replacement (`/new`, `/resume`, `/fork`, `/reload`); live runs are SIGTERM'd on session
   teardown
-- **L6 — background is single-mode only**: no backgrounded chains;
-  runtime conversion via the manager's `b` is single-mode too (foreground single tool-call runs)
+- **L6 — background is single-mode only**: no backgrounded chains (a chain is always
+  foreground); runtime conversion via the manager's `b` is single-mode too (foreground
+  `background: false` tool-call runs)
 - **L7 — `subagent_collect` is process-scoped**: persisted runs from other sessions use
   `subagent_inspect` / `/subagents resume`
 - **L8 — no parent auto-cancel for relayed questions**: a backgrounded child blocked on a

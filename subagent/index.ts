@@ -3262,7 +3262,10 @@ async function openSubagentsManager(ctx: ExtensionContext): Promise<void> {
                 }
                 const short = shortSubagentId(row.id)
                 if (!row.entry.backgroundize) {
-                    showNotice('background applies to foreground single-mode runs only', true)
+                    showNotice(
+                        'background applies to foreground single-mode runs only (background: false)',
+                        true
+                    )
                     return
                 }
                 if (row.entry.runtimeBackgrounded) {
@@ -3499,9 +3502,11 @@ const SubagentParams = Type.Object(
         background: Type.Optional(
             Type.Boolean({
                 description:
-                    'Single mode only. Return immediately; the child keeps running detached from parent Escape. ' +
+                    'Default: true. Returns immediately; the child keeps running detached from parent Escape. ' +
                     'Completion arrives as a notification; fetch the result via subagent_collect { id }. ' +
-                    'Do NOT wait for it: end your turn with a summary. Sleeping or polling only adds delay ' +
+                    'background: false opts into a foreground run that waits for the result in this turn. ' +
+                    'Chain mode is always foreground; print mode always runs foreground. ' +
+                    'Do NOT wait for a background run: end your turn with a summary. Sleeping or polling only adds delay ' +
                     'on top of the notification, and subagent_collect on a running run returns immediately by design.',
             })
         ),
@@ -3595,7 +3600,7 @@ export default function (pi: ExtensionAPI) {
                 '(agent must match the original run).',
             `Default agent scope is "user" (from ${path.join(getAgentDir(), 'agents')}).`,
             `To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
-            'Background: background: true (single mode only) returns immediately; the child keeps running and completion is reported via notification; fetch results with subagent_collect.',
+            'Background: the default for single mode. A single-mode call with `background` omitted or true returns immediately; the child keeps running and completion is reported via notification; fetch results with subagent_collect. Pass background: false to wait for the result in this turn. Chain mode and print mode always run foreground. Do not wait or poll on a background run: end your turn, and the completion notification starts the next one.',
             'Model: model: "provider/model-id" overrides the agent file pin and the parent session default for that dispatch (single mode; per item in chain).',
         ].join(' '),
         parameters: SubagentParams,
@@ -3652,31 +3657,11 @@ export default function (pi: ExtensionAPI) {
                 }
             }
 
-            const background = params.background === true
-            if (background && ctx.mode === 'print') {
-                return {
-                    content: [
-                        {
-                            type: 'text',
-                            text: 'background mode is unavailable in print mode — the parent exits before the child can settle. Use a foreground call instead.',
-                        },
-                    ],
-                    details: makeDetails('single')([]),
-                    isError: true,
-                }
-            }
-            if (background && hasChain) {
-                return {
-                    content: [
-                        {
-                            type: 'text',
-                            text: 'background mode is single-mode only ({agent, task, background: true}).',
-                        },
-                    ],
-                    details: makeDetails('single')([]),
-                    isError: true,
-                }
-            }
+            // Background is the default; only an explicit `background: false` asks for a
+            // foreground run. Chain items are awaited one at a time inside the same tool
+            // call, and print mode exits the parent before a detached child could settle,
+            // so both force foreground rather than erroring on the param.
+            const background = params.background !== false && !hasChain && ctx.mode !== 'print'
             if (params.model !== undefined && params.model.trim() === '') {
                 return {
                     content: [

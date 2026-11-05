@@ -1,18 +1,12 @@
 /**
- * Settlement notice for background runs, in the format external trackers read.
+ * Settlement notice for background runs, in the format their consumers read.
  *
- * A tracker (Paseo's `pi-subagents` adapter) keeps a background run "working"
- * until it can derive a terminal status. It has two channels for that, and both
- * key on the async token this module builds:
+ * A background spawn returns at spawn time, so this entry is the only record of
+ * how the run ended: the outcome on its first line, the async token naming the
+ * run directory in its body. Nothing else on disk is a settlement channel.
  *
- * - live: it polls `<token>/status.json` every 250 ms and stops on a terminal
- *   `state` (written by async-status.ts at spawn and at settlement).
- * - durable: it reads this module's `subagent-notify` payload from the parent
- *   transcript, whose first line carries the outcome and whose body names the
- *   token. That survives a reload; the poller's file does not outlive its run.
- *
- * A wording or token drift in either channel silently strands the run as running
- * in those trackers, with no error anywhere.
+ * A wording or token drift silently strands the run as running in a consumer
+ * that matches on it, with no error anywhere.
  *
  * The notice is a session entry (`pi.appendEntry`), not a message. The host
  * turns every custom message into a user-role LLM message on the following
@@ -26,7 +20,7 @@
 
 import type { Component } from '@earendil-works/pi-tui'
 import type { CustomEntry, EntryRenderer, Theme } from '@earendil-works/pi-coding-agent'
-import { asyncRunDir } from './async-status.ts'
+import { asyncRunDir } from './run-storage.ts'
 
 export const SUBAGENT_NOTIFY_CUSTOM_TYPE = 'subagent-notify'
 
@@ -91,11 +85,10 @@ const OUTCOME_LABEL: Record<TerminalRunStatus, string> = {
 
 /**
  * Correlation token reported as the spawn call's `details.asyncDir` and echoed in
- * the notice. Trackers key on the exact string, so it must be derivable from the
- * run id alone: replay rebuilds both sides from the transcript, long after any
- * live state is gone. It is a real directory holding `status.json` (see
- * async-status.ts), one of the two settlement channels; the notice below is the
- * other, for trackers that read the transcript rather than poll.
+ * the notice. Consumers key on the exact string, so it must be derivable from the
+ * run id alone: a replay rebuilds it from the transcript, long after the process
+ * that spawned the run is gone. It is a real directory holding the run's
+ * transcript (see run-storage.ts).
  */
 export function asyncRunToken(subagentsDir: string, subagentId: string): string {
     return asyncRunDir(subagentsDir, subagentId)

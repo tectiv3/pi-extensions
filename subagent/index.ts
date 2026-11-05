@@ -55,17 +55,14 @@ import {
     type TerminalRunStatus,
 } from './async-notice.ts'
 import {
+    ASYNC_DIR_SUFFIX,
     asyncRunDir,
     asyncRunTranscriptPath,
     findRunTranscriptPath,
     legacyRunTranscriptPath,
     resolveRunTranscriptPath,
-    RUN_STATE_BY_OUTCOME,
-    readRunStatusFile,
-    type RunStatusState,
     sweepExpiredAsyncDirs,
-    writeRunStatus,
-} from './async-status.ts'
+} from './run-storage.ts'
 import { spawnChild } from './child-env.ts'
 import {
     advanceSessionEpoch,
@@ -366,6 +363,9 @@ interface ActiveSubagent {
     // The run's own abort source. Background runs have no parent signal, so
     // without this their only kill path was a bare SIGTERM with no escalation.
     abort: () => void
+    // Spawn-time background (the tool's `background: true`): detached from the
+    // tool call from the first frame, so there is nothing to convert later.
+    spawnBackground: boolean
     // Runtime backgrounding (docs/plans/subagent-runtime-background.md): the
     // manager view's `b` key converts a foreground single-mode tool-call run
     // mid-flight. Wired only for backgroundable runs.
@@ -381,6 +381,30 @@ interface ActiveSubagent {
 type SteerOutcome = string | undefined
 
 const activeSubagents = new Map<string, ActiveSubagent>()
+
+// Terminal outcomes of runs this process settled. A foreground success deletes
+// its meta, and a resumed run's meta carries no status until it exits, so this
+// is what lets the control listing report those outcomes. Keyed by run id,
+// scoped by the session that spawned it.
+interface SettledRunOutcome {
+    status: 'succeeded' | 'failed' | 'aborted'
+    agent: string
+    task: string
+    startedAt: string
+    parentSessionId?: string
+    /** The store the run lived in; a row is only listed against the same store. */
+    subagentsDir: string
+}
+
+const settledRunOutcomes = new Map<string, SettledRunOutcome>()
+
+// Outcomes of other sessions are never listed (list() filters by session), so
+// this is memory hygiene for long-lived processes that switch sessions.
+function pruneSettledRunOutcomes(sessionId: string | undefined): void {
+    for (const [id, outcome] of settledRunOutcomes) {
+        if (outcome.parentSessionId !== sessionId) settledRunOutcomes.delete(id)
+    }
+}
 
 // Global cross-extension bus, handed over by the extension host in the
 // default export; processLine runs in child callbacks that can only reach it
@@ -410,6 +434,8 @@ function capturePiSessionId(ctx: ExtensionContext): void {
 }
 
 function registerActiveSubagent(entry: ActiveSubagent): void {
+    // A resume reuses the id; the previous run's outcome is no longer its state.
+    settledRunOutcomes.delete(entry.id)
     activeSubagents.set(entry.id, entry)
 }
 
@@ -541,52 +567,9 @@ function backgroundRunAsyncToken(subagentId: string): string {
     return asyncRunToken(getSubagentsDir(), subagentId)
 }
 
-// Every background run that published `running` and has not written a terminal
-// state yet, with what its terminal payload repeats. The ActiveSubagent entry
-// cannot serve here: the child's close handler unregisters it before
-// finalizeExit writes the settlement.
-interface PublishedRun {
-    agent: string
-    startedAt: number
-}
-const publishedBackgroundRuns = new Map<string, PublishedRun>()
-
-// The retention-directory transcript a background child was given. Only that
-// path enters: success cleanup keeps it, so it stays real after settlement. A
-// child on a legacy `<id>.jsonl` (a foreground spawn, backgrounded mid-flight or
-// resumed in the background) never enters and advertises no `sessionFile`.
-const backgroundRunSessionFiles = new Map<string, string>()
-
-// Live channel of the settlement contract (see async-status.ts): a tracker polls
-// `<asyncDir>/status.json` from the moment it reads `details.asyncDir` and keeps
-// the run "working" until it sees a terminal state, so the spawn payload has to
-// land before the tool result returns. Best-effort by construction — the write
-// never throws, and it is not on any awaited path.
-function writeRunStatusStart(subagentId: string, agent: string, startedAt: number): void {
-    publishedBackgroundRuns.set(subagentId, { agent, startedAt })
-    // The tracker retries a missing file indefinitely (offset 0, 250 ms ticks), so
-    // a spawn-time background run advertises its deterministic transcript before
-    // the child has created it. A runtime-backgrounded run has no entry here and
-    // stays silent rather than naming a legacy path that will not be tailed.
-    const sessionFile = backgroundRunSessionFiles.get(subagentId)
-    writeRunStatus(backgroundRunAsyncToken(subagentId), {
-        runId: subagentId,
-        mode: 'single',
-        state: 'running',
-        startedAt,
-        lastUpdate: Date.now(),
-        steps: [{ agent, status: 'running', ...(sessionFile ? { sessionFile } : {}) }],
-    })
-}
-
 // One terminal notice per settled background run, whatever ended it (exit,
-// error, abort). The two channels are split on the epoch on purpose: the entry is
-// session-scoped (a run from a torn-down session must not write into its
-// replacement's transcript), the status file is run-scoped — it names a directory
-// on disk and touches no transcript, so it has to land even for a stale epoch.
-// Suppressing it there left the directory `running` forever: the retention sweep
-// only deletes terminal runs, so every quit with a background run in flight leaked
-// one directory and its trackers never settled.
+// error, abort). The entry is session-scoped on purpose: a run from a torn-down
+// session must not write into its replacement's transcript.
 export function emitBackgroundSettlement(
     id: string,
     agent: string,
@@ -609,62 +592,6 @@ export function emitBackgroundSettlement(
                     : {}),
             })
         )
-    }
-    // Poller channel: the poller knows only the async directory and has no
-    // transcript to read, so this write is what actually settles a live row. The
-    // entry stays the durable replay channel.
-    const published = publishedBackgroundRuns.get(id)
-    publishedBackgroundRuns.delete(id)
-    writeTerminalRunStatus(
-        id,
-        agent,
-        RUN_STATE_BY_OUTCOME[status],
-        published?.startedAt,
-        backgroundRunSessionFiles.get(id)
-    )
-    backgroundRunSessionFiles.delete(id)
-}
-
-// `startedAt` falls back to endedAt for a run this process never recorded a
-// spawn time for; the payload must never report startedAt > endedAt.
-function writeTerminalRunStatus(
-    id: string,
-    agent: string,
-    state: RunStatusState,
-    startedAt: number | undefined,
-    sessionFile: string | undefined
-): void {
-    const endedAt = Date.now()
-    writeRunStatus(backgroundRunAsyncToken(id), {
-        runId: id,
-        mode: 'single',
-        state,
-        startedAt: startedAt ?? endedAt,
-        endedAt,
-        lastUpdate: endedAt,
-        steps: [{ agent, status: state, ...(sessionFile ? { sessionFile } : {}) }],
-    })
-}
-
-// A quit disposes the runtime and calls process.exit in the same turn, so a
-// killed child's close event — and the settlement it drives — never runs. Every
-// run still published as `running` is marked stopped synchronously here; a real
-// settlement that does land later (session replacement keeps the process alive)
-// overwrites this with the actual outcome. Entries stay for that settlement.
-function markPublishedRunsStopped(): void {
-    for (const [id, run] of publishedBackgroundRuns) {
-        try {
-            writeTerminalRunStatus(
-                id,
-                run.agent,
-                'stopped',
-                run.startedAt,
-                backgroundRunSessionFiles.get(id)
-            )
-        } catch {
-            // writeRunStatus never throws; the guard keeps one bad id from
-            // stopping the rest.
-        }
     }
 }
 
@@ -768,7 +695,6 @@ function pushSubagentEvent(entry: ActiveSubagent, event: SubagentStreamEvent): v
 // both run and the kill is idempotent. Best-effort only: the event loop stops once
 // 'exit' handlers return, so no SIGKILL escalation can follow.
 process.on('exit', () => {
-    markPublishedRunsStopped()
     for (const entry of activeSubagents.values()) {
         try {
             entry.proc.kill('SIGTERM')
@@ -1293,12 +1219,19 @@ function listSessionPersistedSubagents(): PersistedSubagentEntry[] {
     return listPersistedSubagents().filter(entry => entry.meta?.parentSessionId === sessionId)
 }
 
-// Resumable persisted runs of the current session: readable meta, not owned
+// Listing surfaces show what needs attention: interrupted, failed, or still
+// running. A success keeps its meta only as an outcome record, so it stays
+// reachable by id (inspect, resume, suffix resolution) but is not listed.
+function listSessionListedSubagents(): PersistedSubagentEntry[] {
+    return listSessionPersistedSubagents().filter(entry => entry.meta?.status !== 'succeeded')
+}
+
+// Listed persisted runs of the current session with a readable meta, not owned
 // by a live process (this session's running children are registry entries,
 // another session's by a live pidfile). Powers /subagents resume id omission
 // and the manager view's PERSISTED section (§11).
 function listSessionResumableSubagents(): PersistedSubagentEntry[] {
-    return listSessionPersistedSubagents().filter(
+    return listSessionListedSubagents().filter(
         entry =>
             entry.meta !== undefined &&
             deriveSubagentRunStatus(entry.id, entry.meta).status !== 'running'
@@ -1318,9 +1251,9 @@ function formatAvailableSubagentsError(resumeId: string): string {
     // Headline first, on one line: the tool surfaces only that line as its FAILED:
     // reason, so the next step has to live there, not in the listing below.
     const headline =
-        `No subagent found with id "${resumeId}" (completed runs are cleaned up); ` +
+        `No subagent found with id "${resumeId}" (completed foreground runs are cleaned up); ` +
         're-dispatch with subagent {agent, task} instead of resuming.'
-    const entries = listSessionPersistedSubagents()
+    const entries = listSessionListedSubagents()
     if (entries.length === 0) {
         return (
             `${headline} No persisted subagent runs from this session in ${getSubagentsDir()} ` +
@@ -1349,11 +1282,11 @@ function formatSessionFileSize(sessionPath: string): string {
 }
 
 function buildSubagentsListReport(): string {
-    // Successful runs are cleaned up, so every persisted entry is running, interrupted, or failed.
+    // Successes are not listed, so every entry is running, interrupted, or failed.
     // Missing-meta entries fall back to the uuidv7 id, which embeds a creation timestamp.
     // Scoped to the current session (§11): other sessions' runs are hidden from
     // listings but stay reachable by explicit full id.
-    const entries = [...listSessionPersistedSubagents()].sort((a, b) =>
+    const entries = [...listSessionListedSubagents()].sort((a, b) =>
         (b.meta?.startedAt ?? b.id).localeCompare(a.meta?.startedAt ?? a.id)
     )
     if (entries.length === 0) return 'No persisted subagent runs from this session.'
@@ -1918,8 +1851,8 @@ function resolveInspectTarget(requestedId: string): InspectTarget {
         error:
             formatAvailableSubagentsError(requestedId) +
             '\n' +
-            'A bare id with no artifacts is indistinguishable from a successfully completed run ' +
-            "(artifacts are deleted on success); its output is in the parent session's tool result.",
+            'A bare id with no artifacts is indistinguishable from a successfully completed foreground run ' +
+            "(its artifacts are deleted on success); its output is in the parent session's tool result.",
     }
 }
 
@@ -2052,7 +1985,7 @@ function readSubagentPid(pidPath: string): number | undefined {
 // Acceptable because resume + delete of the same id requires deliberate
 // user action in two sessions simultaneously, and Node is single-threaded
 // so in-process races are impossible.
-function deletePersistedRunArtifacts(subagentId: string): string | undefined {
+export function deletePersistedRunArtifacts(subagentId: string): string | undefined {
     if (activeSubagents.has(subagentId)) {
         return `Refused: ${shortSubagentId(subagentId)} is running in this session — abort it first.`
     }
@@ -2065,6 +1998,7 @@ function deletePersistedRunArtifacts(subagentId: string): string | undefined {
     removeSubagentFile(pid)
     removeSubagentFile(meta)
     removeSubagentDir(asyncDir)
+    settledRunOutcomes.delete(subagentId)
     return undefined
 }
 
@@ -2080,21 +2014,14 @@ function deriveSubagentRunStatus(
     const { pid: pidPath } = getSubagentFilePaths(subagentId)
     const pid = readSubagentPid(pidPath)
     if (pid !== undefined && isProcessAlive(pid)) return { status: 'running', runningPid: pid }
-    // Stale pidfile (parent crashed before cleanup): unlock so the run stays resumable.
-    if (pid !== undefined) removeSubagentFile(pidPath)
+    // A pidfile naming a dead process is a crashed parent's leftover, not this
+    // function's to remove: unlinking it here would put a write on every read path
+    // (list, inspect, the status tile). The retention sweep owns that cleanup and
+    // resume unlinks it on its own action path.
     if (meta?.status) return { status: meta.status }
-    // Success deletes the meta but keeps a run-directory transcript; the status
-    // file still records the outcome.
-    const state = readRunStatusFile(getSubagentsDir(), subagentId)?.state
-    return { status: (state && OUTCOME_BY_RUN_STATE[state]) ?? 'unknown' }
-}
-
-// Inverse of RUN_STATE_BY_OUTCOME. `running` is absent on purpose: with no live
-// pid it is stale, not running.
-const OUTCOME_BY_RUN_STATE: Readonly<Record<string, string>> = {
-    complete: 'succeeded',
-    failed: 'failed',
-    stopped: 'aborted',
+    // No live pid and no recorded outcome: the owner died before settling, or the
+    // meta is gone (a foreground success deletes it with the transcript).
+    return { status: 'unknown' }
 }
 
 function formatSubagentStatus(runStatus: SubagentRunStatus): string {
@@ -2198,13 +2125,7 @@ function buildSubagentInspectReport(subagentId: string, limit: number): string {
             if (meta.exitCode !== undefined) lines.push(`Exit code: ${meta.exitCode}`)
         }
     } else {
-        const agentFromStatus = readRunStatusFile(getSubagentsDir(), subagentId)?.agent
-        if (agentFromStatus) {
-            lines.push(`Agent: ${agentFromStatus}`)
-            lines.push('Meta: removed on success (task and model unknown)')
-        } else {
-            lines.push('Meta: missing (agent, task, and model unknown)')
-        }
+        lines.push('Meta: missing (agent, task, and model unknown)')
     }
 
     const messages = parseSubagentTranscript(sessionPath)
@@ -2486,9 +2407,8 @@ async function runSingleAgent(
 
         ensureSubagentsDir()
         if (background) {
-            // Must exist before the child can write its transcript, and before the
-            // spawn payload advertises it to a tracker. A mkdir failure surfaces as
-            // a failed run, not as a crash of the parent's delegation.
+            // Must exist before the child can write its transcript. A mkdir failure
+            // surfaces as a failed run, not as a crash of the parent's delegation.
             const runDir = path.dirname(sessionAsyncPath)
             try {
                 fs.mkdirSync(runDir, { recursive: true, mode: SUBAGENTS_DIR_MODE })
@@ -2531,10 +2451,6 @@ async function runSingleAgent(
 
         // Counted outside the exit promise: the settle log reports the suppressed total.
         let frameParseFailures = 0
-        // The spawn payload (written once the spawn bridge resolves) and the
-        // settlement read this: the transcript path this child was actually given.
-        if (background && sessionPath === sessionAsyncPath)
-            backgroundRunSessionFiles.set(subagentId, sessionPath)
         const exitCodePromise = new Promise<number>(resolve => {
             const invocation = getPiInvocation(args)
             debug(`spawn: ${invocation.command} ${invocation.args.join(' ')}`)
@@ -2783,6 +2699,7 @@ async function runSingleAgent(
                 pendingSteers: [],
                 steer: steerFn,
                 abort: () => runAbort.abort(),
+                spawnBackground: background,
             }
             registerActiveSubagent(entry)
             // Id supersession (spec 1.1): a re-running id reuses its id, so a stale
@@ -3104,13 +3021,13 @@ async function runSingleAgent(
             // Retention owns a transcript by where it lives, not by how this
             // invocation was launched: a foreground resume of a spawn-time
             // background run continues the run-directory transcript, and deleting
-            // it would leave the run's status.json naming a missing file. A legacy
-            // `<id>.jsonl` sits outside the run directory and keeps the success
-            // cleanup.
+            // it would strip the run of the transcript `subagent_inspect` and a
+            // further resume read. A legacy `<id>.jsonl` sits outside the run
+            // directory and keeps the success cleanup.
             const retentionOwnsTranscript = sessionPath === sessionAsyncPath
-            // Before the cleanup below, deliberately: the notice is the only
-            // terminal marker external trackers persist, so it has to reach the
-            // transcript while the run is still the most recent thing in it.
+            // Before the cleanup below, deliberately: the notice is the run's
+            // terminal record, so it has to reach the transcript while the run is
+            // still the most recent thing in it.
             if (backgrounded) {
                 emitBackgroundSettlement(
                     subagentId,
@@ -3119,20 +3036,21 @@ async function runSingleAgent(
                     runEpoch,
                     buildBackgroundNotification(currentResult)
                 )
-            } else if (readRunStatusFile(getSubagentsDir(), subagentId)) {
-                // A foreground resume of a run that once went to the background:
-                // its status file still holds the earlier outcome.
-                writeTerminalRunStatus(
-                    subagentId,
-                    currentResult.agent,
-                    RUN_STATE_BY_OUTCOME[status],
-                    Date.parse(spawnMeta.startedAt),
-                    retentionOwnsTranscript ? sessionPath : undefined
-                )
             }
+            settledRunOutcomes.set(subagentId, {
+                status,
+                agent: spawnMeta.agent,
+                task: spawnMeta.task,
+                startedAt: spawnMeta.startedAt,
+                parentSessionId: spawnMeta.parentSessionId,
+                subagentsDir: path.dirname(metaPath),
+            })
             removeSubagentFile(pidPath)
-            if (status === 'succeeded') {
-                if (!retentionOwnsTranscript) removeSubagentFile(sessionPath)
+            // A success on a retention-owned transcript keeps its meta as the
+            // outcome record for inspect and the control listing; the sweep
+            // deletes it with the run directory.
+            if (status === 'succeeded' && !retentionOwnsTranscript) {
+                removeSubagentFile(sessionPath)
                 removeSubagentFile(metaPath)
             } else {
                 writeSubagentMetaFile(metaPath, {
@@ -3183,7 +3101,6 @@ async function runSingleAgent(
         return finalizeExit(outcome.code)
     } catch (err) {
         if (!childSpawned) {
-            backgroundRunSessionFiles.delete(subagentId)
             if (background) {
                 // rmdir, not rm -r: only the empty directory this call created
                 // goes; a resumed run's directory still holds its transcript.
@@ -3887,7 +3804,414 @@ const SubagentSteerParams = Type.Object({
     }),
 })
 
+// ── Programmatic control service ─────────────────────────────────────
+//
+// Paseo's in-process runtime bridge reads this off globalThis and drives the
+// same internals the manager view does (its `x` and `b` keys), without an LLM
+// turn. The symbol key is the contract: keep its string stable, and derive
+// every capability from state this module already owns.
+
+export const SUBAGENT_CONTROL_SYMBOL = Symbol.for('pi-extensions:subagent:control')
+
+export type SubagentCapability = 'stop' | 'background'
+
+export type SubagentControlStatus = 'running' | 'completed' | 'failed' | 'canceled'
+
+export interface SubagentControlInfo {
+    id: string
+    agent?: string
+    status: SubagentControlStatus
+    /** Running detached from its spawner (spawn-time or runtime background). */
+    background: boolean
+    capabilities: SubagentCapability[]
+    /** The run's transcript, when one exists on disk. */
+    sessionFile?: string
+    title?: string
+}
+
+export type SubagentControlResult =
+    | { ok: true; id: string; status: SubagentControlStatus }
+    | { ok: false; id: string; reason: string }
+
+export interface SubagentControlService {
+    version: 1
+    list(): SubagentControlInfo[]
+    stop(id: string): Promise<SubagentControlResult>
+    background(id: string): Promise<SubagentControlResult>
+}
+
+// A row with no recorded outcome and no live owner was interrupted before it
+// settled, so it reads as canceled; a switch rather than a lookup table, because
+// the meta is unvalidated JSON.
+function controlStatusForOutcome(status: unknown): SubagentControlStatus {
+    switch (status) {
+        case 'succeeded':
+            return 'completed'
+        case 'failed':
+            return 'failed'
+        default:
+            return 'canceled'
+    }
+}
+
+const CONTROL_BACKGROUND_NOT_AVAILABLE =
+    'background applies to foreground single-mode runs only (background: false)'
+
+interface ControlRunFacts {
+    id: string
+    agent?: string
+    status: SubagentControlStatus
+    task?: string
+    startedAt?: number
+    /** Present only for a run this process still has registered. */
+    entry?: ActiveSubagent
+    /** Disk rows: a live owner in another process runs it from a `.async` directory. */
+    diskBackground?: boolean
+    /** Transcript resolved by the disk pass; registry rows resolve it themselves. */
+    sessionFile?: string
+}
+
+// One row of the session-scoped meta sidecars. list() is on the controller's poll
+// path, so the disk half is one readdir, one stat per `.meta` (a parse only when
+// the file changed since the last poll), one read per pidfile that exists, and
+// one liveness syscall per recorded pid. A run this process still holds in its
+// registry skips the pidfile work: the registry is the same fact without a disk
+// round trip.
+interface ControlDiskRow {
+    id: string
+    meta?: SubagentMeta
+    /** Pid of a live owner process; undefined when absent, dead, or in the registry. */
+    livePid?: number
+    /** The run has a `.async` run directory (spawn-time background). */
+    hasRunDir: boolean
+    /** Transcript from the listing, or undefined when the run left none. */
+    sessionFile?: string
+}
+
+interface CachedControlMeta {
+    mtimeMs: number
+    size: number
+    meta: SubagentMeta | undefined
+}
+
+// Failed and aborted foreground runs keep their meta until an explicit delete, so
+// the sidecar count only grows; a meta is rewritten at spawn and at settlement,
+// which is what the mtime/size key tracks.
+const controlMetaCache = new Map<string, CachedControlMeta>()
+
+function readControlMeta(file: string): SubagentMeta | undefined {
+    let stat: fs.Stats
+    try {
+        stat = fs.statSync(file)
+    } catch {
+        controlMetaCache.delete(file)
+        return undefined
+    }
+    const cached = controlMetaCache.get(file)
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+        return cached.meta
+    }
+    let meta: SubagentMeta | undefined
+    try {
+        meta = JSON.parse(fs.readFileSync(file, 'utf-8')) as SubagentMeta
+    } catch {
+        meta = undefined
+    }
+    controlMetaCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, meta })
+    return meta
+}
+
+interface ControlDiskListing {
+    rows: ControlDiskRow[]
+    /** The directory listing, reused to resolve transcripts without a stat per path. */
+    present: ReadonlySet<string>
+}
+
+function readControlDiskRows(
+    sessionId: string,
+    registryIds: ReadonlySet<string>
+): ControlDiskListing {
+    const dir = getSubagentsDir()
+    let names: string[]
+    try {
+        names = fs.readdirSync(dir)
+    } catch {
+        controlMetaCache.clear()
+        return { rows: [], present: new Set() }
+    }
+    const present = new Set(names)
+    const rows: ControlDiskRow[] = []
+    const pidRows: ControlDiskRow[] = []
+    const seenMetaFiles = new Set<string>()
+
+    for (const name of names) {
+        if (!name.endsWith('.meta')) continue
+        const id = name.slice(0, -'.meta'.length)
+        const file = path.join(dir, name)
+        seenMetaFiles.add(file)
+        const meta = readControlMeta(file)
+        // Session scoping lives in the meta. An unparsable sidecar, or one without
+        // the field (another session's run, or a pre-scoping meta), stays out.
+        if (meta?.parentSessionId !== sessionId) continue
+        const row: ControlDiskRow = {
+            id,
+            meta,
+            hasRunDir: present.has(`${id}${ASYNC_DIR_SUFFIX}`),
+            sessionFile: findRunTranscriptPath(dir, id, present),
+        }
+        rows.push(row)
+        if (registryIds.has(id) || !present.has(`${id}.pid`)) continue
+        const pid = readSubagentPid(path.join(dir, `${id}.pid`))
+        if (pid !== undefined) {
+            row.livePid = pid
+            pidRows.push(row)
+        }
+    }
+
+    // Anything not in this listing is gone, or belongs to a store no longer in use.
+    for (const file of controlMetaCache.keys()) {
+        if (!seenMetaFiles.has(file)) controlMetaCache.delete(file)
+    }
+
+    // Liveness is the per-row syscall: kill(0) is a direct probe, measured at
+    // ~2ms for 500 rows against ~5ms for one batched `ps` fork, so this pass is
+    // over a collected list rather than a process per row.
+    for (const row of pidRows) {
+        if (row.livePid !== undefined && !isProcessAlive(row.livePid)) row.livePid = undefined
+    }
+
+    return { rows, present }
+}
+
+// The union Paseo's adapter renders from, in increasing order of authority: this
+// session's meta sidecars, this process's registry (only it can answer the live
+// operations), and the outcomes this process recorded at settlement (the only
+// record of a foreground success, whose meta is deleted). Registration clears a stale
+// outcome, so an outcome present here is newer than its registry entry.
+function collectControlRunFacts(): ControlRunFacts[] {
+    const facts = new Map<string, ControlRunFacts>()
+    const sessionId = currentPiSessionId
+    // No session id means nothing is scoped to this process: the disk pass would
+    // return every session's rows, so it returns none.
+    if (!sessionId) return []
+
+    const registry = [...activeSubagents.values()]
+    const registryIds = new Set(registry.map(entry => entry.id))
+    const disk = readControlDiskRows(sessionId, registryIds)
+    for (const row of disk.rows) {
+        const live = row.livePid !== undefined
+        const startedAt = row.meta ? Date.parse(row.meta.startedAt) : Number.NaN
+        facts.set(row.id, {
+            id: row.id,
+            agent: row.meta?.agent,
+            status: live ? 'running' : controlStatusForOutcome(row.meta?.status),
+            task: row.meta?.task,
+            startedAt: Number.isFinite(startedAt) ? startedAt : undefined,
+            diskBackground: live && row.hasRunDir,
+            sessionFile: row.sessionFile,
+        })
+    }
+
+    // A settled entry (agent_settled seen, process not yet closed) still reads as
+    // running: its outcome is not recorded until the exit lands.
+    for (const entry of registry) {
+        facts.set(entry.id, {
+            id: entry.id,
+            agent: entry.agent,
+            status: 'running',
+            task: entry.task,
+            startedAt: entry.startedAt,
+            entry,
+        })
+    }
+
+    const subagentsDir = getSubagentsDir()
+    for (const [id, outcome] of settledRunOutcomes) {
+        if (outcome.parentSessionId !== sessionId || outcome.subagentsDir !== subagentsDir) {
+            continue
+        }
+        const startedAt = Date.parse(outcome.startedAt)
+        facts.set(id, {
+            id,
+            agent: outcome.agent,
+            status: controlStatusForOutcome(outcome.status),
+            task: outcome.task,
+            startedAt: Number.isFinite(startedAt) ? startedAt : undefined,
+            sessionFile:
+                facts.get(id)?.sessionFile ??
+                findRunTranscriptPath(subagentsDir, id, disk.present),
+        })
+    }
+
+    return [...facts.values()]
+}
+
+function controlFactsOrder(a: ControlRunFacts, b: ControlRunFacts): number {
+    const rank = (facts: ControlRunFacts) => (facts.status === 'running' ? 0 : 1)
+    return rank(a) - rank(b) || (b.startedAt ?? 0) - (a.startedAt ?? 0)
+}
+
+function controlInfoFor(facts: ControlRunFacts): SubagentControlInfo {
+    const entry = facts.entry
+    // Only an unsettled entry this process owns can be aborted or converted, so a
+    // row without one advertises nothing it cannot do.
+    const operable = entry !== undefined && !entry.settled
+    const capabilities: SubagentCapability[] = []
+    if (operable) capabilities.push('stop')
+    // `backgroundize` exists only for runtimeBackgroundable runs, and an
+    // already-converted run refuses (same gates as the manager `b` key).
+    if (operable && entry.backgroundize !== undefined && entry.runtimeBackgrounded !== true)
+        capabilities.push('background')
+
+    const info: SubagentControlInfo = {
+        id: facts.id,
+        status: facts.status,
+        background: entry
+            ? entry.spawnBackground || entry.runtimeBackgrounded === true
+            : facts.diskBackground === true,
+        capabilities,
+    }
+    if (facts.agent) info.agent = facts.agent
+    // Disk rows already resolved their transcript from the listing list() had to
+    // read; a registry row resolves it here, for one row.
+    const sessionFile = entry
+        ? findRunTranscriptPath(getSubagentsDir(), facts.id)
+        : facts.sessionFile
+    if (sessionFile) info.sessionFile = sessionFile
+    if (facts.task) info.title = previewText(facts.task, LIST_TASK_PREVIEW_CHARS)
+    return info
+}
+
+function controlFailureReason(error: unknown): string {
+    return error instanceof Error ? error.message : String(error)
+}
+
+// Exact ids only. The human and LLM paths resolve unique suffixes and fall back
+// to "the one running run" on an empty id; a programmatic caller passing an
+// empty or truncated id must get a refusal, never act on whichever run is live.
+function resolveControlTarget(id: unknown): ActiveSubagent | string {
+    if (typeof id !== 'string' || id.length === 0) return 'a subagent id is required'
+    const entry = activeSubagents.get(id)
+    if (!entry || entry.settled) return `no running subagent with id "${id}"`
+    return entry
+}
+
+// Both operations reply `running`: abort is SIGTERM (then SIGKILL) and
+// unregistration waits for the child's 'close', and a converted run keeps
+// running by definition. The terminal status is list()'s to report once the
+// exit lands; any terminal value here would be a guess.
+function createSubagentControlService(): SubagentControlService {
+    return {
+        version: 1,
+
+        list() {
+            const infos: SubagentControlInfo[] = []
+            let facts: ControlRunFacts[]
+            try {
+                facts = collectControlRunFacts().sort(controlFactsOrder)
+            } catch (error) {
+                subagentDebugLog(
+                    `[subagent:control] list failed: ${controlFailureReason(error)}`
+                )
+                return infos
+            }
+            for (const run of facts) {
+                try {
+                    infos.push(controlInfoFor(run))
+                } catch (error) {
+                    // One unreadable row must not hide the rest from the controller.
+                    subagentDebugLog(
+                        `[subagent:control] row ${run.id} failed: ${controlFailureReason(error)}`
+                    )
+                }
+            }
+            return infos
+        },
+
+        async stop(id: string): Promise<SubagentControlResult> {
+            try {
+                const target = resolveControlTarget(id)
+                if (typeof target === 'string') return { ok: false, id, reason: target }
+                target.abort()
+                return { ok: true, id: target.id, status: 'running' }
+            } catch (error) {
+                return { ok: false, id, reason: controlFailureReason(error) }
+            }
+        },
+
+        async background(id: string): Promise<SubagentControlResult> {
+            try {
+                const target = resolveControlTarget(id)
+                if (typeof target === 'string') return { ok: false, id, reason: target }
+                const shortId = shortSubagentId(target.id)
+                // Same refusals, same order, same text as the manager `b` key.
+                if (!target.backgroundize)
+                    return {
+                        ok: false,
+                        id: target.id,
+                        reason: CONTROL_BACKGROUND_NOT_AVAILABLE,
+                    }
+                if (target.runtimeBackgrounded)
+                    return {
+                        ok: false,
+                        id: target.id,
+                        reason: `${shortId} already backgrounded`,
+                    }
+                if (!target.backgroundize())
+                    return {
+                        ok: false,
+                        id: target.id,
+                        reason: `${shortId} already finished — nothing to background`,
+                    }
+                return { ok: true, id: target.id, status: 'running' }
+            } catch (error) {
+                return { ok: false, id, reason: controlFailureReason(error) }
+            }
+        },
+    }
+}
+
+const CONTROL_SESSION_SHUT_DOWN = 'subagent control is unavailable: the session is shut down'
+
+// A caller that arrives after session_shutdown must not read the dead session's
+// rows or reach a service whose registry, notify queue and ctx are gone. The
+// symbol is replaced rather than deleted: its string is the published contract,
+// and a version-1 service that reports no runs says "this session is over"
+// where a missing symbol would claim the extension is not loaded.
+function createShutDownControlService(): SubagentControlService {
+    const refuse = async (id: string): Promise<SubagentControlResult> => ({
+        ok: false,
+        id,
+        reason: CONTROL_SESSION_SHUT_DOWN,
+    })
+    return { version: 1, list: () => [], stop: refuse, background: refuse }
+}
+
+function controlServiceHolder(): Record<symbol, SubagentControlService | undefined> {
+    return globalThis as unknown as Record<symbol, SubagentControlService | undefined>
+}
+
+function publishSubagentControlService(service: SubagentControlService): void {
+    try {
+        controlServiceHolder()[SUBAGENT_CONTROL_SYMBOL] = service
+    } catch (error) {
+        subagentDebugLog(
+            `[subagent:control] registration failed: ${controlFailureReason(error)}`
+        )
+    }
+}
+
+// Best-effort by construction: an init that throws takes the extension down,
+// and the controller can survive without the service. A re-init replaces the
+// previous registration; the returned instance is what this init may retire.
+function registerSubagentControlService(): SubagentControlService {
+    const service = createSubagentControlService()
+    publishSubagentControlService(service)
+    return service
+}
+
 export default function (pi: ExtensionAPI) {
+    const ownControlService = registerSubagentControlService()
     eventBus = pi.events
     latestPi = pi
     scheduleAsyncRetentionSweep()
@@ -3912,6 +4236,10 @@ export default function (pi: ExtensionAPI) {
             notifyDrainTimer = undefined
         }
         notifyQueue = []
+        // The dead session's id would keep scoping listings for the replacement
+        // session. Outcomes are kept: a /reload restarts the same session, and
+        // session_start prunes them when the id changes.
+        currentPiSessionId = undefined
         if (subagentStatusTimer) {
             clearInterval(subagentStatusTimer)
             subagentStatusTimer = undefined
@@ -3926,17 +4254,27 @@ export default function (pi: ExtensionAPI) {
         } catch {
             // In-memory only; the reload drops it regardless.
         }
-        // Before the kill: on a quit nothing after this handler runs. Killed
-        // children that do settle (session replacement) still overwrite it — the
-        // terminal status write is not epoch-guarded, and each settlement consumes
-        // its own published entry, so the map needs no reset here.
-        markPublishedRunsStopped()
         for (const entry of activeSubagents.values()) {
             // Same kill path as an explicit abort, so a child stuck in a tool call is
             // still escalated to SIGKILL while the (surviving) parent process lives.
             entry.abort()
         }
         activeSubagents.clear()
+        // Only the published symbol is guarded here: the state above is module
+        // scope, one session per process, and is reset regardless. The host always
+        // shuts the old session down before the next init, so this only stops a
+        // late, out-of-order shutdown from replacing a newer service with the stub.
+        if (controlServiceHolder()[SUBAGENT_CONTROL_SYMBOL] === ownControlService) {
+            publishSubagentControlService(createShutDownControlService())
+        }
+    })
+
+    // The control listing is session-scoped, and shutdown clears the id: without
+    // this capture the replacement session lists nothing until the model happens
+    // to call a subagent tool.
+    pi.on('session_start', (_event, ctx) => {
+        capturePiSessionId(ctx)
+        pruneSettledRunOutcomes(currentPiSessionId)
     })
 
     pi.registerTool({
@@ -4133,10 +4471,6 @@ export default function (pi: ExtensionAPI) {
                 clearTimeout(timer)
                 if (spawn.kind === 'spawned') {
                     const entry = spawn.entry
-                    // Before the result returns: the tracker starts polling as
-                    // soon as it has details.asyncDir, and a missing file is a
-                    // silent "keep running" there.
-                    writeRunStatusStart(entry.id, agentName, entry.startedAt)
                     return {
                         content: [
                             {
@@ -4227,17 +4561,6 @@ export default function (pi: ExtensionAPI) {
                 params.model
             )
             if (result.runtimeBackgrounded) {
-                // Same contract as a spawn-time background run, but the run
-                // started foreground: the tracker only learns the async
-                // directory now, so the spawn payload is written here. This
-                // write cannot land after the terminal one: runSingleAgent
-                // resolved in a microtask, and finalizeExit waits on the
-                // child's close event, a later I/O callback.
-                writeRunStatusStart(
-                    result.subagentId,
-                    agentName,
-                    activeSubagents.get(result.subagentId)?.startedAt ?? Date.now()
-                )
                 return {
                     content: [
                         {

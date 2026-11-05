@@ -172,7 +172,6 @@ files contain full tool output, potentially secrets):
 |------|----------|
 | `<id>.jsonl` | pi session file for foreground runs, and for runs runtime-backgrounded mid-flight |
 | `<id>.async/transcript.jsonl` | pi session file for spawn-time background runs; lives in the retention-managed directory |
-| `<id>.async/status.json` | tracker payload written at spawn and settlement (see [Async settlement notice](#async-settlement-notice)) |
 | `<id>.meta` | JSON sidecar (mode `0600`): agent, task, model, thinking level, startedAt, sha256 `promptHash` of the agent system prompt, and the spawning `subagent` tool call id (absent for non-tool spawns such as `/subagents resume`); updated on close with status, stopReason, exitCode, and the session header id |
 | `<id>.pid` | Child pid, present while the child is running |
 
@@ -182,10 +181,10 @@ formatting, or the session-header read.
 
 - **Retention**: a foreground success deletes its transcript and `.meta` — the
   output already lives in the parent's tool result. A spawn-time background success
-  deletes `.meta` and `.pid` but **keeps** `.async/transcript.jsonl`: the run directory
-  owns it now, and the 30-day retention sweep deletes the directory and transcript
-  together. That holds for any success on the run-directory transcript, including a
-  foreground resume of a background run. Aborted/failed/killed runs persist until resumed
+  deletes `.pid` but **keeps** `.async/transcript.jsonl` and a `.meta` with
+  `status: succeeded`: the run directory owns them now, and the 30-day retention sweep
+  deletes the directory, transcript and meta together. That holds for any success on the
+  run-directory transcript, including a foreground resume of a background run. Aborted/failed/killed runs persist until resumed
   to completion or manually deleted (`rm -r ~/.pi/agent/subagents/<id>.*`; `/subagents`
   lists what is there) — except runs that went to the background: those have a run
   directory, so the sweep deletes them once they are 30 days idle, `.meta`, `.pid` and
@@ -193,9 +192,14 @@ formatting, or the session-header read.
 - **Resume needs a transcript**: a run with a `.meta` but no transcript (it never wrote
   one, or retention removed it) is refused with "nothing to continue" instead of
   starting an empty session.
-- **Inspect after success**: a successful run on the run-directory transcript has no
-  `.meta`; `subagent_inspect` takes its status and agent from `status.json` and reports
-  task and model as unknown.
+- **Successes are not listed**: a run whose meta reads `succeeded` stays out of the
+  `/subagents` listing, the manager view's PERSISTED section and resume id omission. It
+  is still reachable by full id or unique suffix (`subagent_inspect`, `resume`), and
+  inspect reports `succeeded` with its task and model.
+- **Runs from before the outcome was kept**: a background success recorded while the
+  outcome still lived in `<id>.async/status.json` has no meta. Nothing reads that file
+  any more, so inspect reports it as `unknown` with the meta missing until the sweep
+  removes the run.
 - The directory sits outside the per-project sessions tree, so subagent runs never appear
   in the `/resume` picker.
 - **Recovery granularity**: pi creates the session file only at the child's first
@@ -238,7 +242,7 @@ subagent { task: "<continuation instruction>", resume: "<id>" }  # agent inferre
 - Guards, in order:
   1. The id must resolve — exact id with a readable meta sidecar, or a unique suffix among
      this session's persisted runs; otherwise the error lists the available persisted ids
-     (completed runs are cleaned up).
+     (completed foreground runs are cleaned up, and successes are not listed).
   2. The run must not be live — not running in this session, and its pidfile must not
      belong to a live process. A stale pidfile (parent crashed before cleanup) is
      auto-removed and the run is treated as interrupted. When the project-agent trust
@@ -264,9 +268,10 @@ subagent { task: "<continuation instruction>", resume: "<id>" }  # agent inferre
 `limit` transcript entries (default 20; entries render like the collapsed view).
 
 - `id` may be the exact filename id or a unique suffix (ambiguous suffixes list the matches).
-- Status is `running` (via the pidfile), `aborted`, `failed`, or `unknown` (no meta sidecar).
-  Successful runs are deleted on completion, so a bare id with no artifacts is
-  indistinguishable from a completed run — its output is in the parent's tool result.
+- Status is `running` (via the pidfile), `succeeded`, `aborted`, `failed`, or `unknown`
+  (no recorded outcome: the owning pi died before the run settled, or the run predates
+  kept outcomes). A successful foreground run is deleted on completion, so a bare id with
+  no artifacts is indistinguishable from one — its output is in the parent's tool result.
 - Works on still-running children (the JSONL is appended incrementally) — useful for
   debugging a stuck subagent.
 - Torn final lines (child killed mid-append) and unknown entry types are skipped.
@@ -451,64 +456,113 @@ no longer a `custom_message` entry and fires no `custom_message` event.
 
 The token is `<agentDir>/subagents/<id>.async` — a correlation key that must be
 derivable from the run id alone (a replay rebuilds it from the transcript). It is a real
-directory and holds two payloads with the same correlation string. The spawn side
-reports the path on the tool result's `details.asyncDir`, next to `details.asyncId` (the
-full run id); a tracker keys the two together, so a drift in either half strands the run
-with no error.
+directory, holding the run's transcript. The spawn side reports the path on the tool
+result's `details.asyncDir`, next to `details.asyncId` (the full run id); a consumer keys
+the two together, so a drift in either half strands the run with no error.
 
-`status.json` in that directory is the **live channel**, for trackers that poll rather
-than read a transcript:
-
-- Written at spawn (`state: "running"`, `startedAt`, one step for the dispatched agent
-  with `agent` + `status: "running"`, plus `sessionFile` naming the run's transcript from
-  the first poll) and again at settlement (`state`, `endedAt`, `lastUpdate`; step status
-  mirrors the run). A spawn-time background run's path is deterministic and inside the
-  run directory, so it is advertised before the child creates it: the tracker retries a
-  missing file indefinitely. Written atomically — temp file plus rename in the same
-  directory — so a poller never reads a half-written payload. The settlement write is not
-  session-scoped: it lands whatever the session epoch, since the directory it names
-  belongs to the run, not to a transcript.
-- `sessionFile` is only ever the run-directory transcript. A run whose child writes the
-  legacy `<id>.jsonl` — runtime-backgrounded mid-flight, or a background resume of a run
-  that was spawned in the foreground — omits `sessionFile` from both payloads rather than
-  naming a path no tracker followed from spawn and that success cleanup deletes.
-- A foreground resume of a run that has a `status.json` rewrites it terminal at
-  settlement, so the file does not keep the earlier run's outcome.
-- Shape: `{ runId, mode: "single", state, startedAt, endedAt?, lastUpdate, steps: [{ agent,
-  status?, sessionFile? }] }`, epoch milliseconds for the timestamps.
-- `state` is `running | complete | failed | stopped`; the internal outcome maps
-  `succeeded → complete`, `failed → failed`, `aborted → stopped`.
-- Quitting pi (and `session_shutdown` generally, plus the process `exit` hook) marks every
-  run still published as `running` as `stopped` synchronously, before the children are
-  killed: a quit exits in the same turn, so the killed child's own settlement never runs.
-  Where the process survives (reload, new, fork) that settlement still lands and
-  overwrites it. Only a hard kill of pi (SIGKILL, power loss) leaves `running` behind; the
-  directory then stays until something overwrites or removes it.
-- Retention: one sweep per pi process, 60 s after the extension first loads (session
-  replacement does not re-evaluate the module). It looks only at
-  `<agentDir>/subagents/*.async` directories, skips any run still live in this process or
-  whose `<id>.pid` names a live process (another pi resuming it), keeps anything with a
-  missing/unreadable `status.json` or a non-terminal state, and deletes a terminal run
-  (`complete | failed | stopped | rejected`) whose newest signal (`endedAt`/`lastUpdate`,
-  then the mtimes of the directory, `status.json`, and both transcript locations) is older
-  than 30 days — rename aside, then `rm -r`, with `*.async.deleting-*` crash residue older
-  than an hour reaped on the next pass. The whole run goes: once the directory is removed,
-  its `<id>.meta` / `<id>.pid` / `<id>.jsonl` siblings are deleted too.
-
-The `subagent-notify` entry described above remains the **durable replay channel**, and
-it is what a tracker that started after the run finished has to read: the entry survives
-in the parent transcript, `status.json` only outlives its directory.
+Nothing else in that directory is a settlement channel. A background spawn's tool call
+returns at spawn time, so the `subagent-notify` entry is the only record of how the run
+ended, and it survives in the parent transcript — which is what a consumer that started
+after the run finished has to read. Children die with the pi process that spawned them,
+so no live channel needs to outlive it. A live consumer in the same process uses the
+[control service](#programmatic-control-service) instead.
 
 Two behaviours a consumer must tolerate:
 
 - The header always reads `Background task …`, even for a foreground run the user sent to
   the background mid-flight with the manager view's `b` key.
-- A settlement arriving after `session_shutdown` writes no `subagent-notify` entry (the
-  run's session epoch is stale, so the entry — the only channel that lands in a transcript —
-  is suppressed). Its `status.json` **is** still written terminal (and was already marked
-  `stopped` by the shutdown handler): the file names a
-  run-scoped directory, not a transcript, so a tracker polling it settles instead of
-  displaying the run as running, and the retention sweep still deletes the directory.
+- A settlement arriving after `session_shutdown` writes no `subagent-notify` entry: the
+  run's session epoch is stale, so the entry — the only channel that lands in a
+  transcript — is suppressed, and the run leaves no terminal record anywhere.
+
+Retention: one sweep per pi process, 60 s after the extension first loads (session
+replacement does not re-evaluate the module). It looks only at
+`<agentDir>/subagents/*.async` directories, skips any run still registered in this process
+or whose `<id>.pid` names a live process (another pi resuming it), and deletes a directory
+whose newest activity — the mtimes of the directory, `transcript.jsonl`, and any legacy
+`<id>.jsonl` — is older than 30 days: rename aside, then `rm -r`, with
+`*.async.deleting-*` crash residue older than an hour reaped on the next pass. The whole
+run goes: once the directory is removed, its `<id>.meta` / `<id>.pid` / `<id>.jsonl`
+siblings are deleted too. Liveness, not a recorded outcome, gates the delete — a
+SIGKILLed pi leaves no terminal state anywhere, and its orphaned directory still has to go.
+The sweep also reaps `<id>.pid` files whose process is gone, for kept runs as well: read
+paths (the control listing, inspect, the status tile) never delete anything.
+
+### Programmatic control service
+
+An in-process controller (Paseo's runtime bridge) drives runs without an LLM turn through a
+service published on `globalThis[Symbol.for('pi-extensions:subagent:control')]`. The symbol
+string is the contract and stays stable; `version` is `1`.
+
+```ts
+interface SubagentControlService {
+    version: 1
+    list(): SubagentControlInfo[]
+    stop(id: string): Promise<SubagentControlResult>
+    background(id: string): Promise<SubagentControlResult>
+}
+
+interface SubagentControlInfo {
+    id: string // full run id
+    agent?: string
+    status: 'running' | 'completed' | 'failed' | 'canceled'
+    background: boolean // spawn-time or runtime background
+    capabilities: ('stop' | 'background')[]
+    sessionFile?: string // the run's transcript, when one exists on disk
+    title?: string // task preview
+}
+
+type SubagentControlResult =
+    | { ok: true; id: string; status: 'running' | 'completed' | 'failed' | 'canceled' }
+    | { ok: false; id: string; reason: string }
+```
+
+`list()` is scoped to the current pi session (captured on `session_start`) and merges three
+sources, later ones winning:
+
+1. `<id>.meta` sidecars whose `parentSessionId` is this session. A live `<id>.pid` reads as
+   `running`; otherwise the recorded outcome maps `succeeded → completed`,
+   `failed → failed`, `aborted → canceled`, and a missing or unparsable outcome (the owner died before settling) reads as
+   `canceled`. A meta without `parentSessionId`, or one that does not parse, is not listed.
+2. This process's registry: every run it spawned and has not yet seen exit reads as
+   `running`, including one that already settled its last turn but whose process has not
+   closed.
+3. Outcomes this process recorded at exit. A spawn-time background success (run-directory
+   transcript) also leaves `status: succeeded` in its meta, so it still lists as
+   `completed` after a restart, until the sweep removes it. A foreground or
+   runtime-backgrounded success deletes its meta, so this is its only record. Outcomes
+   survive a `/reload` of the same session and are dropped when a different session
+   starts; a manager-view delete drops the run's outcome with its files.
+
+Rows are ordered running first, then newest first. `background` is the registry's flag for
+a run this process owns; for a disk row it is true only while another process owns it live
+from a `.async` run directory.
+
+Capabilities come from state, not from the caller: `stop` only on a run this process owns
+and has not settled, `background` additionally only on a foreground single-mode run not yet
+converted (the manager view's `b` key gates). Rows owned by another process, or finished,
+advertise none.
+
+`stop(id)` and `background(id)` take the exact full run id; an empty id or a short-id
+suffix is refused rather than resolved (the `/subagents` command and the tools accept
+suffixes, the control service does not). A success replies `status: 'running'`: abort is
+asynchronous (SIGTERM, then SIGKILL) and conversion keeps the run going, so the terminal
+status is `list()`'s to report once the exit lands. Every failure, including an internal
+error, is `{ ok: false, reason }`; neither call throws.
+
+On `session_shutdown` the service is replaced, not deleted, by a stub whose `list()`
+returns `[]` and whose operations refuse with `session is shut down` — a missing symbol
+would claim the extension is not loaded. Shutdown only replaces the instance its own init
+published. That guards the symbol, not the session: the registry, the session id and the
+running children are module state for the one session a process serves, and shutdown
+resets them regardless. pi always shuts a session down before the next init, so the guard
+only matters for an out-of-order shutdown.
+
+The disk half costs one `readdir`, one `stat` per `.meta` (parsed again only when its
+mtime or size changed), and one pid read and liveness probe per pidfile, on every poll.
+Transcript paths are resolved from the same listing, including for outcome rows that have
+no meta. Failed and aborted foreground runs keep their meta until deleted (`d` in
+`/subagents`), so that count only grows.
 
 ### Running-subagents footer
 
@@ -632,8 +686,7 @@ resume hint:
   next turn boundary, so it cannot interrupt a running tool call, undo a committed edit, or
   stop a run that is already off the rails. Nothing in the parent observes whether the child
   obeys it, so the tool result says only "not yet in effect"
-- **L11 — a hard kill leaks the run directory**: when pi itself is SIGKILLed (or loses
-  power) neither the shutdown handler nor the exit hook runs, so a background run never writes a terminal
-  `status.json`, so its `running` directory and transcript stay on disk forever and are
-  never swept. The sweep has no orphan reconciliation by design; remove it manually
-  (`rm -r ~/.pi/agent/subagents/<id>.async`)
+- **L11 — a hard kill leaves no settlement record**: when pi itself is SIGKILLed (or loses
+  power) neither the shutdown handler nor the exit hook runs, so no `subagent-notify`
+  entry is written and nothing reports the outcome. The run directory is still reclaimed:
+  its child is gone, so the sweep deletes it 30 days after its last activity.

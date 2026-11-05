@@ -30,18 +30,15 @@ semantics this feature reuses at runtime.
   - `onUpdate` streaming stops (the tool call has returned);
   - when the child exits, the existing background settlement path runs
     (`settleBackgroundRun`: store in `backgroundResults`, coalesced completion
-    notification, footer refresh; plus the `subagent-notify` settlement entry and
-    the terminal `<asyncDir>/status.json` payload `finalizeExit` persists before
-    cleanup — the entry for transcript replay, the file for a poller), and
-    `subagent_collect` delivers the result.
+    notification, footer refresh; plus the `subagent-notify` settlement entry,
+    which is replayed from the parent transcript), and `subagent_collect`
+    delivers the result.
   The child's transcript lives in the same run directory: a spawn-time background
-  run is spawned with `--session <asyncDir>/transcript.jsonl`, so the status
-  payload can advertise `steps[].sessionFile` from the first poll, a tracker can
-  tail it live, and the 30-day sweep deletes it with the run. Success keeps the
-  transcript and removes only `.meta`/`.pid`.
+  run is spawned with `--session <asyncDir>/transcript.jsonl`, so the 30-day
+  sweep deletes it with the run. Success keeps the transcript and a `.meta`
+  recording `status: succeeded`, and removes only the `.pid`.
   Runtime backgrounding cannot move a file the child already has open: such a run
-  keeps `<id>.jsonl`, and both status payloads omit `sessionFile` instead of
-  naming a path no tracker followed.
+  keeps `<id>.jsonl`.
 - **Eligibility: foreground single-mode tool-call runs only**, including
   foreground `resume` runs (same dispatch call site). NOT parallel tasks, NOT
   chain steps, NOT `/subagents resume` handler spawns (no awaiting tool call),
@@ -62,8 +59,7 @@ semantics this feature reuses at runtime.
   else `<id>.jsonl`.
 - **Runtime-backgrounded transcripts stay legacy.** A foreground run has already
   been spawned with `--session <id>.jsonl` when `b` converts it; that file stays
-  where it is and is never advertised as `sessionFile` (the tracker only ever
-  followed the path from the first mapping).
+  where it is.
 - **Exit wins ties.** `runSingleAgent` awaits
   `Promise.race([exitCodePromise.then(…), backgroundizePromise.then(…)])` with
   the exit term FIRST in the array: when both promises are already settled,
@@ -123,8 +119,7 @@ semantics this feature reuses at runtime.
    manager `x` still kills it, and it settles as a failure notification.
 4. Child exit after the conversion → coalesced completion notification fires and
    exactly one `subagent-notify` settlement entry is appended (visible via its entry
-   renderer, absent from model context) next to the terminal `<asyncDir>/status.json`
-   write; `subagent_collect` returns the full result and clears the entry.
+   renderer, absent from model context); `subagent_collect` returns the full result and clears the entry.
 5. `b` on a parallel task, chain step, `/subagents resume` spawn, or
    spawn-time background row → refusal notice.
 6. `b` twice on the same row → "already backgrounded"; `b` on a row whose child

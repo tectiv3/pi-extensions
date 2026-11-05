@@ -42,9 +42,9 @@ cannot be settled from code are collected in §5 (verification checklist).
   SIGTERMs every `activeSubagents` child, drops the drain timer/queue and
   `backgroundResults`, clears the footer slot, and advances the session epoch so the
   killed runs' settlements write no completion notification into the replacement session.
-  The epoch guard covers the transcript entry only: the run's `status.json` is still
-  written terminal, because that file is run-scoped and the retention sweep only deletes
-  terminal runs. This is required, not cosmetic:
+  The epoch guard covers the transcript entry; the run directory needs no terminal marker,
+  because the retention sweep keys on liveness (registry entry, live `<id>.pid`), not on a
+  recorded outcome. This is required, not cosmetic:
   pi reloads and rebinds extensions on session replacement, which drops the module-level
   registries — a surviving child would be an untracked orphan. A `process.on('exit')` hook
   is kept as well, because pi's `uncaughtException` path calls `process.exit` without
@@ -117,7 +117,7 @@ subagent_inspect { id: "<shortId>" } for progress.
 `details` reuses `SubagentDetails` with mode `'single'` and an empty `results` array — the
 same shape the existing invalid-params paths already return, so renderers are unaffected.
 It additionally carries `asyncId` (the full run id) and `asyncDir`
-(`<agentDir>/subagents/<id>.async`) so an external tracker can correlate the spawn call
+(`<agentDir>/subagents/<id>.async`) so an external consumer can correlate the spawn call
 with the settlement notice that ends it; both are absent for foreground runs.
 
 **Spawn-bridge (pinned).** The background branch of `execute()` cannot await
@@ -291,8 +291,8 @@ subagent_collect { id: string }
 | Stall watchdog kill | close → sink, failure | failure (stall noted in stderr/diagnostics) |
 | Parent Escape | **no effect** (detached) | — |
 | `/subagents abort <id>` / manager `x` | close → sink, failure | failure (killed) |
-| Parent process exit | exit handler marks published runs `stopped` in `status.json`, then SIGTERM | lost with the process (documented) |
-| Quit/switch/fork/reload (`session_shutdown`) | mark published runs `stopped` in `status.json`, then SIGTERM live children + drop state | none (entry suppressed by the stale epoch; the run belonged to the old session). A quit exits before the child settles, so the handler's `stopped` write is final; otherwise the settlement overwrites it terminal |
+| Parent process exit | exit handler SIGTERMs live children | lost with the process (documented) |
+| Quit/switch/fork/reload (`session_shutdown`) | SIGTERM live children + drop state | none (entry suppressed by the stale epoch; the run belonged to the old session). No terminal outcome is recorded on disk |
 | Resume of this id (tool or `/subagents resume`) | registration-time supersession | none for the stale entry; the resume path's own handling applies |
 
 ---
@@ -462,9 +462,8 @@ on the target box before the feature is declared done:
 10. **Session switch with an in-flight background run** (`switchSession`/`newSession`/
     `fork`/`reload`): the run is SIGTERM'd on `session_shutdown`, the footer slot is
     cleared, and no completion notification fires for it. Verify: `/new` with a run in
-    flight → the child process is gone (`ps`), the footer is empty, no follow-up arrives,
-    and `<id>.async/status.json` reads a terminal `state` (not `running`). Repeat with a
-    quit (Ctrl+D): the status file must still read `stopped`.
+    flight → the child process is gone (`ps`), the footer is empty, no follow-up arrives.
+    Repeat with a quit (Ctrl+D): the child is gone too.
 11. **Cross-child relay mutex hold:** with a backgrounded dialog open, a second child's
     relay queues behind it; the queued child's stall watchdog keeps running (its
     `relayPending` is set only after the mutex) — observe the queued behavior and that

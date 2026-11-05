@@ -3,7 +3,6 @@ import {
     existsSync,
     mkdirSync,
     mkdtempSync,
-    readdirSync,
     readFileSync,
     rmSync,
     utimesSync,
@@ -14,12 +13,7 @@ import { tmpdir } from 'node:os'
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import test, { type TestContext } from 'node:test'
-import {
-    ASYNC_DIR_SUFFIX,
-    ASYNC_RETENTION_MS,
-    ASYNC_STATUS_FILE,
-    sweepExpiredAsyncDirs,
-} from './async-status.ts'
+import { ASYNC_DIR_SUFFIX, ASYNC_RETENTION_MS, sweepExpiredAsyncDirs } from './run-storage.ts'
 import { advanceSessionEpoch, currentSessionEpoch } from './session-epoch.ts'
 
 // The extension's entry module imports the host packages that pi provides at
@@ -84,6 +78,7 @@ type SingleResult = Parameters<SubagentModule['preSpawnMissReason']>[0]
 type SubagentModule = {
     default: (pi: unknown) => void
     recoverableMiss: (reason: string) => string
+    deletePersistedRunArtifacts: (subagentId: string) => string | undefined
     preSpawnMissReason: (result: any, subject?: string) => string | undefined
     emitBackgroundSettlement: (
         id: string,
@@ -305,21 +300,9 @@ test('recoverableMiss keeps one prefixed line', async () => {
 
 const STALE_RUN_ID = '0195f2c4-7b1e-7c3a-9f21-8d0e6a4b2c31'
 
-function readStatus(agentDir: string, runId: string): Record<string, any> {
-    return JSON.parse(
-        readFileSync(
-            join(agentDir, 'subagents', `${runId}${ASYNC_DIR_SUFFIX}`, ASYNC_STATUS_FILE),
-            'utf-8'
-        )
-    )
-}
-
-// The status file is the poller channel and names a run-scoped directory, so a
-// settlement that arrives after session_shutdown must still write it: without the
-// terminal state the directory reads `running` forever and the retention sweep —
-// which only deletes terminal runs — never reclaims it.
-test('a stale-epoch settlement still writes a sweepable terminal status file', async t => {
-    const agentDir = tempAgentDir(t)
+// A settlement that arrives after session_shutdown belongs to a run whose
+// transcript is gone: it must not write a notice into the replacement session.
+test('a stale-epoch settlement writes no notice entry', async () => {
     const { module, entries } = await loadDispatch()
     const staleEpoch = currentSessionEpoch()
     advanceSessionEpoch()
@@ -328,34 +311,9 @@ test('a stale-epoch settlement still writes a sweepable terminal status file', a
     module.emitBackgroundSettlement(STALE_RUN_ID, 'worker', 'failed', staleEpoch)
 
     assert.equal(entries.length, entriesBefore, 'no entry for a torn-down session')
-    const payload = readStatus(agentDir, STALE_RUN_ID)
-    assert.equal(payload.runId, STALE_RUN_ID)
-    assert.equal(payload.state, 'failed')
-    assert.equal(payload.endedAt, payload.lastUpdate)
-    // No spawn time recorded in this process: the payload falls back to endedAt
-    // rather than reporting a start after the end.
-    assert.equal(payload.startedAt, payload.endedAt)
-    assert.deepEqual(
-        payload.steps.map((step: { agent: string; status: string }) => [
-            step.agent,
-            step.status,
-        ]),
-        [['worker', 'failed']]
-    )
-
-    // The whole point: the directory the bug leaked is now sweepable.
-    const subagentsDir = join(agentDir, 'subagents')
-    assert.deepEqual(
-        sweepExpiredAsyncDirs(subagentsDir, {
-            now: payload.lastUpdate + ASYNC_RETENTION_MS + 1000,
-        }),
-        { scanned: 1, deleted: 1, kept: 0, reaped: 0 }
-    )
-    assert.deepEqual(readdirSync(subagentsDir), [])
 })
 
-test('a live-epoch settlement writes both channels', async t => {
-    const agentDir = tempAgentDir(t)
+test('a live-epoch settlement writes the notice entry', async () => {
     const { module, entries } = await loadDispatch()
 
     const entriesBefore = entries.length
@@ -365,7 +323,6 @@ test('a live-epoch settlement writes both channels', async t => {
     assert.equal(appended.length, 1, 'one entry per settlement')
     assert.equal(appended[0].customType, 'subagent-notify')
     assert.match(String((appended[0].data as { content: string }).content), /stopped/)
-    assert.equal(readStatus(agentDir, STALE_RUN_ID).state, 'stopped')
 })
 
 function existsFile(target: string): boolean {
@@ -416,7 +373,15 @@ if (sessionIndex !== -1) {
     }
     writeFileSync(session, JSON.stringify({ type: 'session', id: 'fake-session' }) + '\\n')
 }
-process.exit(0)
+if (process.env.FAKE_PI_HOLD) {
+    // Settled but not exited: the parent sees agent_settled while the process lives.
+    process.stdout.write(JSON.stringify({ type: 'agent_settled' }) + '\\n')
+    const deadline = Date.now() + 5000
+    while (!existsSync(process.env.FAKE_PI_HOLD) && Date.now() < deadline) {
+        await sleep(10)
+    }
+}
+process.exit(Number(process.env.FAKE_PI_EXIT_CODE ?? 0))
 `
 
 interface FakePi {
@@ -424,25 +389,43 @@ interface FakePi {
     spawnLog: string
     /** Lets a waiting child write its transcript and exit. */
     release: () => void
+    /** Makes the next spawn wait for another release. */
+    rearm: () => void
+    /** With holdAfterSettle: lets a settled child exit. */
+    releaseExit: () => void
 }
 
 /** Points getPiInvocation at the stand-in. */
 function useFakePi(
     t: TestContext,
     agentDir: string,
-    opts: { waitForRelease?: boolean } = {}
+    opts: { waitForRelease?: boolean; holdAfterSettle?: boolean; exitCode?: number } = {}
 ): FakePi {
     const script = join(agentDir, 'fake-pi.mjs')
     const spawnLog = join(agentDir, 'spawn-session.log')
     const waitPath = join(agentDir, 'fake-pi-go')
+    const holdPath = join(agentDir, 'fake-pi-exit')
     writeFileSync(script, FAKE_PI_SOURCE)
     const previousArgv1 = process.argv[1]
     const previousLog = process.env.FAKE_PI_LOG
     const previousWait = process.env.FAKE_PI_WAIT
+    const previousHold = process.env.FAKE_PI_HOLD
+    const previousExitCode = process.env.FAKE_PI_EXIT_CODE
     process.argv[1] = script
     process.env.FAKE_PI_LOG = spawnLog
     if (opts.waitForRelease) process.env.FAKE_PI_WAIT = waitPath
     else delete process.env.FAKE_PI_WAIT
+    if (opts.holdAfterSettle) process.env.FAKE_PI_HOLD = holdPath
+    else delete process.env.FAKE_PI_HOLD
+    if (opts.exitCode !== undefined) process.env.FAKE_PI_EXIT_CODE = String(opts.exitCode)
+    else delete process.env.FAKE_PI_EXIT_CODE
+    const releaseExit = () => {
+        try {
+            writeFileSync(holdPath, 'go')
+        } catch {
+            // Temp dir already cleaned up; the child's deadline ends the hold.
+        }
+    }
     const release = () => {
         try {
             writeFileSync(waitPath, 'go')
@@ -454,28 +437,25 @@ function useFakePi(
     t.after(() => {
         // Never leave a waiting child behind when an assertion failed first.
         release()
+        releaseExit()
         process.argv[1] = previousArgv1
         if (previousLog === undefined) delete process.env.FAKE_PI_LOG
         else process.env.FAKE_PI_LOG = previousLog
         if (previousWait === undefined) delete process.env.FAKE_PI_WAIT
         else process.env.FAKE_PI_WAIT = previousWait
+        if (previousHold === undefined) delete process.env.FAKE_PI_HOLD
+        else process.env.FAKE_PI_HOLD = previousHold
+        if (previousExitCode === undefined) delete process.env.FAKE_PI_EXIT_CODE
+        else process.env.FAKE_PI_EXIT_CODE = previousExitCode
     })
-    return { spawnLog, release }
+    const rearm = () => rmSync(waitPath, { force: true })
+    return { spawnLog, release, rearm, releaseExit }
 }
 
 function spawnedSession(log: string): string | undefined {
     if (!existsFile(log)) return undefined
     const value = readFileSync(log, 'utf-8').trim()
     return value.length > 0 ? value : undefined
-}
-
-function terminalStatus(asyncDir: string): Record<string, any> | undefined {
-    try {
-        const payload = JSON.parse(readFileSync(join(asyncDir, ASYNC_STATUS_FILE), 'utf-8'))
-        return payload.state === 'running' ? undefined : payload
-    } catch {
-        return undefined
-    }
 }
 
 test('a background spawn writes its transcript inside the run directory and keeps it on success', async t => {
@@ -498,30 +478,29 @@ test('a background spawn writes its transcript inside the run directory and keep
     const asyncDir = details.asyncDir
     const transcript = join(asyncDir, 'transcript.jsonl')
     assert.equal(transcript.startsWith(asyncDir), true)
+    assert.equal(existsFile(transcript), false, 'the child has not written it yet')
 
-    // The first poll already names the transcript, before the child has created
-    // it: the tracker retries a missing file, so waiting for an existsSync gate
-    // would only lose the live half of the run.
-    const spawnPayload = readStatus(agentDir, details.asyncId)
-    assert.equal(spawnPayload.state, 'running')
-    assert.equal(spawnPayload.steps[0].sessionFile, transcript)
-    assert.equal(existsFile(transcript), false)
-
-    // `--session` and the status step name the same file, so a tracker that
-    // registers the step follows the transcript the child actually writes.
+    // The child's own `--session` is the file the run directory advertises.
     assert.equal(
         await waitFor(() => spawnedSession(fake.spawnLog), 'the child spawn'),
         transcript
     )
     fake.release()
-    const payload = await waitFor(() => terminalStatus(asyncDir), 'the terminal status')
-    assert.equal(payload.state, 'complete')
-    assert.equal(payload.steps[0].sessionFile, transcript)
+    await waitFor(
+        () =>
+            existsFile(join(agentDir, 'subagents', `${details.asyncId}.pid`))
+                ? undefined
+                : true,
+        'the child exit'
+    )
 
-    // Success cleanup: retention owns the transcript, the meta-driven list is not
-    // left pointing at nothing.
+    // Retention owns the transcript and the meta, which now records the outcome.
     assert.equal(existsFile(transcript), true)
-    assert.equal(existsFile(join(agentDir, 'subagents', `${details.asyncId}.meta`)), false)
+    const metaPath = join(agentDir, 'subagents', `${details.asyncId}.meta`)
+    assert.equal(
+        (JSON.parse(readFileSync(metaPath, 'utf-8')) as { status?: string }).status,
+        'succeeded'
+    )
 })
 
 test('a foreground spawn keeps the legacy path and deletes transcript and meta on success', async t => {
@@ -570,55 +549,6 @@ function seedFailedRun(agentDir: string, id: string): string {
     return dir
 }
 
-function statusOf(asyncDir: string): Record<string, any> | undefined {
-    try {
-        return JSON.parse(readFileSync(join(asyncDir, ASYNC_STATUS_FILE), 'utf-8'))
-    } catch {
-        return undefined
-    }
-}
-
-// A quit disposes the runtime and exits in the same turn, so the killed child's
-// close event never drives a settlement: the shutdown handler itself has to leave
-// the tracker a terminal state.
-test('session shutdown marks an in-flight background run stopped before any child event', async t => {
-    const agentDir = tempAgentDir(t)
-    seedAgent(agentDir)
-    const fake = useFakePi(t, agentDir, { waitForRelease: true })
-    const { subagent, handlers } = await loadDispatch()
-
-    const result = await subagent.execute(
-        'tool-call-1',
-        { agent: 'worker', task: 'do it' },
-        undefined,
-        undefined,
-        makeCtx(agentDir)
-    )
-    const asyncDir = (result.details as { asyncDir?: string }).asyncDir
-    assert.ok(asyncDir)
-    assert.equal(statusOf(asyncDir)?.state, 'running')
-
-    const shutdown = handlers.get('session_shutdown')
-    assert.ok(shutdown, 'the shutdown handler is registered')
-    shutdown()
-    const payload = statusOf(asyncDir)
-    assert.equal(payload?.state, 'stopped', 'written synchronously inside the handler')
-    assert.equal(payload?.endedAt, payload?.lastUpdate)
-    assert.ok(payload?.startedAt <= payload?.endedAt)
-    assert.equal(payload?.steps[0].sessionFile, join(asyncDir, 'transcript.jsonl'))
-
-    fake.release()
-    // The killed child's own settlement still lands, and stays terminal.
-    await waitFor(
-        () =>
-            existsFile(join(agentDir, 'subagents', 'stub0000-0000-4000-8000-000000000000.pid'))
-                ? undefined
-                : true,
-        'the child exit'
-    )
-    assert.notEqual(statusOf(asyncDir)?.state, 'running')
-})
-
 test('resume refuses a run whose transcript is gone', async t => {
     const agentDir = tempAgentDir(t)
     seedAgent(agentDir)
@@ -643,18 +573,10 @@ test('resume refuses a run the retention sweep deleted', async t => {
     const subagentsDir = seedFailedRun(agentDir, RESUME_ID)
     const runDir = join(subagentsDir, `${RESUME_ID}${ASYNC_DIR_SUFFIX}`)
     mkdirSync(runDir)
-    writeFileSync(join(runDir, 'transcript.jsonl'), '{}\n')
+    const transcript = join(runDir, 'transcript.jsonl')
+    writeFileSync(transcript, '{}\n')
     const old = Date.now() - ASYNC_RETENTION_MS - 60_000
-    writeFileSync(
-        join(runDir, ASYNC_STATUS_FILE),
-        JSON.stringify({ runId: RESUME_ID, state: 'failed', endedAt: old, lastUpdate: old })
-    )
-    for (const target of [
-        join(runDir, 'transcript.jsonl'),
-        join(runDir, ASYNC_STATUS_FILE),
-        join(subagentsDir, `${RESUME_ID}.meta`),
-        runDir,
-    ]) {
+    for (const target of [transcript, runDir]) {
         utimesSync(target, new Date(old), new Date(old))
     }
 
@@ -673,7 +595,7 @@ test('resume refuses a run the retention sweep deleted', async t => {
     assert.equal(result.isError, true)
 })
 
-test('a foreground resume of a background run keeps its transcript and refreshes its status', async t => {
+test('a foreground resume of a background run keeps its transcript', async t => {
     const agentDir = tempAgentDir(t)
     seedAgent(agentDir)
     useFakePi(t, agentDir)
@@ -682,19 +604,7 @@ test('a foreground resume of a background run keeps its transcript and refreshes
     const transcript = join(runDir, 'transcript.jsonl')
     mkdirSync(runDir)
     writeFileSync(transcript, JSON.stringify({ type: 'session', id: 'earlier' }) + '\n')
-    writeFileSync(
-        join(runDir, ASYNC_STATUS_FILE),
-        JSON.stringify({
-            runId: RESUME_ID,
-            mode: 'single',
-            state: 'failed',
-            startedAt: 1,
-            endedAt: 2,
-            lastUpdate: 2,
-            steps: [{ agent: 'worker', status: 'failed', sessionFile: transcript }],
-        })
-    )
-    const { subagent, tools } = await loadDispatch()
+    const { module, subagent, tools } = await loadDispatch()
 
     const result = await subagent.execute(
         'tool-call-1',
@@ -705,10 +615,12 @@ test('a foreground resume of a background run keeps its transcript and refreshes
     )
     assert.equal(result.isError, undefined, textOf(result))
     assert.equal(existsFile(transcript), true, 'retention still owns the transcript')
-    assert.equal(existsFile(join(subagentsDir, `${RESUME_ID}.meta`)), false)
-    const payload = statusOf(runDir)
-    assert.equal(payload?.state, 'complete')
-    assert.equal(payload?.steps[0].sessionFile, transcript)
+    const meta = JSON.parse(
+        readFileSync(join(subagentsDir, `${RESUME_ID}.meta`), 'utf-8')
+    ) as {
+        status?: string
+    }
+    assert.equal(meta.status, 'succeeded', 'the kept meta records the outcome')
 
     const inspect = tools.get('subagent_inspect')
     assert.ok(inspect)
@@ -722,36 +634,25 @@ test('a foreground resume of a background run keeps its transcript and refreshes
         )
     )
     assert.match(report, /Status: succeeded/)
-    assert.match(report, /Agent: worker/)
-})
 
-test('a background resume of a legacy-transcript run advertises no sessionFile', async t => {
-    const agentDir = tempAgentDir(t)
-    seedAgent(agentDir)
-    const fake = useFakePi(t, agentDir, { waitForRelease: true })
-    const subagentsDir = seedFailedRun(agentDir, RESUME_ID)
-    const legacy = join(subagentsDir, `${RESUME_ID}.jsonl`)
-    writeFileSync(legacy, JSON.stringify({ type: 'session', id: 'earlier' }) + '\n')
-    const { subagent } = await loadDispatch()
-
-    const result = await subagent.execute(
-        'tool-call-1',
-        { agent: 'worker', task: 'continue', resume: RESUME_ID },
-        undefined,
-        undefined,
-        makeCtx(agentDir)
-    )
-    const asyncDir = (result.details as { asyncDir?: string }).asyncDir
-    assert.ok(asyncDir, textOf(result))
-    assert.equal(statusOf(asyncDir)?.state, 'running')
-    assert.equal(statusOf(asyncDir)?.steps[0].sessionFile, undefined)
-    assert.equal(await waitFor(() => spawnedSession(fake.spawnLog), 'the child spawn'), legacy)
-
-    fake.release()
-    const payload = await waitFor(() => terminalStatus(asyncDir), 'the terminal status')
-    assert.equal(payload.state, 'complete')
-    assert.equal(payload.steps[0].sessionFile, undefined)
-    assert.equal(existsFile(legacy), false, 'a legacy transcript keeps the success cleanup')
+    // Listings show what needs attention; the success stays out of the report.
+    let handler: ((args: string, ctx: unknown) => Promise<void>) | undefined
+    module.default({
+        ...(stubExtensionApi() as Record<string, unknown>),
+        registerCommand: (
+            name: string,
+            command: { handler: (args: string, ctx: unknown) => Promise<void> }
+        ) => {
+            if (name === 'subagents') handler = command.handler
+        },
+    })
+    assert.ok(handler, 'the /subagents command was registered')
+    const notices: string[] = []
+    await handler('', {
+        ...(makeCtx(agentDir) as Record<string, unknown>),
+        ui: { notify: (message: string) => notices.push(message) },
+    })
+    assert.deepEqual(notices, ['No persisted subagent runs from this session.'])
 })
 
 test('a resume without an agent continues as the agent the run recorded', async t => {
@@ -773,15 +674,18 @@ test('a resume without an agent continues as the agent the run recorded', async 
     const asyncDir = (result.details as { asyncDir?: string }).asyncDir
     assert.ok(asyncDir, textOf(result))
     assert.equal(result.isError, undefined, textOf(result))
-    // The meta sidecar supplied the agent: the spawn payload names it, and the
+    // The meta sidecar supplied the agent: the spawn result names it, and the
     // child was started on the run's own transcript.
-    assert.equal(statusOf(asyncDir)?.steps[0].agent, 'worker')
+    assert.match(textOf(result), /agent: worker/)
     assert.equal(await waitFor(() => spawnedSession(fake.spawnLog), 'the child spawn'), legacy)
 
+    // The next test resumes the same id, which is refused while this run is
+    // still registered: wait for the child to settle.
     fake.release()
-    const payload = await waitFor(() => terminalStatus(asyncDir), 'the terminal status')
-    assert.equal(payload.state, 'complete')
-    assert.equal(payload.steps[0].agent, 'worker')
+    await waitFor(
+        () => (existsFile(join(subagentsDir, `${RESUME_ID}.pid`)) ? undefined : true),
+        'the child exit'
+    )
 })
 
 test('a resume with an empty agent string infers the recorded agent', async t => {
@@ -938,4 +842,637 @@ test('a resume re-checks liveness after the trust confirm', async t => {
     )
     assert.equal(result.isError, true)
     assert.match(textOf(result), /is still running \(pid \d+\)/)
+})
+
+// ── Programmatic control service ─────────────────────────────────────
+//
+// Paseo's in-process bridge reads this off globalThis. These tests pin the
+// contract key, the capabilities derived from state, and fail-closed behavior.
+
+const CONTROL_KEY = 'pi-extensions:subagent:control'
+
+interface ControlInfo {
+    id: string
+    agent?: string
+    status: string
+    background: boolean
+    capabilities: string[]
+    sessionFile?: string
+    title?: string
+}
+
+interface ControlResult {
+    ok: boolean
+    id: string
+    status?: string
+    reason?: string
+}
+
+interface ControlService {
+    version: number
+    list(): ControlInfo[]
+    stop(id: string): Promise<ControlResult>
+    background(id: string): Promise<ControlResult>
+}
+
+function controlService(): ControlService {
+    const service = (globalThis as unknown as Record<symbol, ControlService | undefined>)[
+        Symbol.for(CONTROL_KEY)
+    ]
+    assert.ok(service, 'extension init published the control service')
+    return service
+}
+
+/** The extension factory runs once per load and again on reload. */
+function stubExtensionApi(): unknown {
+    return {
+        registerTool: () => {},
+        registerCommand: () => {},
+        registerShortcut: () => {},
+        registerEntryRenderer: () => {},
+        registerMarkdownTheme: () => {},
+        registerToolRenderer: () => {},
+        on: () => {},
+        appendEntry: () => {},
+    }
+}
+
+/** A fresh init whose lifecycle handlers the test drives itself. */
+function initWithHandlers(
+    module: SubagentModule
+): Map<string, (...args: unknown[]) => unknown> {
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+    module.default({
+        ...(stubExtensionApi() as Record<string, unknown>),
+        on: (event: string, handler: (...args: unknown[]) => unknown) =>
+            handlers.set(event, handler),
+    })
+    return handlers
+}
+
+const CONTROL_ABORTED_ID = '0195f2c4-7b1e-7c3a-9f21-8d0e6a4b2caa'
+const CONTROL_FOREIGN_ID = '0195f2c4-7b1e-7c3a-9f21-8d0e6a4b2cac'
+const CONTROL_OTHER_SESSION_ID = '0195f2c4-7b1e-7c3a-9f21-8d0e6a4b2cad'
+const CONTROL_UNSCOPED_ID = '0195f2c4-7b1e-7c3a-9f21-8d0e6a4b2cae'
+const CONTROL_UNPARSABLE_ID = '0195f2c4-7b1e-7c3a-9f21-8d0e6a4b2caf'
+
+function seedControlStore(agentDir: string): string {
+    const dir = join(agentDir, 'subagents')
+    mkdirSync(dir, { recursive: true })
+
+    // Aborted run: meta survives, transcript on the legacy path.
+    writeFileSync(
+        join(dir, `${CONTROL_ABORTED_ID}.meta`),
+        JSON.stringify({
+            agent: 'worker',
+            task: 'resume\nme',
+            startedAt: new Date().toISOString(),
+            promptHash: PROMPT_HASH,
+            parentSessionId: 'test-session',
+            status: 'aborted',
+        })
+    )
+    writeFileSync(join(dir, `${CONTROL_ABORTED_ID}.jsonl`), '{}\n')
+
+    // Another process's live child: status derives to running, but this
+    // process has no entry to abort or background.
+    writeFileSync(
+        join(dir, `${CONTROL_FOREIGN_ID}.meta`),
+        JSON.stringify({
+            agent: 'worker',
+            task: 'elsewhere',
+            startedAt: new Date().toISOString(),
+            promptHash: PROMPT_HASH,
+            parentSessionId: 'test-session',
+        })
+    )
+    writeFileSync(join(dir, `${CONTROL_FOREIGN_ID}.pid`), `${process.pid}\n`)
+
+    // None of these belong to this session's listing.
+    const excluded = {
+        agent: 'worker',
+        task: 'not mine',
+        startedAt: new Date().toISOString(),
+        promptHash: PROMPT_HASH,
+        status: 'failed',
+    }
+    writeFileSync(
+        join(dir, `${CONTROL_OTHER_SESSION_ID}.meta`),
+        JSON.stringify({ ...excluded, parentSessionId: 'other-session' })
+    )
+    writeFileSync(join(dir, `${CONTROL_UNSCOPED_ID}.meta`), JSON.stringify(excluded))
+    writeFileSync(join(dir, `${CONTROL_UNPARSABLE_ID}.meta`), '{not json')
+    return dir
+}
+
+test('init publishes the control service under the contract symbol and re-init replaces it', async () => {
+    const { module } = await loadDispatch()
+    const first = controlService()
+
+    assert.equal(first.version, 1)
+    assert.deepEqual(Object.keys(first).sort(), ['background', 'list', 'stop', 'version'])
+
+    module.default(stubExtensionApi())
+    const second = controlService()
+    assert.notEqual(second, first, 'a re-init publishes a fresh service')
+    assert.equal(second.version, 1)
+})
+
+test('list exposes active and persisted rows with state-derived capabilities', async t => {
+    const agentDir = tempAgentDir(t)
+    seedControlStore(agentDir)
+    const { subagent } = await loadDispatch()
+    // The persisted rows are session-scoped; this is the capture point.
+    await subagent.execute(
+        'capture-session',
+        { agent: 'ghost', task: 'noop' },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+
+    const infos = controlService().list()
+    const byId = new Map(infos.map(info => [info.id, info]))
+    // Another session's meta, a meta without parentSessionId, and an unparsable
+    // meta are all out of scope.
+    assert.deepEqual([...byId.keys()].sort(), [CONTROL_ABORTED_ID, CONTROL_FOREIGN_ID].sort())
+
+    const aborted = byId.get(CONTROL_ABORTED_ID)
+    assert.ok(aborted)
+    assert.equal(aborted.status, 'canceled')
+    assert.equal(aborted.agent, 'worker')
+    assert.equal(aborted.title, 'resume me')
+    assert.equal(
+        aborted.sessionFile,
+        join(agentDir, 'subagents', `${CONTROL_ABORTED_ID}.jsonl`)
+    )
+    assert.equal(aborted.background, false)
+    // Nothing live to abort or convert: capabilities come from the registry.
+    assert.deepEqual(aborted.capabilities, [])
+
+    const foreign = byId.get(CONTROL_FOREIGN_ID)
+    assert.ok(foreign)
+    assert.equal(foreign.status, 'running', 'a live pidfile in another process')
+    assert.deepEqual(foreign.capabilities, [])
+
+    // Running rows first, mirroring the manager's RUNNING section.
+    assert.equal(infos[0].id, CONTROL_FOREIGN_ID)
+})
+
+test('control operations fail closed instead of throwing', async t => {
+    tempAgentDir(t)
+    await loadDispatch()
+    const service = controlService()
+    const unknownId = '0195f2c4-7b1e-7c3a-9f21-8d0e6a4b2cff'
+
+    const stop = await service.stop(unknownId)
+    assert.equal(stop.ok, false)
+    assert.equal(stop.id, unknownId)
+    assert.match(stop.reason ?? '', /no running subagent with id/)
+
+    const background = await service.background(unknownId)
+    assert.equal(background.ok, false)
+    assert.equal(background.id, unknownId)
+    assert.match(background.reason ?? '', /no running subagent with id/)
+
+    assert.deepEqual(service.list(), [], 'an empty store lists nothing')
+})
+
+test('a live foreground run advertises background and stop, and both drive it', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(agentDir)
+    useFakePi(t, agentDir, { waitForRelease: true })
+    const { subagent } = await loadDispatch()
+    const service = controlService()
+
+    const pending = subagent.execute(
+        'tool-call-control',
+        { agent: 'worker', task: 'watch me', background: false },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+
+    const live = await waitFor(
+        () => service.list().find(info => info.status === 'running'),
+        'the live registry row'
+    )
+    assert.equal(live.background, false)
+    assert.deepEqual([...live.capabilities].sort(), ['background', 'stop'])
+    assert.equal(live.title, 'watch me')
+
+    // Exact ids only: with one run live, an empty id or a unique suffix must not
+    // resolve to it the way the human-facing commands do.
+    const empty = await service.stop('')
+    assert.equal(empty.ok, false)
+    assert.match(empty.reason ?? '', /id is required/)
+    const suffix = await service.stop(live.id.slice(-8))
+    assert.equal(suffix.ok, false)
+    assert.match(suffix.reason ?? '', /no running subagent with id/)
+    const suffixBackground = await service.background(live.id.slice(-8))
+    assert.equal(suffixBackground.ok, false)
+    assert.equal(
+        service.list().find(info => info.id === live.id)?.status,
+        'running',
+        'the refused calls left the run alone'
+    )
+
+    const converted = await service.background(live.id)
+    assert.equal(converted.ok, true)
+    assert.equal(converted.id, live.id)
+
+    const after = service.list().find(info => info.id === live.id)
+    assert.ok(after)
+    assert.equal(after.background, true)
+    // One-shot conversion: the manager's refusals apply unchanged.
+    assert.deepEqual(after.capabilities, ['stop'])
+    const again = await service.background(live.id)
+    assert.equal(again.ok, false)
+    assert.match(again.reason ?? '', /already backgrounded$/)
+
+    // Conversion is what returns the awaiting tool call; the child keeps running.
+    assert.match(textOf(await pending), /sent to the background by the user/)
+
+    const stopped = await service.stop(live.id)
+    assert.equal(stopped.ok, true)
+    assert.equal(stopped.id, live.id)
+    const settled = await waitFor(
+        () => service.list().find(info => info.id === live.id && info.status === 'canceled'),
+        'the aborted row'
+    )
+    assert.deepEqual(settled.capabilities, [])
+    assert.equal(settled.background, false, 'not running any more')
+})
+
+test('a spawn-time background run is background with only stop', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(agentDir)
+    const fake = useFakePi(t, agentDir, { waitForRelease: true })
+    const { subagent } = await loadDispatch()
+    const service = controlService()
+
+    const result = await subagent.execute(
+        'tool-call-background',
+        { agent: 'worker', task: 'detached' },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+    const { asyncId } = result.details as { asyncId?: string }
+    assert.ok(asyncId)
+
+    const info = await waitFor(
+        () => service.list().find(row => row.id === asyncId),
+        'the background row'
+    )
+    assert.equal(info.status, 'running')
+    assert.equal(info.background, true)
+    assert.deepEqual(info.capabilities, ['stop'])
+
+    const stopped = await service.stop(asyncId)
+    assert.equal(stopped.ok, true)
+    fake.release()
+    await waitFor(
+        () => service.list().find(row => row.id === asyncId && row.status === 'canceled'),
+        'the stopped background row'
+    )
+})
+
+test('stop replies running, never a terminal status it did not observe', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(agentDir)
+    useFakePi(t, agentDir, { waitForRelease: true })
+    const { subagent } = await loadDispatch()
+    const service = controlService()
+
+    const pending = subagent.execute(
+        'tool-call-stop-measure',
+        { agent: 'worker', task: 'measure me', background: false },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+    const live = await waitFor(
+        () => service.list().find(info => info.status === 'running'),
+        'the live registry row'
+    )
+
+    const stopped = await service.stop(live.id)
+    assert.equal(stopped.ok, true)
+    // The registry still holds the row while the reply is built — unregistration
+    // runs on the child's 'close' — so the reply carries that measurement and not
+    // the settlement it has not seen. Any terminal value here would be a guess:
+    // the run may end as canceled, failed, or (racing an exit) completed.
+    assert.equal(stopped.status, 'running')
+
+    // The settlement arrives after the reply, which is exactly why the reply must
+    // not pre-empt it.
+    await pending
+    await waitFor(
+        () => service.list().find(info => info.id === live.id && info.status === 'canceled'),
+        'the aborted row'
+    )
+})
+
+test('session shutdown retires the control service instead of serving the dead session', async t => {
+    const agentDir = tempAgentDir(t)
+    seedControlStore(agentDir)
+    const { module } = await loadDispatch()
+    const handlers = initWithHandlers(module)
+    const start = handlers.get('session_start')
+    assert.ok(start, 'the extension registered a session_start handler')
+    // session_start alone scopes the listing; no tool call is needed.
+    start({ type: 'session_start' }, makeCtx(agentDir))
+    const live = controlService()
+    assert.equal(live.list().length, 2, 'the session-scoped rows are listed while it lives')
+
+    const shutdown = handlers.get('session_shutdown')
+    assert.ok(shutdown, 'the extension registered a session_shutdown handler')
+    shutdown()
+
+    // Replaced, not deleted: the symbol string is the published contract, so a
+    // version-1 service answers instead of the adapter reporting the extension
+    // as unloaded.
+    const retired = controlService()
+    assert.notEqual(retired, live)
+    assert.equal(retired.version, 1)
+    assert.deepEqual(retired.list(), [], 'no row of the dead session survives')
+
+    const stopped = await retired.stop(CONTROL_ABORTED_ID)
+    assert.equal(stopped.ok, false)
+    assert.equal(stopped.id, CONTROL_ABORTED_ID)
+    assert.match(stopped.reason ?? '', /session is shut down/)
+
+    const background = await retired.background(CONTROL_FOREIGN_ID)
+    assert.equal(background.ok, false)
+    assert.match(background.reason ?? '', /session is shut down/)
+
+    // The replacement session lists its own rows as soon as it starts.
+    const next = initWithHandlers(module)
+    assert.deepEqual(controlService().list(), [], 'no session captured before session_start')
+    next.get('session_start')?.({ type: 'session_start' }, makeCtx(agentDir))
+    assert.equal(controlService().list().length, 2)
+})
+
+test("an older session shutdown does not retire a newer init's service", async t => {
+    tempAgentDir(t)
+    const { module } = await loadDispatch()
+    const older = initWithHandlers(module)
+    initWithHandlers(module)
+    const newer = controlService()
+
+    older.get('session_shutdown')?.()
+    assert.equal(controlService(), newer, 'the newer registration survives')
+})
+
+test('a successful run lists as completed after it exits', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(agentDir)
+    useFakePi(t, agentDir)
+    const { subagent } = await loadDispatch()
+    const service = controlService()
+
+    const result = await subagent.execute(
+        'tool-call-control-success',
+        { agent: 'worker', task: 'finish me', background: false },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+    assert.notEqual(result.isError, true)
+    // Outcomes are scoped to this test's store, so the title identifies the run.
+    const rows = service.list().filter(info => info.title === 'finish me')
+    assert.equal(rows.length, 1)
+    const [row] = rows
+    assert.ok(row, 'the success is still listed although its meta is gone')
+    assert.equal(row.status, 'completed')
+    assert.deepEqual(row.capabilities, [])
+    assert.equal(row.agent, 'worker')
+})
+
+test('a resume clears the previous outcome while the run is live again', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(agentDir)
+    const fake = useFakePi(t, agentDir, { waitForRelease: true })
+    const { subagent } = await loadDispatch()
+    const service = controlService()
+
+    const spawned = await subagent.execute(
+        'tool-call-resume-outcome',
+        { agent: 'worker', task: 'first pass' },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+    const { asyncId } = spawned.details as { asyncId?: string }
+    assert.ok(asyncId)
+    fake.release()
+    await waitFor(
+        () => service.list().find(row => row.id === asyncId && row.status === 'completed'),
+        'the completed first run'
+    )
+
+    fake.rearm()
+    const pending = subagent.execute(
+        'tool-call-resume-outcome-2',
+        { agent: 'worker', task: 'second pass', resume: asyncId, background: false },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+    const live = await waitFor(
+        () => service.list().find(row => row.id === asyncId && row.status === 'running'),
+        'the resumed run listed as running, not as its old outcome'
+    )
+    assert.ok(live.capabilities.includes('stop'))
+    fake.release()
+    assert.notEqual((await pending).isError, true)
+})
+
+test('a settled run that has not exited lists as running with no capabilities', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(agentDir)
+    const fake = useFakePi(t, agentDir, { holdAfterSettle: true })
+    const { subagent } = await loadDispatch()
+    const service = controlService()
+
+    const result = await subagent.execute(
+        'tool-call-settled-hold',
+        { agent: 'worker', task: 'settle then linger' },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+    const { asyncId } = result.details as { asyncId?: string }
+    assert.ok(asyncId)
+    const settled = await waitFor(
+        () => service.list().find(row => row.id === asyncId && row.capabilities.length === 0),
+        'the settled row'
+    )
+    assert.equal(settled.status, 'running', 'no outcome until the process exits')
+    const stop = await service.stop(asyncId)
+    assert.equal(stop.ok, false, 'a settled run is not operable')
+
+    fake.releaseExit()
+    await waitFor(
+        () => service.list().find(row => row.id === asyncId && row.status === 'completed'),
+        'the outcome once the process exits'
+    )
+})
+
+test('outcomes survive a reload of the same session and go with a different one', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(agentDir)
+    useFakePi(t, agentDir)
+    const { module, subagent } = await loadDispatch()
+    await subagent.execute(
+        'tool-call-reload-outcome',
+        { agent: 'worker', task: 'before reload', background: false },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+    const completed = () =>
+        controlService()
+            .list()
+            .filter(row => row.title === 'before reload' && row.status === 'completed')
+    assert.equal(completed().length, 1)
+
+    // /reload: shutdown, a fresh init, and session_start with the same session id.
+    const reloaded = initWithHandlers(module)
+    reloaded.get('session_start')?.({ type: 'session_start' }, makeCtx(agentDir))
+    assert.equal(
+        completed().length,
+        1,
+        'a foreground success has no meta; the outcome is its record'
+    )
+
+    const switched = initWithHandlers(module)
+    switched.get('session_start')?.(
+        { type: 'session_start' },
+        {
+            ...(makeCtx(agentDir) as Record<string, unknown>),
+            sessionManager: { getSessionId: () => 'other-session' },
+        }
+    )
+    switched.get('session_start')?.({ type: 'session_start' }, makeCtx(agentDir))
+    assert.equal(completed().length, 0, 'switching sessions pruned the outcome')
+})
+
+test('deleting a persisted run drops its recorded outcome', async t => {
+    const agentDir = tempAgentDir(t)
+    seedAgent(agentDir)
+    useFakePi(t, agentDir, { exitCode: 1 })
+    const { module, subagent } = await loadDispatch()
+    const result = await subagent.execute(
+        'tool-call-delete-outcome',
+        { agent: 'worker', task: 'fail then delete', background: false },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+    const { results } = result.details as { results: Array<{ subagentId: string }> }
+    const id = results[0].subagentId
+    assert.equal(
+        controlService()
+            .list()
+            .find(row => row.id === id)?.status,
+        'failed'
+    )
+
+    assert.equal(module.deletePersistedRunArtifacts(id), undefined)
+    assert.equal(
+        controlService()
+            .list()
+            .find(row => row.id === id),
+        undefined,
+        'no row for a run whose files are gone'
+    )
+})
+
+test('a changed meta is re-read between polls', async t => {
+    const agentDir = tempAgentDir(t)
+    const dir = join(agentDir, 'subagents')
+    mkdirSync(dir, { recursive: true })
+    const metaPath = join(dir, `${CONTROL_ABORTED_ID}.meta`)
+    const meta = {
+        agent: 'worker',
+        task: 'changing',
+        startedAt: new Date().toISOString(),
+        promptHash: PROMPT_HASH,
+        parentSessionId: 'test-session',
+    }
+    writeFileSync(metaPath, JSON.stringify(meta))
+    const { subagent } = await loadDispatch()
+    await subagent.execute(
+        'capture-session',
+        { agent: 'ghost', task: 'noop' },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+    const status = () =>
+        controlService()
+            .list()
+            .find(row => row.id === CONTROL_ABORTED_ID)?.status
+    assert.equal(status(), 'canceled', 'no outcome recorded yet')
+
+    writeFileSync(metaPath, JSON.stringify({ ...meta, status: 'failed' }))
+    assert.equal(status(), 'failed')
+})
+
+test('a disk row is background only while a live owner runs it from a run directory', async t => {
+    const agentDir = tempAgentDir(t)
+    const dir = seedControlStore(agentDir)
+    const { subagent } = await loadDispatch()
+    await subagent.execute(
+        'capture-session',
+        { agent: 'ghost', task: 'noop' },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+    const foreign = () =>
+        controlService()
+            .list()
+            .find(row => row.id === CONTROL_FOREIGN_ID)
+    assert.equal(foreign()?.background, false, 'live, but no run directory')
+
+    mkdirSync(join(dir, `${CONTROL_FOREIGN_ID}${ASYNC_DIR_SUFFIX}`))
+    assert.equal(foreign()?.background, true)
+
+    // A run directory without a live owner is a finished run, not a background one.
+    mkdirSync(join(dir, `${CONTROL_ABORTED_ID}${ASYNC_DIR_SUFFIX}`))
+    assert.equal(
+        controlService()
+            .list()
+            .find(row => row.id === CONTROL_ABORTED_ID)?.background,
+        false
+    )
+})
+
+test('list never deletes a stale pidfile; the retention sweep owns that cleanup', async t => {
+    const agentDir = tempAgentDir(t)
+    const dir = seedControlStore(agentDir)
+    // A crashed parent's leftover: the pid names no process (macOS caps pids at 99999).
+    const stalePid = join(dir, `${CONTROL_ABORTED_ID}.pid`)
+    writeFileSync(stalePid, '999999\n')
+    const { subagent } = await loadDispatch()
+    await subagent.execute(
+        'capture-session',
+        { agent: 'ghost', task: 'noop' },
+        undefined,
+        undefined,
+        makeCtx(agentDir)
+    )
+
+    const aborted = controlService()
+        .list()
+        .find(info => info.id === CONTROL_ABORTED_ID)
+    assert.equal(aborted?.status, 'canceled', 'the dead pid does not make the run live')
+    assert.ok(existsSync(stalePid), 'a read path must not delete')
+
+    // The sweep is where stale pidfiles go.
+    sweepExpiredAsyncDirs(dir, { isProcessAlive: () => false })
+    assert.equal(existsSync(stalePid), false)
 })

@@ -47,6 +47,12 @@ import {
 } from '@earendil-works/pi-tui'
 import { Type } from 'typebox'
 import { type AgentConfig, type AgentScope, discoverAgents } from './agents.ts'
+import {
+    asyncRunToken,
+    buildTerminalNotice,
+    emitTerminalNotice,
+    type TerminalRunStatus,
+} from './async-notice.ts'
 import { spawnChild } from './child-env.ts'
 import {
     advanceSessionEpoch,
@@ -510,6 +516,27 @@ function settleBackgroundRun(id: string, result: SingleResult, runEpoch: number)
     }
 }
 
+// The async token a background run's spawn details report as `asyncDir`.
+function backgroundRunAsyncToken(subagentId: string): string {
+    return asyncRunToken(getSubagentsDir(), subagentId)
+}
+
+// One terminal notice per settled background run, whatever ended it (exit,
+// error, abort). Epoch-guarded like the settlement sink: a run from a torn-down
+// session must not write into its replacement's transcript.
+function emitBackgroundSettlement(
+    id: string,
+    agent: string,
+    status: TerminalRunStatus,
+    runEpoch: number
+): void {
+    if (!isCurrentSessionRun(runEpoch)) return
+    emitTerminalNotice(
+        latestPi,
+        buildTerminalNotice({ agent, status, asyncToken: backgroundRunAsyncToken(id) })
+    )
+}
+
 // One self-contained per-id block for the completion notification (spec
 // 1.2.3). The short id is the only id source for the model; suffix resolution
 // makes it interchangeable with the full id within this session.
@@ -809,6 +836,11 @@ interface SubagentDetails {
     agentScope: AgentScope
     projectAgentsDir: string | null
     results: SingleResult[]
+    // Background single runs only: external trackers key the completion notice
+    // on these (see async-notice.ts). Both are absent for foreground runs,
+    // whose tool result already carries the outcome.
+    asyncId?: string
+    asyncDir?: string
 }
 
 interface SubagentMeta {
@@ -2788,6 +2820,12 @@ async function runSingleAgent(
                 : isFailedResult(currentResult)
                   ? 'failed'
                   : 'succeeded'
+            // Before the cleanup below, deliberately: the notice is the only
+            // terminal marker external trackers persist, so it has to reach the
+            // transcript while the run is still the most recent thing in it.
+            if (backgrounded) {
+                emitBackgroundSettlement(subagentId, currentResult.agent, status, runEpoch)
+            }
             removeSubagentFile(pidPath)
             if (status === 'succeeded') {
                 removeSubagentFile(sessionPath)
@@ -3894,7 +3932,14 @@ export default function (pi: ExtensionAPI) {
                                     ].join('\n'),
                                 },
                             ],
-                            details: makeDetails('single')([]),
+                            // The async id/token let external trackers settle this
+                            // call from the completion notice instead of waiting on
+                            // a result that this run will never return here.
+                            details: {
+                                ...makeDetails('single')([]),
+                                asyncId: entry.id,
+                                asyncDir: backgroundRunAsyncToken(entry.id),
+                            },
                         }
                     }
                     if (spawn.kind === 'pre-spawn')
@@ -3947,7 +3992,13 @@ export default function (pi: ExtensionAPI) {
                                 ].join('\n'),
                             },
                         ],
-                        details: makeDetails('single')([]),
+                        // Same contract as a spawn-time background run: the awaited
+                        // call returns no result, so the notice carries the outcome.
+                        details: {
+                            ...makeDetails('single')([]),
+                            asyncId: result.subagentId,
+                            asyncDir: backgroundRunAsyncToken(result.subagentId),
+                        },
                     }
                 }
                 const isError = isFailedResult(result)

@@ -57,6 +57,15 @@ declare module '@earendil-works/pi-coding-agent' {
                 | undefined
         ): void
         appendEntry<T = unknown>(customType: string, data?: T): void
+        sendMessage(
+            message: {
+                customType: string
+                content: string
+                display: boolean
+                details?: unknown
+            },
+            opts?: { triggerTurn?: boolean; deliverAs?: 'steer' | 'followUp' | 'nextTurn' }
+        ): void
         sendUserMessage(text: string, opts?: { deliverAs?: string }): void
         exec(
             command: string,

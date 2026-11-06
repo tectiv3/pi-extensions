@@ -458,7 +458,9 @@ The token is `<agentDir>/subagents/<id>.async` — a correlation key that must b
 derivable from the run id alone (a replay rebuilds it from the transcript). It is a real
 directory, holding the run's transcript. The spawn side reports the path on the tool
 result's `details.asyncDir`, next to `details.asyncId` (the full run id); a consumer keys
-the two together, so a drift in either half strands the run with no error.
+the two together, so a drift in either half strands the run with no error. The same
+details carry `asyncSessionFile`, the transcript the child writes (it may not exist yet),
+so a consumer can follow live progress without deriving the path.
 
 Nothing else in that directory is a settlement channel. A background spawn's tool call
 returns at spawn time, so the `subagent-notify` entry is the only record of how the run

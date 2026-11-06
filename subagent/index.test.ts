@@ -471,12 +471,21 @@ test('a background spawn writes its transcript inside the run directory and keep
         undefined,
         makeCtx(agentDir)
     )
-    const details = result.details as { asyncId?: string; asyncDir?: string }
+    const details = result.details as {
+        asyncId?: string
+        asyncDir?: string
+        asyncSessionFile?: string
+    }
     assert.ok(details.asyncId, 'the spawn reported an async id')
     assert.ok(details.asyncDir, 'the spawn reported an async dir')
 
     const asyncDir = details.asyncDir
     const transcript = join(asyncDir, 'transcript.jsonl')
+    assert.equal(
+        details.asyncSessionFile,
+        transcript,
+        'the spawn names the transcript to follow'
+    )
     assert.equal(transcript.startsWith(asyncDir), true)
     assert.equal(existsFile(transcript), false, 'the child has not written it yet')
 

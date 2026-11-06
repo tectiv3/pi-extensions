@@ -921,6 +921,9 @@ interface SubagentDetails {
     // whose tool result already carries the outcome.
     asyncId?: string
     asyncDir?: string
+    // The transcript the background child writes (or will write, for a run that
+    // has not created it yet). A tracker follows it for live progress.
+    asyncSessionFile?: string
 }
 
 interface SubagentMeta {
@@ -4495,6 +4498,7 @@ export default function (pi: ExtensionAPI) {
                             ...makeDetails([]),
                             asyncId: entry.id,
                             asyncDir: backgroundRunAsyncToken(entry.id),
+                            asyncSessionFile: getSubagentFilePaths(entry.id).sessionAsync,
                         },
                     }
                 }
@@ -4581,6 +4585,7 @@ export default function (pi: ExtensionAPI) {
                         ...makeDetails([]),
                         asyncId: result.subagentId,
                         asyncDir: backgroundRunAsyncToken(result.subagentId),
+                        asyncSessionFile: getSubagentFilePaths(result.subagentId).session,
                     },
                 }
             }

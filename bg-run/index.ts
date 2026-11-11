@@ -9,6 +9,7 @@
  * globalThis[Symbol.for('pi-extensions:bg-run:control')] (version 1) to show
  * and stop jobs without an LLM turn. The symbol string is the contract.
  */
+import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
@@ -84,8 +85,6 @@ function completionMessage(jobs: Job[]): string {
 
 export default function bgRun(pi: ExtensionAPI) {
     let manager: JobManager | undefined
-    // The dead session's jobs settle while it shuts down; they must not wake the new one.
-    let quiet = false
     let pendingNotify: Job[] = []
     let notifyTimer: ReturnType<typeof setTimeout> | undefined
     const listeners = new Set<() => void>()
@@ -104,9 +103,9 @@ export default function bgRun(pi: ExtensionAPI) {
 
     const createManager = () =>
         new JobManager({
-            runDir: path.join(os.tmpdir(), 'bg-run', String(process.pid), String(Date.now())),
+            runDir: fs.mkdtempSync(path.join(os.tmpdir(), 'bg-run-')),
             onSettled: (job) => {
-                if (quiet || job.status === 'killed') return
+                if (job.status === 'killed') return
                 pendingNotify.push(job)
                 notifyTimer ??= setTimeout(flushNotifications, NOTIFY_BATCH_MS)
             },
@@ -151,19 +150,6 @@ export default function bgRun(pi: ExtensionAPI) {
         },
     }
     ;(globalThis as Record<symbol, unknown>)[BG_RUN_CONTROL_SYMBOL] = service
-
-    // pi's crash path exits without session_shutdown, and the jobs are detached
-    // process groups, so they would outlive it. Best effort: no SIGKILL can follow.
-    process.on('exit', () => {
-        for (const job of manager?.list() ?? []) {
-            if (job.status !== 'running') continue
-            try {
-                process.kill(-job.pid, 'SIGTERM')
-            } catch {
-                // already gone
-            }
-        }
-    })
 
     pi.registerTool({
         name: 'bg_run',
@@ -211,14 +197,12 @@ export default function bgRun(pi: ExtensionAPI) {
     })
 
     pi.on('session_start', () => {
-        quiet = false
         manager = createManager()
     })
 
     pi.on('session_shutdown', async () => {
         const ending = manager
         manager = undefined
-        quiet = true
         if (notifyTimer) clearTimeout(notifyTimer)
         notifyTimer = undefined
         pendingNotify = []

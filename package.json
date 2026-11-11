@@ -10,7 +10,7 @@
     "typescript-eslint": "^8.0.0"
   },
   "scripts": {
-    "test": "node --test --experimental-strip-types --no-warnings notify/*.test.ts subagent/*.test.ts simplify/*.test.ts multi-opencode-go/*.test.ts ask-user-question/*.test.ts agent-memory/**/*.test.ts"
+    "test": "node --test --experimental-strip-types --no-warnings bg-run/*.test.ts notify/*.test.ts subagent/*.test.ts simplify/*.test.ts multi-opencode-go/*.test.ts ask-user-question/*.test.ts agent-memory/**/*.test.ts"
   },
   "dependencies": {
     "sqlite-vec": "0.1.9"
